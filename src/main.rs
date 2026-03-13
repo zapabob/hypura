@@ -50,13 +50,22 @@ enum Commands {
         #[arg(long, default_value = "8080")]
         port: u16,
     },
-    /// Benchmark tok/s with Reach scheduling
+    /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
         /// Path to model file
         model: String,
         /// Also benchmark with naive mmap for comparison
         #[arg(long)]
         baseline: bool,
+        /// Maximum context length
+        #[arg(long, default_value = "2048")]
+        context: u32,
+        /// Tokens to generate per run
+        #[arg(long, default_value = "128")]
+        max_tokens: u32,
+        /// Prompt text
+        #[arg(long)]
+        prompt: Option<String>,
     },
     /// Print model metadata, tensor list, and placement plan
     Inspect {
@@ -94,7 +103,13 @@ fn main() -> anyhow::Result<()> {
             max_tokens,
         } => cli::run::run(&model, context, prompt.as_deref(), interactive, max_tokens),
         Commands::Serve { model, host, port } => cli::serve::run(&model, &host, port),
-        Commands::Bench { model, baseline } => cli::bench::run(&model, baseline),
+        Commands::Bench {
+            model,
+            baseline,
+            context,
+            max_tokens,
+            prompt,
+        } => cli::bench::run(&model, baseline, context, max_tokens, prompt.as_deref()),
         Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
         Commands::Optimize { model } => cli::optimize::run(&model),
     }
