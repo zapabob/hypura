@@ -16,8 +16,25 @@ pub fn compute_placement(
     model: &GgufFile,
     hardware: &HardwareProfile,
 ) -> anyhow::Result<PlacementPlan> {
+    compute_placement_with_context(model, hardware, 0)
+}
+
+/// Compute placement with a specific context length for KV cache headroom.
+/// If `context_length` is 0, uses a sensible default (capped at 8192 to avoid
+/// over-reserving KV headroom for models with very large max context).
+pub fn compute_placement_with_context(
+    model: &GgufFile,
+    hardware: &HardwareProfile,
+    context_length: u32,
+) -> anyhow::Result<PlacementPlan> {
     let metadata = ModelMetadata::from_gguf(model)?;
-    let context_length = metadata.context_length.max(2048);
+    // Cap KV headroom context — the model's max context (e.g., 131K) is the ceiling,
+    // not the operating point. Use a practical default for placement planning.
+    let context_length = if context_length > 0 {
+        context_length.min(metadata.context_length.max(2048))
+    } else {
+        metadata.context_length.max(2048).min(8192)
+    };
     let capacities = compute_tier_capacities(hardware, &metadata, context_length);
 
     // Score and sort tensors

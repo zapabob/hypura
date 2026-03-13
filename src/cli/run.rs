@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hypura::compute::inference::*;
 use hypura::model::gguf::GgufFile;
 use hypura::profiler;
-use hypura::scheduler::placement::{compute_placement, summarize_placement};
+use hypura::scheduler::placement::{compute_placement_with_context, summarize_placement};
 use hypura::scheduler::types::{PlacementSummary, StorageTier};
 use hypura::telemetry::metrics::TelemetryEmitter;
 
@@ -16,9 +16,10 @@ pub fn run(
     context: u32,
     prompt: Option<&str>,
     interactive: bool,
+    max_tokens: u32,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(model_path, context, prompt, interactive))
+    rt.block_on(run_async(model_path, context, prompt, interactive, max_tokens))
 }
 
 async fn run_async(
@@ -26,6 +27,7 @@ async fn run_async(
     context: u32,
     prompt: Option<&str>,
     interactive: bool,
+    max_tokens: u32,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     anyhow::ensure!(path.exists(), "Model file not found: {model_path}");
@@ -43,7 +45,7 @@ async fn run_async(
 
     // Parse GGUF header for placement
     let gguf = GgufFile::open(path)?;
-    let plan = compute_placement(&gguf, &hardware)?;
+    let plan = compute_placement_with_context(&gguf, &hardware, context)?;
     let summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
     let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf);
 
@@ -56,10 +58,11 @@ async fn run_async(
     print_placement_header(&summary, &plan, n_gpu_layers);
 
     let telemetry = Arc::new(TelemetryEmitter::new(256));
-    let config = InferenceConfig {
+    let mut config = InferenceConfig {
         n_ctx: context,
         ..InferenceConfig::default()
     };
+    config.sampling.max_tokens = max_tokens;
 
     // Clone what we need for the blocking thread
     let plan = Arc::new(plan);

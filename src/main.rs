@@ -35,6 +35,9 @@ enum Commands {
         /// Interactive chat mode
         #[arg(long)]
         interactive: bool,
+        /// Maximum tokens to generate
+        #[arg(long, default_value = "512")]
+        max_tokens: u32,
     },
     /// Start OpenAI-compatible API server
     Serve {
@@ -88,7 +91,8 @@ fn main() -> anyhow::Result<()> {
             context,
             prompt,
             interactive,
-        } => cli::run::run(&model, context, prompt.as_deref(), interactive),
+            max_tokens,
+        } => cli::run::run(&model, context, prompt.as_deref(), interactive, max_tokens),
         Commands::Serve { model, host, port } => cli::serve::run(&model, &host, port),
         Commands::Bench { model, baseline } => cli::bench::run(&model, baseline),
         Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
