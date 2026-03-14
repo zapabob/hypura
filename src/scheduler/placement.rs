@@ -10,6 +10,7 @@ use crate::scheduler::prefetch::build_prefetch_schedule;
 use crate::scheduler::types::*;
 
 const OS_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for macOS
+const GPU_RUNTIME_OVERHEAD: u64 = 1 << 30; // 1 GiB reserved for compute buffers + Metal overhead
 const SYNC_OVERHEAD_PER_LAYER_US: f64 = 50.0; // 50μs CPU-GPU sync per layer
 
 pub fn compute_placement(
@@ -115,10 +116,15 @@ fn compute_tier_capacities(
     let usable = total_ram.saturating_sub(OS_OVERHEAD);
 
     let gpu_max = hw.gpu.as_ref().map_or(0, |g| g.vram_bytes);
-    let gpu_bytes = gpu_max.min(usable);
 
-    // Reserve space for KV cache
+    // Reserve space for KV cache and GPU runtime (compute buffers, Metal overhead).
+    // On unified memory (Apple Silicon), KV cache + compute live in the same
+    // working set as model weights — must subtract from gpu_bytes too.
     let kv_headroom = estimate_kv_bytes(metadata, context_length);
+    let gpu_bytes = gpu_max
+        .min(usable)
+        .saturating_sub(kv_headroom)
+        .saturating_sub(GPU_RUNTIME_OVERHEAD);
     let ram_bytes = usable.saturating_sub(gpu_bytes).saturating_sub(kv_headroom);
     let unified_limit = usable.saturating_sub(kv_headroom);
 

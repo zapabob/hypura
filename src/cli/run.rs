@@ -47,7 +47,9 @@ async fn run_async(
     let gguf = GgufFile::open(path)?;
     let plan = compute_placement_with_context(&gguf, &hardware, context)?;
     let summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
-    let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf);
+    let metadata = hypura::model::metadata::ModelMetadata::from_gguf(&gguf)?;
+    let gpu_budget = compute_gpu_budget(&hardware, &metadata, context);
+    let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf, gpu_budget);
 
     let has_nvme = plan.tier_assignments.values().any(|t| *t == StorageTier::Nvme);
     if has_nvme {

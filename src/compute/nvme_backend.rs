@@ -47,6 +47,9 @@ pub struct PrefetchState {
     pub nvme_fd: Mutex<Option<i32>>,
     /// Channel sender for background prefetch thread
     pub prefetch_tx: Mutex<Option<std::sync::mpsc::Sender<u32>>>,
+    /// Layer indices that are on NVMe (released after use, re-loaded as needed).
+    /// Layers in our buffer but NOT in this set are RAM layers (loaded once, kept).
+    pub nvme_layers: std::collections::HashSet<u32>,
 }
 
 // SAFETY: buffer_base and nvme_fd are accessed under Mutex
@@ -258,7 +261,12 @@ impl HypuraBuftController {
 
     /// After model loading, correlate tensor map with GGUF file offsets
     /// and build the PrefetchState for use during inference.
-    pub fn build_prefetch_state(&self, gguf: &GgufFile, num_layers: u32) -> Arc<PrefetchState> {
+    pub fn build_prefetch_state(
+        &self,
+        gguf: &GgufFile,
+        num_layers: u32,
+        nvme_layers: std::collections::HashSet<u32>,
+    ) -> Arc<PrefetchState> {
         let mut map = self.tensor_map.lock().unwrap();
 
         // Fill in file offsets and layer indices from GGUF metadata
@@ -280,10 +288,11 @@ impl HypuraBuftController {
             }
         }
 
-        // All layers start as Loaded (data was written during model init)
+        // All layers start as NotLoaded — data loaded lazily via pread
+        // (set_tensor skips memcpy to avoid peak memory during model loading)
         let layer_status: HashMap<u32, LayerStatus> = layer_regions
             .keys()
-            .map(|&k| (k, LayerStatus::Loaded))
+            .map(|&k| (k, LayerStatus::NotLoaded))
             .collect();
 
         // Copy buffer_base from controller (set during model loading callbacks)
@@ -301,6 +310,7 @@ impl HypuraBuftController {
             prefetch_enabled: AtomicBool::new(true),
             nvme_fd: Mutex::new(None),
             prefetch_tx: Mutex::new(None),
+            nvme_layers,
         })
     }
 
@@ -322,41 +332,51 @@ pub fn build_override_patterns(
     plan: &PlacementPlan,
     gguf: &GgufFile,
     buft_ptr: hypura_sys::ggml_backend_buffer_type_t,
+    n_gpu_layers: i32,
 ) -> (Vec<CString>, Vec<hypura_sys::llama_model_tensor_buft_override>) {
+    // Only override tensors in layers BEYOND n_gpu_layers. GPU-offloaded layers
+    // must stay on Metal shared buffers (mmap). Overriding GPU-layer tensors
+    // causes Metal OOM because llama.cpp allocates Metal buffers for them anyway.
+    let first_non_gpu_layer = if n_gpu_layers > 0 {
+        (n_gpu_layers - 1) as u32
+    } else {
+        0
+    };
+
+    // Count non-GPU-layer tensors per layer (for pattern optimization)
     let mut layer_counts: HashMap<u32, (usize, usize)> = HashMap::new();
 
     for t in &gguf.tensors {
         if let Some(layer) = t.layer_index {
+            if layer < first_non_gpu_layer {
+                continue; // GPU-offloaded layer, don't touch
+            }
             let entry = layer_counts.entry(layer).or_insert((0, 0));
             entry.1 += 1;
-            if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
-                entry.0 += 1;
-            }
+            entry.0 += 1; // All tensors in non-GPU layers go to our buffer
         }
     }
 
     let mut patterns = Vec::new();
 
-    for (layer, (nvme, total)) in &layer_counts {
-        if *nvme == *total && *nvme > 0 {
+    // Whole-layer pattern for non-GPU layers
+    for (layer, (non_gpu, total)) in &layer_counts {
+        if *non_gpu == *total && *non_gpu > 0 {
             patterns.push(format!("^blk\\.{}\\.", layer));
         }
     }
 
+    // Per-tensor fallback for partial layers (rare with contiguous assignment)
     for t in &gguf.tensors {
-        let tier = plan.tier_assignments.get(&t.name);
-        if tier != Some(&StorageTier::Nvme) {
-            continue;
-        }
         if let Some(layer) = t.layer_index {
-            let (nvme, total) = layer_counts[&layer];
-            if nvme < total {
+            if layer < first_non_gpu_layer {
+                continue;
+            }
+            let (non_gpu, total) = layer_counts[&layer];
+            if non_gpu < total {
                 let escaped = regex_escape(&t.name);
                 patterns.push(format!("^{}$", escaped));
             }
-        } else {
-            let escaped = regex_escape(&t.name);
-            patterns.push(format!("^{}$", escaped));
         }
     }
 
@@ -436,16 +456,18 @@ pub extern "C" fn eval_callback(
         let prev_layer = prev as u32;
 
         if prev >= 0 && prev_layer != layer_idx && prev_layer < layer_idx {
-            // We've moved forward — release the completed layer's pages
-            state.release_layer(prev_layer);
+            // Only release NVMe layers — RAM layers stay in memory
+            if state.nvme_layers.contains(&prev_layer) {
+                state.release_layer(prev_layer);
+            }
 
-            // Async prefetch: request layer+2 and layer+3 (non-blocking)
+            // Async prefetch: only request NVMe layers (RAM layers load once)
             let target2 = layer_idx + 2;
-            if target2 < state.num_layers {
+            if target2 < state.num_layers && state.nvme_layers.contains(&target2) {
                 state.request_prefetch(target2);
             }
             let target3 = layer_idx + 3;
-            if target3 < state.num_layers {
+            if target3 < state.num_layers && state.nvme_layers.contains(&target3) {
                 state.request_prefetch(target3);
             }
         }

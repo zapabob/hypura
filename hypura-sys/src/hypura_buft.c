@@ -34,6 +34,17 @@ static void *hypura_buf_get_base(ggml_backend_buffer_t buffer) {
 
 static enum ggml_status hypura_buf_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor *tensor) {
     hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
+
+    /* Register tensor location here rather than set_tensor, because llama.cpp
+     * may bypass set_tensor for host buffers when use_mmap=false (reads directly
+     * into tensor->data via fread). init_tensor is ALWAYS called. */
+    if (ctx->buft_ctx->on_tensor_loaded) {
+        size_t buf_offset = (uint8_t *)tensor->data - (uint8_t *)ctx->base;
+        size_t size = ggml_nbytes(tensor);
+        ctx->buft_ctx->on_tensor_loaded(ctx->buft_ctx->rust_ctx, tensor->name,
+                                        buf_offset, size, ctx->base);
+    }
+
     if (ctx->buft_ctx->on_tensor_init) {
         ctx->buft_ctx->on_tensor_init(ctx->buft_ctx->rust_ctx, tensor, tensor->name);
     }
@@ -42,22 +53,15 @@ static enum ggml_status hypura_buf_init_tensor(ggml_backend_buffer_t buffer, str
 
 static void hypura_buf_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor *tensor,
                                      uint8_t value, size_t offset, size_t size) {
-    (void)buffer;
-    memset((uint8_t *)tensor->data + offset, value, size);
+    /* Skip — data loaded lazily from file via pread during inference */
+    (void)buffer; (void)tensor; (void)value; (void)offset; (void)size;
 }
 
 static void hypura_buf_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor *tensor,
                                   const void *data, size_t offset, size_t size) {
-    hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
-
-    /* Copy tensor data into our buffer */
-    memcpy((uint8_t *)tensor->data + offset, data, size);
-
-    /* Notify Rust of this tensor's location */
-    if (ctx->buft_ctx->on_tensor_loaded && offset == 0) {
-        size_t buf_offset = (uint8_t *)tensor->data - (uint8_t *)ctx->base;
-        ctx->buft_ctx->on_tensor_loaded(ctx->buft_ctx->rust_ctx, tensor->name, buf_offset, size, ctx->base);
-    }
+    /* Skip memcpy — data loaded lazily from file via pread during inference.
+     * Tensor registration happens in init_tensor instead. */
+    (void)buffer; (void)tensor; (void)data; (void)offset; (void)size;
 }
 
 static void hypura_buf_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor *tensor,
@@ -77,8 +81,8 @@ static bool hypura_buf_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggm
 }
 
 static void hypura_buf_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
-    memset(ctx->base, value, ctx->size);
+    /* Skip — data loaded lazily from file via pread during inference */
+    (void)buffer; (void)value;
 }
 
 /* ---------- Buffer type vtable ---------- */

@@ -9,6 +9,8 @@ use tokio::sync::mpsc;
 
 use crate::compute::ffi::*;
 use crate::model::gguf::GgufFile;
+use crate::model::metadata::ModelMetadata;
+use crate::profiler::types::HardwareProfile;
 use crate::scheduler::types::*;
 use crate::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
 
@@ -52,23 +54,52 @@ pub struct GenerationResult {
     pub perf: PerfData,
 }
 
+/// Compute GPU budget for model weights (bytes) after reserving space for
+/// KV cache and compute buffers within the Metal working set.
+pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, context_length: u32) -> u64 {
+    let gpu_working_set = hw.gpu.as_ref().map_or(0, |g| g.vram_bytes);
+    // KV cache on GPU: 2 * layers * kv_heads * head_dim * 2 bytes * context
+    let head_dim = if metadata.num_heads > 0 {
+        metadata.embedding_dim as u64 / metadata.num_heads as u64
+    } else {
+        0
+    };
+    let kv_on_gpu = 2 * metadata.num_layers as u64
+        * metadata.num_kv_heads as u64
+        * head_dim
+        * 2
+        * context_length as u64;
+    // Reserve 1 GiB for compute buffers + Metal framework overhead
+    let runtime_overhead: u64 = 1 << 30;
+    gpu_working_set
+        .saturating_sub(kv_on_gpu)
+        .saturating_sub(runtime_overhead)
+}
+
 /// Derive `n_gpu_layers` from a PlacementPlan.
 ///
-/// Only offload layers to GPU where NO tensor is on NVMe. Layers with any
-/// NVMe tensor stay on CPU — the custom buffer type + eval callback handles
-/// prefetch/release for those layers. This keeps Metal's working set within
-/// `recommendedMaxWorkingSetSize` and prevents GPU OOM on models that exceed
-/// physical memory.
+/// Caps at the minimum of:
+/// 1. The first NVMe layer (layers with NVMe tensors must stay on CPU)
+/// 2. The GPU working set capacity (all tensors in GPU-offloaded layers
+///    go to Metal shared buffers, regardless of the plan's GPU/RAM split)
 ///
-/// Since llama.cpp's `n_gpu_layers` is sequential (layers 0..N go to GPU),
-/// we offload up to (but not including) the first layer with an NVMe tensor.
-pub fn gpu_layers_from_placement(plan: &PlacementPlan, gguf: &GgufFile) -> i32 {
+/// On Apple Silicon, `n_gpu_layers` controls which layers get Metal buffers.
+/// Layers between the GPU cap and NVMe cutoff run on CPU with mmap'd weights.
+pub fn gpu_layers_from_placement(
+    plan: &PlacementPlan,
+    gguf: &GgufFile,
+    gpu_budget_bytes: u64,
+) -> i32 {
     let mut max_layer: i32 = -1;
     let mut first_nvme_layer: Option<u32> = None;
+
+    // Compute per-layer sizes and find NVMe cutoff
+    let mut layer_sizes: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
 
     for t in &gguf.tensors {
         if let Some(layer_idx) = t.layer_index {
             max_layer = max_layer.max(layer_idx as i32);
+            *layer_sizes.entry(layer_idx).or_default() += t.size_bytes;
             if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
                 first_nvme_layer = Some(match first_nvme_layer {
                     Some(existing) => existing.min(layer_idx),
@@ -82,17 +113,35 @@ pub fn gpu_layers_from_placement(plan: &PlacementPlan, gguf: &GgufFile) -> i32 {
         return 0;
     }
 
-    match first_nvme_layer {
-        Some(nvme_start) => {
-            // Offload layers 0..(nvme_start-1) to GPU.
-            // +1 for the output layer llama.cpp counts separately.
-            nvme_start as i32 + 1
-        }
-        None => {
-            // No NVMe tensors — offload everything.
-            max_layer + 1 + 1
+    // Cap by NVMe cutoff
+    let from_nvme = match first_nvme_layer {
+        Some(nvme_start) => nvme_start as i32 + 1,
+        None => max_layer + 1 + 1,
+    };
+
+    // Cap by GPU working set: sum layers until budget exhausted.
+    // Start with non-layer tensors (embedding, output head) since they also
+    // go to Metal shared buffers when GPU-offloaded.
+    let non_layer_gpu_size: u64 = gguf
+        .tensors
+        .iter()
+        .filter(|t| t.layer_index.is_none())
+        .map(|t| t.size_bytes)
+        .sum();
+    let mut cumulative: u64 = non_layer_gpu_size;
+    let mut max_fitting: i32 = 0;
+    for (&layer_idx, &size) in &layer_sizes {
+        cumulative += size;
+        if cumulative <= gpu_budget_bytes {
+            max_fitting = layer_idx as i32 + 1;
+        } else {
+            break;
         }
     }
+    // +1 for the output layer llama.cpp counts separately
+    let from_capacity = max_fitting + 1;
+
+    from_nvme.min(from_capacity)
 }
 
 /// Run inference on a blocking thread. Streams tokens via `token_tx`.
@@ -215,7 +264,8 @@ pub fn generate_with_nvme_scheduling(
 
     // Create custom buffer type for NVMe-tier tensors
     let controller = HypuraBuftController::new(model_path, gguf);
-    let (_patterns, overrides) = build_override_patterns(plan, gguf, controller.buft_ptr());
+    let (_patterns, overrides) =
+        build_override_patterns(plan, gguf, controller.buft_ptr(), n_gpu_layers);
 
     let nvme_count = plan
         .tier_assignments
@@ -224,17 +274,29 @@ pub fn generate_with_nvme_scheduling(
         .count();
     tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
 
-    // Load model with overrides
+    // Disable mmap — on Apple Silicon, mmap'd pages in unified memory all count
+    // against Metal's recommendedMaxWorkingSetSize. With mmap off, only GPU-offloaded
+    // layers get Metal shared buffers. CPU_REPACK is disabled in vendored llama.cpp,
+    // so no duplicate copies are created.
     let model = LlamaModel::load_with_overrides(
         model_path,
         n_gpu_layers,
-        true,
+        false,
         overrides.as_ptr(),
     )?;
 
     // Build prefetch state with layer groupings and file offsets
     let num_layers = model.n_layers() as u32;
-    let prefetch_state = controller.build_prefetch_state(gguf, num_layers);
+
+    // Determine which layers are NVMe (released after use) vs RAM (loaded once, kept)
+    let nvme_layers: std::collections::HashSet<u32> = gguf
+        .tensors
+        .iter()
+        .filter(|t| plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme))
+        .filter_map(|t| t.layer_index)
+        .collect();
+
+    let prefetch_state = controller.build_prefetch_state(gguf, num_layers, nvme_layers);
 
     // Open NVMe file descriptor for F_NOCACHE reads during prefetch
     prefetch_state.open_nvme_fd()?;
@@ -416,7 +478,7 @@ mod tests {
         }
         let plan = make_plan(assignments);
         // 10 layers (0-9) + 1 output = 11
-        assert_eq!(gpu_layers_from_placement(&plan, &gguf), 11);
+        assert_eq!(gpu_layers_from_placement(&plan, &gguf, u64::MAX), 11);
     }
 
     #[test]
@@ -435,7 +497,7 @@ mod tests {
         }
         let plan = make_plan(assignments);
         // Layers 0-5 on GPU (6 layers) + 1 output = 7
-        assert_eq!(gpu_layers_from_placement(&plan, &gguf), 7);
+        assert_eq!(gpu_layers_from_placement(&plan, &gguf, u64::MAX), 7);
     }
 
     #[test]
@@ -447,6 +509,6 @@ mod tests {
             data_offset: 0,
         };
         let plan = make_plan(HashMap::new());
-        assert_eq!(gpu_layers_from_placement(&plan, &gguf), 0);
+        assert_eq!(gpu_layers_from_placement(&plan, &gguf, u64::MAX), 0);
     }
 }

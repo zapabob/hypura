@@ -56,7 +56,8 @@ async fn run_async(
     let metadata = ModelMetadata::from_gguf(&gguf)?;
     let plan = compute_placement_with_context(&gguf, &hardware, context)?;
     let summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
-    let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf);
+    let gpu_budget = compute_gpu_budget(&hardware, &metadata, context);
+    let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf, gpu_budget);
 
     let has_nvme = plan
         .tier_assignments
@@ -97,6 +98,15 @@ async fn run_async(
     );
     println!();
 
+    // Memory safety check for the baseline run only.
+    // The Hypura run is designed to handle models larger than RAM via NVMe scheduling —
+    // that's the whole point. But the baseline (naive mmap) has no such mechanism and
+    // will cause severe swap thrashing if the full model exceeds physical memory.
+    let model_total_bytes = gguf.total_tensor_bytes();
+    let total_ram = hardware.memory.total_bytes;
+    let min_headroom: u64 = 4 * (1 << 30);
+    let baseline_safe = model_total_bytes <= total_ram.saturating_sub(min_headroom);
+
     let config = InferenceConfig {
         n_ctx: context,
         n_batch: 512,
@@ -111,6 +121,12 @@ async fn run_async(
     // --- Baseline run (naive mmap) ---
     let mut baseline_result = None;
     if run_baseline {
+        if !baseline_safe {
+            let model_gb = model_total_bytes as f64 / (1u64 << 30) as f64;
+            let total_gb = total_ram as f64 / (1u64 << 30) as f64;
+            println!("  Note: model ({model_gb:.1} GB) exceeds RAM ({total_gb:.1} GB) — baseline will be slow.");
+        }
+
         println!("  Run 1: Naive mmap (baseline)");
         println!("    Running...");
 
@@ -127,11 +143,32 @@ async fn run_async(
 
         // Drain tokens (discard output)
         while token_rx.recv().await.is_some() {}
-        let result = handle.await??;
-        let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
 
-        print_run_result("Naive mmap (baseline)", &result, wall_ms);
-        baseline_result = Some((result, wall_ms));
+        match handle.await {
+            Ok(Ok(result)) => {
+                let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
+                print_run_result("Naive mmap (baseline)", &result, wall_ms);
+                baseline_result = Some((result, wall_ms));
+            }
+            Ok(Err(e)) => {
+                println!("    Baseline failed: {e}");
+                println!("    Continuing with Hypura run...");
+                println!();
+            }
+            Err(e) => {
+                println!("    Baseline panicked: {e}");
+                println!("    Continuing with Hypura run...");
+                println!();
+            }
+        }
+
+        // When model exceeds RAM, give the OS time to reclaim pages from the
+        // baseline's GPU/mmap buffers before loading again for the Hypura run.
+        // Without this, back-to-back loads can spike to 2x model size and OOM.
+        if !baseline_safe && has_nvme {
+            println!("  Reclaiming memory before Hypura run...");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
     }
 
     // --- Hypura run ---
