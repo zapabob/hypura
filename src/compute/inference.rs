@@ -682,11 +682,26 @@ pub fn generate_with_nvme_scheduling(
 
     if expert_streaming {
         // Expert-streaming: non-expert tensors on GPU/Metal, experts on NVMe buffer.
-        // The eval_callback stays enabled and loads experts on demand.
+        // Activate pool buffer: allocate small pool, rewrite tensor->data, release loading buffer.
+        let num_experts = gguf.get_u32("expert_count").unwrap_or(8);
+        let pool = controller.activate_expert_pool(gguf, num_experts)?;
         tracing::info!(
-            "Expert-streaming mode: {:.2} GB expert tensors on NVMe, loaded on demand",
+            "Expert-streaming mode: {:.2} GB expert tensors on NVMe, {:.0} MB pool ({} slots)",
             nvme_bytes as f64 / (1u64 << 30) as f64,
+            pool.pool_size as f64 / 1e6,
+            pool.num_slots,
         );
+
+        // Transfer pool and tensor pointers to PrefetchState
+        *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
+        // Note: fused_tensor_ptrs is set in build_prefetch_state from controller
+        let tensor_ptrs = controller.take_tensor_ptrs();
+        // SAFETY: PrefetchState is behind Arc, tensor_ptrs are stable pointers from model loading
+        let state_mut = unsafe {
+            &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState)
+        };
+        state_mut.fused_tensor_ptrs = tensor_ptrs;
+
         prefetch_state
             .expert_streaming
             .store(true, std::sync::atomic::Ordering::Relaxed);

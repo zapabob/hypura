@@ -260,17 +260,17 @@ fn try_expert_streaming_assign(
         return None; // Either doesn't fit at all, or everything fits (use keep-resident)
     }
 
-    // On unified memory (Apple Silicon), the expert buffer's virtual address mapping
-    // counts against Metal's working set even if physical pages aren't committed.
-    // Guard against Metal OOM: expert buffer + non-expert must fit in ~80% of total RAM
-    // to leave room for Metal overhead + OS.
-    let total_ram = caps.unified_limit + OS_OVERHEAD;
-    let metal_budget = total_ram * 80 / 100;
-    if non_expert_bytes + expert_bytes > metal_budget {
+    // With the pool buffer, Metal only sees the small pool (~1 GB), not the full expert
+    // tensor size. Check that non-expert tensors + pool overhead fit in GPU budget.
+    // Pool size is approximately 14 slots × largest fused tensor size.
+    // Conservative estimate: pool ≈ 1.5 GB.
+    let estimated_pool: u64 = 3 * (1 << 30) / 2; // 1.5 GB
+    if non_expert_bytes + estimated_pool > caps.gpu_bytes + GPU_RUNTIME_OVERHEAD {
         tracing::debug!(
-            "Expert-streaming skipped: buffer ({:.1} GB) exceeds Metal budget ({:.1} GB)",
-            (non_expert_bytes + expert_bytes) as f64 / (1u64 << 30) as f64,
-            metal_budget as f64 / (1u64 << 30) as f64,
+            "Expert-streaming skipped: non-expert ({:.1} GB) + pool ({:.1} GB) exceeds GPU budget ({:.1} GB)",
+            non_expert_bytes as f64 / (1u64 << 30) as f64,
+            estimated_pool as f64 / (1u64 << 30) as f64,
+            (caps.gpu_bytes + GPU_RUNTIME_OVERHEAD) as f64 / (1u64 << 30) as f64,
         );
         return None;
     }

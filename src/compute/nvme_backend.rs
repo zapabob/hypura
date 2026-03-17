@@ -324,6 +324,10 @@ pub struct PrefetchState {
 
     /// Expert-streaming mode: non-expert tensors GPU-resident, experts loaded on demand.
     pub expert_streaming: AtomicBool,
+    /// Pool buffer for expert-streaming (slot allocator + pool base).
+    pub expert_pool: Mutex<Option<ExpertPool>>,
+    /// Captured ggml_tensor* pointers for fused expert tensors (for data pointer rewriting).
+    pub fused_tensor_ptrs: HashMap<String, *mut hypura_sys::ggml_tensor>,
 
     /// When true, record timestamped I/O events for post-hoc analysis.
     pub trace_enabled: AtomicBool,
@@ -717,12 +721,14 @@ impl PrefetchState {
 
     /// Load selected experts for a layer, blocking until complete.
     /// Uses neuron cache to skip already-loaded expert strides.
+    /// In pool mode, allocates pool slots, rewrites tensor->data, and preads into pool.
     pub fn ensure_experts_loaded(&self, layer_idx: u32, expert_ids: &[u32]) {
         if expert_ids.is_empty() || !self.expert_layouts.contains_key(&layer_idx) {
             return;
         }
 
-        let tracing = self.trace_enabled.load(Ordering::Relaxed);
+        let tracing_on = self.trace_enabled.load(Ordering::Relaxed);
+        let use_pool = self.expert_pool.lock().unwrap().is_some();
 
         // Check which experts need loading (cache misses)
         let needs_load = {
@@ -747,31 +753,188 @@ impl PrefetchState {
         };
 
         if !needs_load {
-            if tracing {
+            // Even cache hits need tensor->data rewriting in pool mode
+            if use_pool {
+                self.rewrite_tensor_ptrs_for_layer(layer_idx);
+            }
+            if tracing_on {
                 self.trace.record(TraceEvent::LayerHit(layer_idx));
             }
             return;
         }
 
-        // Submit expert load — reuse layer status mechanism for blocking
         let wait_start = Instant::now();
+
+        if use_pool {
+            // Pool mode: allocate slots, rewrite tensor->data, pread into pool
+            self.load_experts_pooled(layer_idx, expert_ids);
+        } else {
+            // Standard mode: pread into the main buffer at fixed offsets
+            {
+                let mut status = self.layer_status.lock().unwrap();
+                status.insert(layer_idx, LayerStatus::Loading);
+            }
+            self.submit_expert_load_with_status(layer_idx, expert_ids);
+            let mut status = self.layer_status.lock().unwrap();
+            while status.get(&layer_idx).copied() != Some(LayerStatus::Loaded) {
+                status = self.layer_notify.wait(status).unwrap();
+            }
+        }
+
+        if tracing_on {
+            let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+            self.trace
+                .record(TraceEvent::LayerStall { layer: layer_idx, wait_ms });
+        }
+    }
+
+    /// Pool mode: allocate slots for a layer, rewrite tensor->data, pread expert strides.
+    fn load_experts_pooled(&self, layer_idx: u32, expert_ids: &[u32]) {
+        let layouts = match self.expert_layouts.get(&layer_idx) {
+            Some(l) => l,
+            None => return,
+        };
+
+        // Allocate pool slots
+        let slot_offsets = {
+            let mut pool = self.expert_pool.lock().unwrap();
+            let pool = pool.as_mut().expect("pool not initialized");
+            // Evict old layer's neuron cache entries if pool reclaims slots
+            let evicted_layers: Vec<u32> = pool
+                .layer_slots
+                .keys()
+                .copied()
+                .filter(|&l| l != layer_idx && pool.free_slots.len() < layouts.len())
+                .collect();
+            for el in &evicted_layers {
+                self.neuron_cache.lock().unwrap().evict_layer(*el);
+            }
+            pool.allocate_layer(layer_idx, layouts.len())
+        };
+
+        // Rewrite tensor->data pointers to pool slots
+        for (i, layout) in layouts.iter().enumerate() {
+            if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
+                if !tensor_ptr.is_null() {
+                    let pool = self.expert_pool.lock().unwrap();
+                    let pool = pool.as_ref().unwrap();
+                    unsafe {
+                        (*tensor_ptr).data =
+                            pool.pool_base.add(slot_offsets[i]) as *mut c_void;
+                    }
+                }
+            }
+        }
+
+        // Build pread regions targeting pool slots
+        let pool_base = {
+            let pool = self.expert_pool.lock().unwrap();
+            pool.as_ref().unwrap().pool_base
+        };
+
+        let mut task_regions: Vec<Vec<(usize, usize, u64)>> = Vec::new();
+        {
+            let mut cache = self.neuron_cache.lock().unwrap();
+            for (i, layout) in layouts.iter().enumerate() {
+                let tensor_type = ExpertTensorType::from_name(&layout.tensor_name)
+                    .unwrap_or(ExpertTensorType::Gate);
+                let mut regions = Vec::new();
+                for &eid in expert_ids {
+                    if eid >= layout.num_experts {
+                        continue;
+                    }
+                    if cache.is_loaded(layer_idx, eid, tensor_type) {
+                        continue;
+                    }
+                    // Pool-relative: slot_offset + expert_id * stride
+                    let mapped_eid = layout
+                        .expert_permutation
+                        .as_ref()
+                        .and_then(|p| p.get(eid as usize).copied())
+                        .unwrap_or(eid);
+                    let pool_dest =
+                        slot_offsets[i] + (mapped_eid as usize) * layout.expert_stride;
+                    regions.push((
+                        pool_dest,
+                        layout.expert_stride,
+                        layout.expert_file_offset(eid),
+                    ));
+                    cache.mark_loaded(layer_idx, eid, tensor_type);
+                }
+                if !regions.is_empty() {
+                    task_regions.push(regions);
+                }
+            }
+        }
+
+        if task_regions.is_empty() {
+            return;
+        }
+
+        // Submit to I/O pool and wait
+        let completion = Arc::new(IoCompletion {
+            remaining: AtomicUsize::new(task_regions.len()),
+            layer_idx,
+            update_status: true,
+        });
+
         {
             let mut status = self.layer_status.lock().unwrap();
             status.insert(layer_idx, LayerStatus::Loading);
         }
 
-        self.submit_expert_load_with_status(layer_idx, expert_ids);
+        let pool_lock = self.io_pool.lock().unwrap();
+        if let Some(ref pool) = *pool_lock {
+            if let Some(ref tx) = pool.tx {
+                for regions in task_regions {
+                    let _ = tx.send(IoPoolTask {
+                        regions,
+                        base: pool_base,
+                        completion: completion.clone(),
+                    });
+                }
+            }
+        }
+        drop(pool_lock);
 
-        // Wait for completion
+        // Wait for I/O completion
         let mut status = self.layer_status.lock().unwrap();
         while status.get(&layer_idx).copied() != Some(LayerStatus::Loaded) {
             status = self.layer_notify.wait(status).unwrap();
         }
+    }
 
-        if tracing {
-            let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
-            self.trace
-                .record(TraceEvent::LayerStall { layer: layer_idx, wait_ms });
+    /// Rewrite tensor->data for a layer's fused tensors to their current pool slots.
+    /// Called on neuron cache hits when pool mode is active.
+    fn rewrite_tensor_ptrs_for_layer(&self, layer_idx: u32) {
+        let layouts = match self.expert_layouts.get(&layer_idx) {
+            Some(l) => l,
+            None => return,
+        };
+
+        let pool = self.expert_pool.lock().unwrap();
+        let pool = match pool.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let slot_offsets: Vec<usize> = match pool.layer_slots.get(&layer_idx) {
+            Some(slots) => slots.iter().map(|&s| s * pool.slot_size).collect(),
+            None => return,
+        };
+
+        for (i, layout) in layouts.iter().enumerate() {
+            if i >= slot_offsets.len() {
+                break;
+            }
+            if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
+                if !tensor_ptr.is_null() {
+                    unsafe {
+                        (*tensor_ptr).data =
+                            pool.pool_base.add(slot_offsets[i]) as *mut c_void;
+                    }
+                }
+            }
         }
     }
 
@@ -1047,6 +1210,88 @@ impl Drop for PrefetchState {
     }
 }
 
+/// Expert pool for expert-streaming mode: small mmap'd buffer where expert
+/// tensor data is dynamically loaded into reusable slots.
+pub struct ExpertPool {
+    pub pool_base: *mut u8,
+    pub pool_size: usize,
+    pub slot_size: usize,
+    pub num_slots: usize,
+    /// Which slot each layer's tensors currently occupy: layer -> [slot indices]
+    pub layer_slots: HashMap<u32, Vec<usize>>,
+    /// Free slot indices (LIFO)
+    pub free_slots: Vec<usize>,
+}
+
+unsafe impl Send for ExpertPool {}
+unsafe impl Sync for ExpertPool {}
+
+impl ExpertPool {
+    pub fn new(pool_base: *mut u8, pool_size: usize, slot_size: usize) -> Self {
+        let num_slots = pool_size / slot_size;
+        let free_slots = (0..num_slots).rev().collect();
+        Self {
+            pool_base,
+            pool_size,
+            slot_size,
+            num_slots,
+            layer_slots: HashMap::new(),
+            free_slots,
+        }
+    }
+
+    /// Allocate slots for a layer. Returns pool byte offsets for each slot.
+    pub fn allocate_layer(&mut self, layer_idx: u32, num_tensors: usize) -> Vec<usize> {
+        if let Some(existing) = self.layer_slots.get(&layer_idx) {
+            return existing.iter().map(|&s| s * self.slot_size).collect();
+        }
+
+        let mut slots = Vec::with_capacity(num_tensors);
+        for _ in 0..num_tensors {
+            if let Some(slot) = self.free_slots.pop() {
+                slots.push(slot);
+            } else {
+                // Pool full — evict oldest layer
+                let oldest = self
+                    .layer_slots
+                    .keys()
+                    .filter(|&&l| l != layer_idx)
+                    .copied()
+                    .min()
+                    .unwrap_or(0);
+                self.release_layer(oldest);
+                let slot = self.free_slots.pop().expect("pool exhausted after eviction");
+                slots.push(slot);
+            }
+        }
+        let offsets: Vec<usize> = slots.iter().map(|&s| s * self.slot_size).collect();
+        self.layer_slots.insert(layer_idx, slots);
+        offsets
+    }
+
+    /// Release a layer's slots back to the free list.
+    pub fn release_layer(&mut self, layer_idx: u32) {
+        if let Some(slots) = self.layer_slots.remove(&layer_idx) {
+            for slot in slots {
+                // MADV_FREE the slot's pages
+                unsafe {
+                    libc::madvise(
+                        self.pool_base.add(slot * self.slot_size) as *mut c_void,
+                        self.slot_size,
+                        libc::MADV_FREE,
+                    );
+                }
+                self.free_slots.push(slot);
+            }
+        }
+    }
+
+    /// Get pool byte offset for a specific slot index.
+    pub fn slot_offset(&self, slot_idx: usize) -> usize {
+        slot_idx * self.slot_size
+    }
+}
+
 /// Controls the custom Hypura buffer type for NVMe-tier tensors.
 pub struct HypuraBuftController {
     buft_ptr: hypura_sys::ggml_backend_buffer_type_t,
@@ -1055,6 +1300,8 @@ pub struct HypuraBuftController {
     gguf_data_offset: u64,
     /// Buffer base pointer captured from C callback during model loading
     buffer_base: Mutex<*mut u8>,
+    /// Captured ggml_tensor* pointers for fused expert tensors (for data pointer rewriting)
+    tensor_ptrs: Mutex<HashMap<String, *mut hypura_sys::ggml_tensor>>,
 }
 
 // SAFETY: buft_ptr used only from the creating thread; buffer_base accessed under Mutex
@@ -1071,6 +1318,7 @@ impl HypuraBuftController {
             model_path: model_path.to_path_buf(),
             gguf_data_offset: gguf.data_offset,
             buffer_base: Mutex::new(std::ptr::null_mut()),
+            tensor_ptrs: Mutex::new(HashMap::new()),
         });
 
         let rust_ctx = &*controller as *const Self as *mut c_void;
@@ -1274,6 +1522,8 @@ impl HypuraBuftController {
             co_activation: Mutex::new(co_activation),
             prev_layer_experts: Mutex::new(None),
             expert_streaming: AtomicBool::new(false),
+            expert_pool: Mutex::new(None),
+            fused_tensor_ptrs: HashMap::new(),
             trace_enabled: AtomicBool::new(false),
             trace: IoTrace::new(),
         })
@@ -1281,6 +1531,80 @@ impl HypuraBuftController {
 
     pub fn tensor_map(&self) -> Arc<Mutex<HashMap<String, TensorLocation>>> {
         self.tensor_map.clone()
+    }
+
+    /// Activate pool buffer for expert-streaming mode. Allocates a small pool,
+    /// rewrites fused expert tensor->data pointers to pool slots, then releases
+    /// the original large loading buffer. Returns the ExpertPool.
+    pub fn activate_expert_pool(
+        &self,
+        gguf: &GgufFile,
+        num_experts: u32,
+    ) -> anyhow::Result<ExpertPool> {
+        let buffer = unsafe { hypura_sys::hypura_buft_get_last_buffer(self.buft_ptr) };
+        anyhow::ensure!(!buffer.is_null(), "No buffer allocated");
+
+        // Determine slot size from the largest fused expert tensor
+        let slot_size = gguf
+            .tensors
+            .iter()
+            .filter(|t| {
+                let role = TensorRole::from_name(&t.name);
+                matches!(role, TensorRole::MoeFusedExperts)
+            })
+            .map(|t| t.size_bytes as usize)
+            .max()
+            .unwrap_or(0);
+
+        anyhow::ensure!(slot_size > 0, "No fused expert tensors found");
+
+        // Pool size: 2 layers × 3 fused tensors = 6 slots (current layer + 1 prefetch)
+        let num_slots = 6;
+        let pool_size = num_slots * slot_size;
+
+        tracing::info!(
+            "Expert pool: {} slots × {:.1} MB = {:.1} MB total",
+            num_slots,
+            slot_size as f64 / 1e6,
+            pool_size as f64 / 1e6,
+        );
+
+        // Initialize pool in C
+        let ret = unsafe { hypura_sys::hypura_buffer_init_pool(buffer, pool_size) };
+        anyhow::ensure!(ret == 0, "Failed to allocate expert pool ({pool_size} bytes)");
+
+        let pool_base =
+            unsafe { hypura_sys::hypura_buffer_get_pool_base(buffer) } as *mut u8;
+        anyhow::ensure!(!pool_base.is_null(), "Pool base is null");
+
+        // Rewrite tensor->data for all fused expert tensors to point into the pool.
+        // Initially all point to slot 0 (arbitrary valid address within pool).
+        // The eval_callback will assign real slots before compute.
+        let tensor_ptrs = self.tensor_ptrs.lock().unwrap();
+        for (name, &ptr) in tensor_ptrs.iter() {
+            if !ptr.is_null() {
+                unsafe {
+                    (*ptr).data = pool_base as *mut c_void;
+                }
+                tracing::trace!("Rewrote tensor->data for {name} to pool base");
+            }
+        }
+
+        // Release the original large loading buffer
+        unsafe { hypura_sys::hypura_buffer_release_loading_buffer(buffer) };
+        tracing::info!("Released loading buffer, pool active");
+
+        let pool = ExpertPool::new(pool_base, pool_size, slot_size);
+
+        // Store tensor_ptrs in the pool for later data pointer updates
+        // (handled via PrefetchState.tensor_ptrs instead)
+
+        Ok(pool)
+    }
+
+    /// Get captured tensor pointers (for transfer to PrefetchState).
+    pub fn take_tensor_ptrs(&self) -> HashMap<String, *mut hypura_sys::ggml_tensor> {
+        std::mem::take(&mut *self.tensor_ptrs.lock().unwrap())
     }
 }
 
@@ -1762,11 +2086,28 @@ extern "C" fn on_tensor_loaded_cb(
 }
 
 extern "C" fn on_tensor_init_cb(
-    _rust_ctx: *mut c_void,
-    _tensor: *mut hypura_sys::ggml_tensor,
-    _name: *const std::os::raw::c_char,
+    rust_ctx: *mut c_void,
+    tensor: *mut hypura_sys::ggml_tensor,
+    name: *const std::os::raw::c_char,
 ) {
-    // Reserved for future tensor pointer registry
+    if rust_ctx.is_null() || tensor.is_null() || name.is_null() {
+        return;
+    }
+    let controller = unsafe { &*(rust_ctx as *const HypuraBuftController) };
+    let name_str = unsafe { CStr::from_ptr(name) }
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Capture fused expert tensor pointers for pool data-pointer rewriting
+    let role = TensorRole::from_name(&name_str);
+    if matches!(role, TensorRole::MoeFusedExperts) {
+        controller
+            .tensor_ptrs
+            .lock()
+            .unwrap()
+            .insert(name_str, tensor);
+    }
 }
 
 #[cfg(test)]

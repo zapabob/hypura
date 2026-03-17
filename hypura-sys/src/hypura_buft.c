@@ -10,12 +10,16 @@ typedef struct {
     hypura_on_tensor_loaded_t on_tensor_loaded;
     hypura_on_tensor_init_t   on_tensor_init;
     void *rust_ctx;
+    ggml_backend_buffer_t last_buffer;  /* most recently allocated buffer */
 } hypura_buft_context;
 
 typedef struct {
-    void  *base;
+    void  *base;       /* original mmap'd buffer (loading phase) */
     size_t size;
     hypura_buft_context *buft_ctx;
+    void  *pool_base;  /* pool buffer (inference phase, expert-streaming) */
+    size_t pool_size;
+    int    pool_active; /* 0 = loading phase, 1 = pool phase */
 } hypura_buffer_context;
 
 /* ---------- Buffer vtable ---------- */
@@ -25,6 +29,9 @@ static void hypura_buf_free(ggml_backend_buffer_t buffer) {
     if (ctx) {
         if (ctx->base && ctx->size > 0) {
             munmap(ctx->base, ctx->size);
+        }
+        if (ctx->pool_base && ctx->pool_size > 0) {
+            munmap(ctx->pool_base, ctx->pool_size);
         }
         free(ctx);
     }
@@ -131,7 +138,13 @@ static ggml_backend_buffer_t hypura_buft_alloc_buffer(ggml_backend_buffer_type_t
         .reset        = NULL,
     };
 
-    return ggml_backend_buffer_init(buft, iface, buf_ctx, aligned_size);
+    ggml_backend_buffer_t buf = ggml_backend_buffer_init(buft, iface, buf_ctx, aligned_size);
+
+    /* Store buffer handle for Rust-side pool activation */
+    hypura_buft_context *buft_ctx = (hypura_buft_context *)buft->context;
+    buft_ctx->last_buffer = buf;
+
+    return buf;
 }
 
 static size_t hypura_buft_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -192,4 +205,52 @@ void *hypura_buffer_get_base_ptr(ggml_backend_buffer_t buffer) {
     if (!buffer) return NULL;
     hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
     return ctx ? ctx->base : NULL;
+}
+
+/* --- Pool buffer API --- */
+
+int hypura_buffer_init_pool(ggml_backend_buffer_t buffer, size_t pool_size) {
+    if (!buffer) return -1;
+    hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
+    if (!ctx) return -1;
+
+    size_t aligned = (pool_size + 4095) & ~(size_t)4095;
+    void *pool = mmap(NULL, aligned, PROT_READ | PROT_WRITE,
+                      MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (pool == MAP_FAILED) return -1;
+
+    ctx->pool_base = pool;
+    ctx->pool_size = aligned;
+    return 0;
+}
+
+void hypura_buffer_release_loading_buffer(ggml_backend_buffer_t buffer) {
+    if (!buffer) return;
+    hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
+    if (!ctx) return;
+
+    if (ctx->base && ctx->size > 0) {
+        munmap(ctx->base, ctx->size);
+        ctx->base = NULL;
+        ctx->size = 0;
+    }
+    ctx->pool_active = 1;
+}
+
+void *hypura_buffer_get_pool_base(ggml_backend_buffer_t buffer) {
+    if (!buffer) return NULL;
+    hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
+    return ctx ? ctx->pool_base : NULL;
+}
+
+size_t hypura_buffer_get_pool_size(ggml_backend_buffer_t buffer) {
+    if (!buffer) return 0;
+    hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
+    return ctx ? ctx->pool_size : 0;
+}
+
+ggml_backend_buffer_t hypura_buft_get_last_buffer(ggml_backend_buffer_type_t buft) {
+    if (!buft) return NULL;
+    hypura_buft_context *ctx = (hypura_buft_context *)buft->context;
+    return ctx ? ctx->last_buffer : NULL;
 }
