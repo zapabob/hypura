@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 /* ---------- Context structs ---------- */
 
@@ -22,7 +23,9 @@ typedef struct {
 static void hypura_buf_free(ggml_backend_buffer_t buffer) {
     hypura_buffer_context *ctx = (hypura_buffer_context *)buffer->context;
     if (ctx) {
-        free(ctx->base);
+        if (ctx->base && ctx->size > 0) {
+            munmap(ctx->base, ctx->size);
+        }
         free(ctx);
     }
 }
@@ -93,12 +96,17 @@ static const char *hypura_buft_get_name(ggml_backend_buffer_type_t buft) {
 }
 
 static ggml_backend_buffer_t hypura_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    /* Page-align the allocation for direct I/O compatibility */
+    /* Page-align the allocation for direct I/O compatibility.
+     * Use mmap instead of posix_memalign: on macOS unified memory, mmap pages
+     * are lazily committed on first access. This avoids Metal OOM from a large
+     * virtual reservation — uncommitted mmap pages don't count against Metal's
+     * working set the same way heap allocations do. Pages loaded via pread get
+     * committed; released pages (MADV_FREE) return to uncommitted state. */
     size_t aligned_size = (size + 4095) & ~(size_t)4095;
 
-    void *base = NULL;
-    int ret = posix_memalign(&base, 4096, aligned_size);
-    if (ret != 0 || base == NULL) {
+    void *base = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
+                       MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (base == MAP_FAILED) {
         return NULL;
     }
 

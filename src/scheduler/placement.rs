@@ -260,15 +260,17 @@ fn try_expert_streaming_assign(
         return None; // Either doesn't fit at all, or everything fits (use keep-resident)
     }
 
-    // Metal working set check: virtual allocation of expert buffer + non-expert tensors
-    // must fit within the GPU's recommended max working set
-    let gpu_max = caps.gpu_bytes + GPU_RUNTIME_OVERHEAD; // approximate gpu_max
-    if non_expert_bytes + expert_bytes + (1 << 30) > gpu_max {
+    // On unified memory (Apple Silicon), the expert buffer's virtual address mapping
+    // counts against Metal's working set even if physical pages aren't committed.
+    // Guard against Metal OOM: expert buffer + non-expert must fit in ~80% of total RAM
+    // to leave room for Metal overhead + OS.
+    let total_ram = caps.unified_limit + OS_OVERHEAD;
+    let metal_budget = total_ram * 80 / 100;
+    if non_expert_bytes + expert_bytes > metal_budget {
         tracing::debug!(
-            "Expert-streaming skipped: expert buffer ({:.1} GB) + non-expert ({:.1} GB) exceeds Metal working set ({:.1} GB)",
-            expert_bytes as f64 / (1u64 << 30) as f64,
-            non_expert_bytes as f64 / (1u64 << 30) as f64,
-            gpu_max as f64 / (1u64 << 30) as f64,
+            "Expert-streaming skipped: buffer ({:.1} GB) exceeds Metal budget ({:.1} GB)",
+            (non_expert_bytes + expert_bytes) as f64 / (1u64 << 30) as f64,
+            metal_budget as f64 / (1u64 << 30) as f64,
         );
         return None;
     }
