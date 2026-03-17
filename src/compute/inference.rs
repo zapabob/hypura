@@ -810,13 +810,62 @@ pub fn generate_with_nvme_scheduling(
         prefetch_state.enable_trace();
     }
 
+    // Hybrid residency: keep first N layers' FFN permanently in RAM.
+    // Compute how many layers fit in the memory headroom.
+    if dense_ffn_streaming {
+        // Dense FFN streaming uses use_mmap=false: GPU tensors are 100% committed
+        // (not 60% like mmap mode). Use gpu_bytes directly.
+        let gpu_actual = gpu_bytes;
+        let pool_committed = prefetch_state
+            .expert_pool
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |p| p.pool_size as u64);
+        let committed_so_far = gpu_actual + pool_committed + runtime_overhead;
+        let resident_headroom: u64 = 8 * (1 << 30); // 8 GB safety (Metal + KV + macOS)
+        let resident_budget =
+            total_ram.saturating_sub(committed_so_far + resident_headroom);
+
+        // Compute per-layer FFN size from first layer with layouts
+        let per_layer_ffn: u64 = prefetch_state
+            .dense_ffn_layouts
+            .values()
+            .next()
+            .map(|layouts| layouts.iter().map(|l| l.size as u64).sum())
+            .unwrap_or(0);
+
+        if per_layer_ffn > 0 {
+            let max_resident = (resident_budget / per_layer_ffn) as u32;
+            // Cap conservatively: Metal needs significant headroom for compute
+            // buffers, KV cache, and page cache. On 32 GB M1 Max, 10+ resident
+            // layers causes memory pressure that slows Metal compute more than
+            // the I/O savings. Scale with available memory.
+            let num_resident = max_resident.min(num_layers / 4);
+            if num_resident >= 4 {
+                if let Some((base, size, layers, offsets)) =
+                    prefetch_state.activate_resident_ffn(num_resident)
+                {
+                    let state_mut = unsafe {
+                        &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState)
+                    };
+                    state_mut.resident_ffn_base = base;
+                    state_mut.resident_ffn_size = size;
+                    state_mut.resident_ffn_layers = layers;
+                    state_mut.resident_ffn_offsets = offsets;
+                }
+            }
+        }
+    }
+
     // Eagerly prefetch NVMe layers before the first forward pass.
     if expert_streaming {
         prefetch_state.warm_cache_from_coactivation();
     } else if dense_ffn_streaming {
-        // Pre-load the first few layers' FFN data so the initial eval_callback
-        // doesn't stall. With 12 pool slots we can prime 4 layers.
-        for layer in 0..4.min(num_layers) {
+        // Pre-load the first streaming layers' FFN data so the initial eval_callback
+        // doesn't stall. Skip resident layers (already loaded).
+        let first_streaming = prefetch_state.resident_ffn_layers.len() as u32;
+        for layer in first_streaming..(first_streaming + 4).min(num_layers) {
             if prefetch_state.dense_ffn_layouts.contains_key(&layer) {
                 prefetch_state.prefetch_dense_ffn(layer);
             }
@@ -907,15 +956,15 @@ pub fn generate_with_nvme_scheduling(
             prefetch_state.prefetch_all_nvme();
         }
 
-        // Dense FFN-streaming: pre-submit early layer prefetches before the next
-        // forward pass. At the token boundary, the I/O pipe goes idle (the last
-        // eval_callback has nothing to prefetch past layer 79). Priming layers 0-3
-        // keeps the pipe busy through the sampling/emission gap so the first layers
-        // of the next token don't stall.
+        // Dense FFN-streaming: pre-submit early STREAMING layer prefetches before the
+        // next forward pass. At the token boundary, the I/O pipe goes idle. Priming
+        // the first streaming layers keeps the pipe busy through the sampling gap.
+        // Resident layers are skipped (always ready).
         if dense_ffn_streaming {
+            let first_streaming = prefetch_state.resident_ffn_layers.len() as u32;
             let status = prefetch_state.layer_status.lock().unwrap();
             let mut to_prefetch = Vec::new();
-            for layer in 0..4.min(num_layers) {
+            for layer in first_streaming..(first_streaming + 4).min(num_layers) {
                 if !prefetch_state.dense_ffn_layouts.contains_key(&layer) {
                     continue;
                 }

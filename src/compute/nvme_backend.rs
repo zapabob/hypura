@@ -333,6 +333,17 @@ pub struct PrefetchState {
     /// Captured ggml_tensor* pointers for fused expert tensors (for data pointer rewriting).
     pub fused_tensor_ptrs: HashMap<String, *mut hypura_sys::ggml_tensor>,
 
+    // --- Hybrid residency (dense FFN) ---
+
+    /// Layers whose FFN data is permanently resident in memory (not pool-managed).
+    pub resident_ffn_layers: std::collections::HashSet<u32>,
+    /// Base pointer of the resident FFN buffer (separate from pool).
+    pub resident_ffn_base: *mut u8,
+    /// Total size of the resident FFN buffer (for munmap on drop).
+    pub resident_ffn_size: usize,
+    /// Per-resident-layer tensor: tensor_name → offset within resident buffer.
+    pub resident_ffn_offsets: HashMap<String, usize>,
+
     /// When true, record timestamped I/O events for post-hoc analysis.
     pub trace_enabled: AtomicBool,
     /// Trace event log. Only populated when `trace_enabled` is true.
@@ -1202,6 +1213,170 @@ impl PrefetchState {
         }
     }
 
+    /// Allocate a resident buffer for the first `num_layers` FFN layers and load their
+    /// data from the model file. These layers' tensors point into this permanent buffer
+    /// instead of the pool, eliminating all I/O during inference.
+    ///
+    /// SAFETY: must be called after `activate_dense_ffn_pool` and `start_io_pool`.
+    /// Mutates self through unsafe cast (same pattern as expert pool activation).
+    pub fn activate_resident_ffn(
+        &self,
+        num_resident: u32,
+    ) -> Option<(
+        *mut u8,
+        usize,
+        std::collections::HashSet<u32>,
+        HashMap<String, usize>,
+    )> {
+        if num_resident == 0 {
+            return None;
+        }
+
+        // Compute total size and build offset map
+        let mut total_size: usize = 0;
+        let mut offsets: HashMap<String, usize> = HashMap::new();
+        let mut resident_layers = std::collections::HashSet::new();
+
+        for layer in 0..num_resident {
+            if let Some(layouts) = self.dense_ffn_layouts.get(&layer) {
+                for layout in layouts {
+                    offsets.insert(layout.tensor_name.clone(), total_size);
+                    total_size += layout.size;
+                    // Align to page boundary
+                    total_size = (total_size + 4095) & !4095;
+                }
+                resident_layers.insert(layer);
+            }
+        }
+
+        if total_size == 0 {
+            return None;
+        }
+
+        // Allocate resident buffer
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            tracing::warn!(
+                "Failed to allocate resident FFN buffer ({:.1} GB)",
+                total_size as f64 / 1e9,
+            );
+            return None;
+        }
+        let base = base as *mut u8;
+
+        tracing::info!(
+            "Resident FFN buffer: {:.1} GB for {} layers (layers 0-{})",
+            total_size as f64 / 1e9,
+            num_resident,
+            num_resident - 1,
+        );
+
+        // Load data via I/O pool (blocking)
+        let mut all_regions: Vec<Vec<(usize, usize, u64)>> = Vec::new();
+        for layer in 0..num_resident {
+            if let Some(layouts) = self.dense_ffn_layouts.get(&layer) {
+                for layout in layouts {
+                    if let Some(&offset) = offsets.get(&layout.tensor_name) {
+                        all_regions.push(vec![(offset, layout.size, layout.file_offset)]);
+                    }
+                }
+            }
+        }
+
+        if !all_regions.is_empty() {
+            let load_start = Instant::now();
+            // Use a sentinel layer index for the completion tracker
+            let sentinel_layer = self.num_layers + 1;
+            {
+                let mut status = self.layer_status.lock().unwrap();
+                status.insert(sentinel_layer, LayerStatus::Loading);
+            }
+
+            let completion = Arc::new(IoCompletion {
+                remaining: AtomicUsize::new(all_regions.len()),
+                layer_idx: sentinel_layer,
+                update_status: true,
+            });
+
+            {
+                let pool_lock = self.io_pool.lock().unwrap();
+                if let Some(ref pool) = *pool_lock {
+                    if let Some(ref tx) = pool.tx {
+                        for regions in all_regions {
+                            let _ = tx.send(IoPoolTask {
+                                regions,
+                                base,
+                                completion: completion.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Wait for all I/O to complete
+            let mut status = self.layer_status.lock().unwrap();
+            while status.get(&sentinel_layer).copied() != Some(LayerStatus::Loaded) {
+                status = self.layer_notify.wait(status).unwrap();
+            }
+            status.remove(&sentinel_layer);
+
+            let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(
+                "Resident FFN loaded: {:.1} GB in {:.1}s ({:.1} GB/s)",
+                total_size as f64 / 1e9,
+                load_ms / 1000.0,
+                total_size as f64 / 1e9 / (load_ms / 1000.0),
+            );
+        }
+
+        // Rewrite tensor->data for resident layers
+        for (name, &offset) in &offsets {
+            if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(name) {
+                if !tensor_ptr.is_null() {
+                    unsafe {
+                        (*tensor_ptr).data = base.add(offset) as *mut c_void;
+                    }
+                }
+            }
+        }
+
+        Some((base, total_size, resident_layers, offsets))
+    }
+
+    /// Rewrite tensor->data for resident FFN layers to the permanent resident buffer.
+    fn rewrite_resident_ffn_ptrs(&self, layer_idx: u32) {
+        let layouts = match self.dense_ffn_layouts.get(&layer_idx) {
+            Some(l) => l,
+            None => return,
+        };
+
+        if self.resident_ffn_base.is_null() {
+            return;
+        }
+
+        for layout in layouts {
+            if let Some(&offset) = self.resident_ffn_offsets.get(&layout.tensor_name) {
+                if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
+                    if !tensor_ptr.is_null() {
+                        unsafe {
+                            (*tensor_ptr).data =
+                                self.resident_ffn_base.add(offset) as *mut c_void;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Rewrite tensor->data for dense FFN tensors to their current pool slots.
     fn rewrite_dense_ffn_ptrs(&self, layer_idx: u32) {
         let layouts = match self.dense_ffn_layouts.get(&layer_idx) {
@@ -1463,6 +1638,15 @@ impl Drop for PrefetchState {
                 tracing::warn!("Failed to save co-activation data: {e}");
             } else {
                 tracing::info!("Co-activation data saved to {}", path.display());
+            }
+        }
+        // Release resident FFN buffer
+        if !self.resident_ffn_base.is_null() && self.resident_ffn_size > 0 {
+            unsafe {
+                libc::munmap(
+                    self.resident_ffn_base as *mut libc::c_void,
+                    self.resident_ffn_size,
+                );
             }
         }
     }
@@ -1880,6 +2064,10 @@ impl HypuraBuftController {
             dense_ffn_layouts,
             expert_pool: Mutex::new(None),
             fused_tensor_ptrs: HashMap::new(),
+            resident_ffn_layers: std::collections::HashSet::new(),
+            resident_ffn_base: std::ptr::null_mut(),
+            resident_ffn_size: 0,
+            resident_ffn_offsets: HashMap::new(),
             trace_enabled: AtomicBool::new(false),
             trace: IoTrace::new(),
         })
@@ -2298,9 +2486,15 @@ pub extern "C" fn eval_callback(
 
 /// Dense FFN-streaming eval_callback path: load FFN tensors on demand per layer.
 fn eval_callback_dense_ffn_streaming(state: &PrefetchState, layer_idx: u32, ask: bool) -> bool {
+    let is_resident = state.resident_ffn_layers.contains(&layer_idx);
+
     if ask {
-        // Before computation: load FFN tensors for this layer if it has them
-        if state.dense_ffn_layouts.contains_key(&layer_idx) {
+        // Before computation: load FFN tensors for this layer
+        if is_resident {
+            // Resident layer: rewrite tensor->data to permanent buffer, zero I/O
+            state.rewrite_resident_ffn_ptrs(layer_idx);
+        } else if state.dense_ffn_layouts.contains_key(&layer_idx) {
+            // Streaming layer: load from NVMe into pool slot
             state.ensure_dense_ffn_loaded(layer_idx);
         }
     } else {
@@ -2313,9 +2507,10 @@ fn eval_callback_dense_ffn_streaming(state: &PrefetchState, layer_idx: u32, ask:
             let prev_layer = prev as u32;
             if prev_layer != layer_idx
                 && prev_layer < layer_idx
+                && !state.resident_ffn_layers.contains(&prev_layer)
                 && state.dense_ffn_layouts.contains_key(&prev_layer)
             {
-                // Release previous layer's pool slots and status
+                // Release previous STREAMING layer's pool slots and status
                 {
                     let mut pool = state.expert_pool.lock().unwrap();
                     if let Some(pool) = pool.as_mut() {
@@ -2327,9 +2522,7 @@ fn eval_callback_dense_ffn_streaming(state: &PrefetchState, layer_idx: u32, ask:
             }
         }
 
-        // Prefetch ahead: submit I/O for the next 3 FFN layers so the I/O pipe
-        // stays busy continuously. With 12 pool slots (4 layers × 3 tensors),
-        // we can hold current + 3 prefetched layers simultaneously.
+        // Prefetch ahead: only submit for streaming (non-resident) layers
         {
             let status = state.layer_status.lock().unwrap();
             let mut to_prefetch = Vec::new();
@@ -2337,6 +2530,9 @@ fn eval_callback_dense_ffn_streaming(state: &PrefetchState, layer_idx: u32, ask:
                 let target = layer_idx + lookahead;
                 if target >= state.num_layers {
                     break;
+                }
+                if state.resident_ffn_layers.contains(&target) {
+                    continue;
                 }
                 if !state.dense_ffn_layouts.contains_key(&target) {
                     continue;

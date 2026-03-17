@@ -587,6 +587,82 @@ used for larger pool (more prefetch depth), partial layer residency, or larger K
 
 ---
 
+## Hybrid Residency for Dense FFN-Streaming: IN PROGRESS (2026-03-17)
+
+### Change 17: Keep first N layers' FFN permanently resident
+
+**Problem:** With all 80 layers streaming from NVMe, the I/O pipe (50ms/layer) is slower
+than compute (24ms/layer). Even with 3-layer prefetch, the pipe falls behind. With ~20 GB
+of memory headroom, we can pin some layers' FFN data in RAM permanently.
+
+**Approach:** Allocate a separate mmap buffer for the first N layers' FFN data (N determined
+by available memory). These layers need zero I/O during inference, giving the I/O pipe a
+~N×24ms head start before streaming layers begin. Transparent within `DenseFfnStreaming` —
+the `resident_ffn_layers` set being non-empty is the runtime flag.
+
+#### Changes:
+
+- `src/compute/nvme_backend.rs`:
+  - `PrefetchState`: add `resident_ffn_layers`, `resident_ffn_base`, `resident_ffn_offsets`,
+    `resident_ffn_size` fields
+  - `allocate_resident_ffn_buffer()`: compute which layers fit, mmap resident buffer,
+    build tensor-name→offset map
+  - `load_resident_ffn_data()`: pread resident layers' FFN data using I/O pool at startup
+  - `rewrite_resident_ffn_ptrs()`: point resident layers' tensor->data to resident buffer
+  - `eval_callback_dense_ffn_streaming()`: skip pool allocation and I/O for resident layers,
+    skip release for resident layers, skip prefetch for resident layers
+  - Drop impl: munmap resident buffer
+
+- `src/compute/inference.rs`:
+  - Compute resident budget: total_ram - committed - 4 GB headroom
+  - Call allocate + load after pool activation
+  - Adjust between-token prefetch to skip resident layers
+
+#### Memory budget (Llama 70B Q4_K_M on M1 Max 32 GB):
+
+- Non-FFN on GPU: ~7.8 GB
+- Pool buffer: ~2.3 GB
+- Runtime overhead: ~2.5 GB (KV cache + Metal compute)
+- Safety headroom: 4 GB
+- Available for resident: 32 - 7.8 - 2.3 - 2.5 - 4 = ~15.4 GB
+- Per-layer FFN: ~427 MB → max ~36 resident layers
+- Cap at half (40 layers) → 36 layers resident, 44 streaming
+- Resident data: ~15.4 GB, loaded at startup in ~2.3s
+
+#### Expected performance:
+
+- Resident compute runway: 36 layers × 24ms = 864ms
+- During that time, I/O pipe preloads: 864ms / 50ms ≈ 17 streaming layers
+- Only 44 - 17 = 27 streaming layers could stall
+- Expected: ~0.4-0.6 tok/s (vs 0.3 currently)
+
+#### Status: IMPLEMENTED, MARGINAL IMPROVEMENT ON M1 MAX 32 GB
+
+Test command: `cargo run --release -- bench --max-tokens 3 --context 512 ./test-models/llama-3.3-70b-q4_k_m.gguf`
+
+#### Test Results
+
+| Resident layers | Resident size | Token 2 stalls | Token 2 decode | tok/s | Problem |
+|----------------|--------------|---------------|---------------|-------|---------|
+| 0 (baseline) | 0 | 29 | 2984ms | 0.30 | — |
+| 10 | 4.6 GB | 33 | 3275ms | 0.30 | Same perf, no improvement |
+| 27 | 11.6 GB | 13 | 7940ms | 0.10 | Memory pressure, Metal 3x slower |
+| 40 | 17.1 GB | 28 | 16395ms | 0.10 | Severe memory pressure |
+
+**Conclusion:** On M1 Max 32 GB, hybrid residency is a wash. Each resident layer saves
+~24ms of I/O overlap opportunity but consumes ~427 MB. More than ~10 layers causes
+enough memory pressure to slow Metal compute beyond the I/O savings. The code is correct
+and would help on machines with >48 GB (where 20+ layers could be resident without
+pressure), but is not beneficial at 32 GB.
+
+**Key learning:** The `gpu_committed_estimate = gpu_bytes * 60%` heuristic is wrong for
+`use_mmap=false` (dense FFN streaming). GPU tensors are 100% committed. KV cache
+(~2.6 GB at context 512) and Metal compute buffers are not accounted for in the simple
+`runtime_overhead = 2.5 GB` estimate. Actual overhead: ~5+ GB. The resident budget
+calculation now uses `gpu_bytes` directly and 8 GB safety headroom, capped at 25% of layers.
+
+---
+
 ## Next Optimizations (post expert-streaming)
 
 ### Change 11: Increase n_batch for Expert-Streaming Prompt Eval
