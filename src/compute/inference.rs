@@ -592,13 +592,17 @@ pub fn generate_with_nvme_scheduling(
         .count();
     tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
 
-    // Use mmap so GPU-offloaded layers get efficient Metal shared buffers.
-    // Non-GPU tensors are routed to our Hypura buffer via overrides (posix_memalign,
-    // not Metal) so they don't count against recommendedMaxWorkingSetSize.
+    // Expert-streaming: use_mmap=false so Metal creates individual GPU buffers for
+    // non-expert tensors (~1.1 GB) instead of one giant MTLBuffer for the entire
+    // model file. With mmap, Metal wraps the full 30.9 GB file as one GPU resource,
+    // exceeding the working set limit even though only 1.1 GB is actually on GPU.
+    //
+    // Other modes: use_mmap=true for efficient Metal shared buffers.
+    let use_mmap = plan.inference_mode != InferenceMode::ExpertStreaming;
     let model = LlamaModel::load_with_overrides(
         model_path,
         n_gpu_layers,
-        true,
+        use_mmap,
         overrides.as_ptr(),
     )?;
 
@@ -740,10 +744,13 @@ pub fn generate_with_nvme_scheduling(
     let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
 
     let kv_quant = plan.kv_cache_plan.kv_quantization;
+    // Expert-streaming: use small batch size to limit Metal compute buffer for MoE
+    // intermediates. Prompt eval is slower but generation (n_batch=1) is unaffected.
+    let effective_batch = if expert_streaming { 1 } else { config.n_batch };
     let mut ctx = LlamaContext::new_with_callback_and_kv(
         &model,
         config.n_ctx,
-        config.n_batch,
+        effective_batch,
         config.n_threads,
         Some(eval_callback),
         state_ptr,
@@ -793,10 +800,10 @@ pub fn generate_with_nvme_scheduling(
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Process prompt
+    // Process prompt (expert-streaming uses n_batch=1 to limit Metal compute buffer)
     let prompt_start = Instant::now();
-    let batch_size = config.n_batch as usize;
-    for chunk in tokens.chunks(batch_size) {
+    let prompt_batch = effective_batch as usize;
+    for chunk in tokens.chunks(prompt_batch) {
         ctx.decode(chunk)?;
     }
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
