@@ -779,8 +779,10 @@ pub fn generate_with_nvme_scheduling(
     }
 
     // Eagerly prefetch NVMe layers before the first forward pass.
-    // Expert-streaming: don't prefetch — experts loaded on demand by eval_callback.
-    if !expert_streaming {
+    // Expert-streaming: warm the neuron cache from co-activation data instead.
+    if expert_streaming {
+        prefetch_state.warm_cache_from_coactivation();
+    } else {
         prefetch_state.prefetch_all_nvme();
     }
 

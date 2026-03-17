@@ -1041,6 +1041,70 @@ impl PrefetchState {
         }
     }
 
+    /// Warm the neuron cache by pre-loading the most frequently activated experts
+    /// from co-activation data. Reduces first-token stalls in expert-streaming mode.
+    pub fn warm_cache_from_coactivation(&self) {
+        let co_act = self.co_activation.lock().unwrap();
+        if !co_act.has_data() {
+            tracing::info!("No co-activation data available for cache warming");
+            return;
+        }
+
+        let num_to_load = self.num_experts_used as usize;
+        let mut layers_warmed = 0u32;
+        let mut experts_loaded = 0u32;
+
+        for (&layer_idx, _) in &self.expert_layouts {
+            // Get top-K experts by self-activation frequency (diagonal of layer_counts)
+            let layer_counts = co_act.layer_counts();
+            let l = layer_idx as usize;
+            if l >= layer_counts.len() {
+                continue;
+            }
+
+            let mut freq: Vec<(u32, u32)> = (0..self.num_experts_total)
+                .map(|e| {
+                    let count = if (e as usize) < layer_counts[l].len() {
+                        layer_counts[l][e as usize][e as usize]
+                    } else {
+                        0
+                    };
+                    (e, count)
+                })
+                .collect();
+            freq.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let top_experts: Vec<u32> = freq
+                .iter()
+                .take(num_to_load)
+                .filter(|(_, count)| *count > 0)
+                .map(|(eid, _)| *eid)
+                .collect();
+
+            if top_experts.is_empty() {
+                continue;
+            }
+
+            // Store as predicted experts so the eval_callback uses them
+            self.selected_experts
+                .lock()
+                .unwrap()
+                .insert(layer_idx, top_experts.clone());
+
+            // Pre-load into pool
+            self.ensure_experts_loaded(layer_idx, &top_experts);
+
+            experts_loaded += top_experts.len() as u32;
+            layers_warmed += 1;
+        }
+
+        if layers_warmed > 0 {
+            tracing::info!(
+                "Cache warmed: {experts_loaded} experts across {layers_warmed} layers from co-activation data"
+            );
+        }
+    }
+
     /// Enable I/O tracing for diagnostic analysis.
     pub fn enable_trace(&self) {
         self.trace_enabled.store(true, Ordering::Relaxed);
