@@ -797,10 +797,10 @@ The iobench proves the raw I/O path achieves 6.8 GB/s. The 300 MB/s effective th
 - **Change 6** (cache heuristic) — deferred (LRU is sufficient at 99.5% hit rate)
 - **Change 7** (layer skip) — deferred
 - **Changes 8-10** — SUPERSEDED by expert-streaming
-- **Change 11** (n_batch tuning) — **NEXT**
+- **Change 11** (n_batch tuning) — DONE (n_batch=1 cap removed in earlier session, Mixtral prompt eval 4.5s → 1.2s)
 - **Change 12** (warm cache) — planned
 - **Change 13** (dense FFN-streaming) — DONE: 0.20 tok/s (6.7x over FullStreaming 0.03). Bottleneck is per-layer I/O stalls (~50ms × 80 layers)
-- **Change 14** (pool/cache tuning) — planned
+- **Change 14** (pool/cache tuning) — DONE: unified MemoryBudget, dynamic pool slots, scaled prefetch lookahead
 - **Change 15** (deeper prefetch) — planned
 
 ---

@@ -698,16 +698,68 @@ pub fn generate_with_nvme_scheduling(
     }
     let expert_streaming = plan.inference_mode == InferenceMode::ExpertStreaming;
     let dense_ffn_streaming = plan.inference_mode == InferenceMode::DenseFfnStreaming;
+    let any_streaming = expert_streaming || dense_ffn_streaming;
+
+    // Unified memory budget for pool sizing and residency decisions.
+    // Streaming modes use use_mmap=false → GPU tensors 100% committed.
+    let metadata_for_budget = ModelMetadata::from_gguf(gguf).ok();
+    let head_dim = metadata_for_budget
+        .as_ref()
+        .map(|m| {
+            if m.num_heads > 0 {
+                m.embedding_dim as u64 / m.num_heads as u64
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+    let num_kv_heads = metadata_for_budget
+        .as_ref()
+        .map(|m| m.num_kv_heads)
+        .unwrap_or(0);
+
+    let memory_budget = MemoryBudget::compute(
+        total_ram,
+        gpu_bytes,
+        !any_streaming, // use_mmap=false for streaming modes
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        config.n_ctx,
+        plan.kv_cache_plan.kv_quantization,
+    );
+
+    tracing::info!(
+        "Memory budget: {:.1} GB committed ({:.1} GPU + {:.1} KV + {:.1} Metal + {:.1} OS), {:.1} GB available",
+        memory_budget.total_committed as f64 / 1e9,
+        memory_budget.gpu_committed as f64 / 1e9,
+        memory_budget.kv_cache_bytes as f64 / 1e9,
+        memory_budget.metal_overhead as f64 / 1e9,
+        memory_budget.os_overhead as f64 / 1e9,
+        memory_budget.available as f64 / 1e9,
+    );
 
     if expert_streaming {
         // Expert-streaming: non-expert tensors on GPU/Metal, experts on NVMe buffer.
         let num_experts = gguf.get_u32("expert_count").unwrap_or(8);
-        let pool = controller.activate_expert_pool(gguf, num_experts)?;
+        // Dynamic pool slots: each slot = largest fused expert tensor (~385 MB for Mixtral).
+        // Min 6 (2 layers × 3 tensors), max 18 (6 layers).
+        let expert_slot_size = gguf
+            .tensors
+            .iter()
+            .filter(|t| matches!(TensorRole::from_name(&t.name), TensorRole::MoeFusedExperts))
+            .map(|t| t.size_bytes)
+            .max()
+            .unwrap_or(1);
+        let num_slots = memory_budget.pool_slots(expert_slot_size, 6, 18);
+        let pool = controller.activate_expert_pool(gguf, num_experts, num_slots)?;
+        let memory_budget = memory_budget.with_pool(pool.pool_size as u64);
         tracing::info!(
-            "Expert-streaming mode: {:.2} GB expert tensors on NVMe, {:.0} MB pool ({} slots)",
+            "Expert-streaming mode: {:.2} GB expert tensors on NVMe, {:.0} MB pool ({} slots), {:.1} GB available",
             nvme_bytes as f64 / (1u64 << 30) as f64,
             pool.pool_size as f64 / 1e6,
             pool.num_slots,
+            memory_budget.available as f64 / 1e9,
         );
 
         *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
@@ -722,20 +774,40 @@ pub fn generate_with_nvme_scheduling(
             .store(true, std::sync::atomic::Ordering::Relaxed);
     } else if dense_ffn_streaming {
         // Dense FFN-streaming: attention+norms on GPU, FFN on NVMe pool buffer.
-        let pool = controller.activate_dense_ffn_pool(gguf)?;
+        // Dynamic pool slots: each slot = largest FFN tensor (~193 MB for Llama 70B).
+        // Min 6 (2 layers × 3 tensors), max 24 (8 layers).
+        let ffn_slot_size = gguf
+            .tensors
+            .iter()
+            .filter(|t| {
+                matches!(
+                    TensorRole::from_name(&t.name),
+                    TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                )
+            })
+            .map(|t| t.size_bytes)
+            .max()
+            .unwrap_or(1);
+        let num_slots = memory_budget.pool_slots(ffn_slot_size, 6, 24);
+        let pool = controller.activate_dense_ffn_pool(gguf, num_slots)?;
+        let _memory_budget = memory_budget.with_pool(pool.pool_size as u64);
         tracing::info!(
-            "Dense FFN-streaming mode: {:.2} GB FFN tensors on NVMe, {:.0} MB pool ({} slots)",
+            "Dense FFN-streaming mode: {:.2} GB FFN tensors on NVMe, {:.0} MB pool ({} slots), {:.1} GB available",
             nvme_bytes as f64 / (1u64 << 30) as f64,
             pool.pool_size as f64 / 1e6,
             pool.num_slots,
+            _memory_budget.available as f64 / 1e9,
         );
 
+        // Prefetch lookahead = (pool_slots / 3) - 1 (reserve current layer)
+        let lookahead = ((num_slots / 3).saturating_sub(1)).max(1) as u32;
         *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
         let tensor_ptrs = controller.take_tensor_ptrs();
         let state_mut = unsafe {
             &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState)
         };
         state_mut.fused_tensor_ptrs = tensor_ptrs;
+        state_mut.dense_ffn_lookahead = lookahead;
 
         prefetch_state
             .dense_ffn_streaming
@@ -811,21 +883,26 @@ pub fn generate_with_nvme_scheduling(
     }
 
     // Hybrid residency: keep first N layers' FFN permanently in RAM.
-    // Compute how many layers fit in the memory headroom.
+    // Uses the unified MemoryBudget (already accounts for GPU, KV, Metal, OS, pool).
     if dense_ffn_streaming {
-        // Dense FFN streaming uses use_mmap=false: GPU tensors are 100% committed
-        // (not 60% like mmap mode). Use gpu_bytes directly.
-        let gpu_actual = gpu_bytes;
-        let pool_committed = prefetch_state
+        let pool_size = prefetch_state
             .expert_pool
             .lock()
             .unwrap()
             .as_ref()
             .map_or(0, |p| p.pool_size as u64);
-        let committed_so_far = gpu_actual + pool_committed + runtime_overhead;
-        let resident_headroom: u64 = 8 * (1 << 30); // 8 GB safety (Metal + KV + macOS)
-        let resident_budget =
-            total_ram.saturating_sub(committed_so_far + resident_headroom);
+        let budget = MemoryBudget::compute(
+            total_ram,
+            gpu_bytes,
+            false, // use_mmap=false for dense FFN streaming
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            config.n_ctx,
+            plan.kv_cache_plan.kv_quantization,
+        )
+        .with_pool(pool_size);
+        let resident_budget = budget.available;
 
         // Compute per-layer FFN size from first layer with layouts
         let per_layer_ffn: u64 = prefetch_state
@@ -842,7 +919,11 @@ pub fn generate_with_nvme_scheduling(
             // layers causes memory pressure that slows Metal compute more than
             // the I/O savings. Scale with available memory.
             let num_resident = max_resident.min(num_layers / 4);
-            if num_resident >= 4 {
+            // Only activate residency when available memory is >50% of total RAM.
+            // On 32 GB M1 Max, residency causes memory pressure that slows Metal
+            // compute more than the I/O savings. Needs 64 GB+ to be beneficial.
+            let min_available_for_residency = total_ram * 60 / 100;
+            if num_resident >= 4 && budget.available > min_available_for_residency {
                 if let Some((base, size, layers, offsets)) =
                     prefetch_state.activate_resident_ffn(num_resident)
                 {

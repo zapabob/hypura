@@ -328,6 +328,8 @@ pub struct PrefetchState {
     pub dense_ffn_streaming: AtomicBool,
     /// Per-layer dense FFN tensor info for pool-based loading.
     pub dense_ffn_layouts: HashMap<u32, Vec<DenseFfnLayout>>,
+    /// Prefetch lookahead depth for dense FFN streaming (scales with pool slots).
+    pub dense_ffn_lookahead: u32,
     /// Pool buffer for expert-streaming (slot allocator + pool base).
     pub expert_pool: Mutex<Option<ExpertPool>>,
     /// Captured ggml_tensor* pointers for fused expert tensors (for data pointer rewriting).
@@ -2062,6 +2064,7 @@ impl HypuraBuftController {
             expert_streaming: AtomicBool::new(false),
             dense_ffn_streaming: AtomicBool::new(false),
             dense_ffn_layouts,
+            dense_ffn_lookahead: 3, // default, updated after pool activation
             expert_pool: Mutex::new(None),
             fused_tensor_ptrs: HashMap::new(),
             resident_ffn_layers: std::collections::HashSet::new(),
@@ -2083,7 +2086,8 @@ impl HypuraBuftController {
     pub fn activate_expert_pool(
         &self,
         gguf: &GgufFile,
-        num_experts: u32,
+        _num_experts: u32,
+        num_slots: usize,
     ) -> anyhow::Result<ExpertPool> {
         let buffer = unsafe { hypura_sys::hypura_buft_get_last_buffer(self.buft_ptr) };
         anyhow::ensure!(!buffer.is_null(), "No buffer allocated");
@@ -2102,8 +2106,7 @@ impl HypuraBuftController {
 
         anyhow::ensure!(slot_size > 0, "No fused expert tensors found");
 
-        // Pool size: 2 layers × 3 fused tensors = 6 slots (current layer + 1 prefetch)
-        let num_slots = 6;
+        // Caller provides slot count based on available memory.
         let pool_size = num_slots * slot_size;
 
         tracing::info!(
@@ -2148,7 +2151,11 @@ impl HypuraBuftController {
 
     /// Activate pool buffer for dense FFN streaming. Same as expert pool but sized
     /// for individual FFN tensors (gate, up, down) rather than fused expert tensors.
-    pub fn activate_dense_ffn_pool(&self, gguf: &GgufFile) -> anyhow::Result<ExpertPool> {
+    pub fn activate_dense_ffn_pool(
+        &self,
+        gguf: &GgufFile,
+        num_slots: usize,
+    ) -> anyhow::Result<ExpertPool> {
         let buffer = unsafe { hypura_sys::hypura_buft_get_last_buffer(self.buft_ptr) };
         anyhow::ensure!(!buffer.is_null(), "No buffer allocated");
 
@@ -2169,8 +2176,7 @@ impl HypuraBuftController {
 
         anyhow::ensure!(slot_size > 0, "No FFN tensors found");
 
-        // 12 slots: 4 layers × 3 FFN tensors (current + 3 prefetched ahead)
-        let num_slots = 12;
+        // Caller provides slot count based on available memory.
         let pool_size = num_slots * slot_size;
 
         tracing::info!(
@@ -2522,11 +2528,13 @@ fn eval_callback_dense_ffn_streaming(state: &PrefetchState, layer_idx: u32, ask:
             }
         }
 
-        // Prefetch ahead: only submit for streaming (non-resident) layers
+        // Prefetch ahead: only submit for streaming (non-resident) layers.
+        // Lookahead depth scales with pool size.
         {
             let status = state.layer_status.lock().unwrap();
             let mut to_prefetch = Vec::new();
-            for lookahead in 1..=3 {
+            let max_lookahead = state.dense_ffn_lookahead;
+            for lookahead in 1..=max_lookahead {
                 let target = layer_idx + lookahead;
                 if target >= state.num_layers {
                     break;
