@@ -61,11 +61,11 @@ Use [Conventional Commits](https://www.conventionalcommits.org/): `feat(scope): 
 
 | Model | Mode | tok/s | Notes |
 |-------|------|-------|-------|
-| Mixtral 8x7B Q5_K_M (30.9 GB) | keep-resident | 1.3 | 60% improvement from IoPool parallel first-pass loading |
-| Llama 3.3 70B Q4_K_M (39.6 GB) | streaming | 0.03 | NVMe controller bound — multi-threading doesn't help when I/O is sequential |
+| Mixtral 8x7B Q5_K_M (30.9 GB) | expert-streaming | 2.19 | 2.5x over keep-resident; 99.5% neuron cache hit rate |
+| Llama 3.3 70B Q4_K_M (39.6 GB) | dense-FFN-streaming | 0.20 | 6.7x over FullStreaming; all 80 layers on Metal; bottleneck is per-layer I/O stalls |
 
 ### Known limitations
 
-- Heavy-overflow streaming (>10 GB NVMe spill) is bottlenecked by NVMe controller bandwidth, not fd contention or thread count
+- Dense FFN-streaming (Llama 70B): per-layer I/O stalls (~50ms × 80 layers) dominate decode time; deeper prefetch needed
 - Co-activation predictions need 100+ tokens of inference to accumulate useful data
 - `hypura optimize` writes a full copy of the model file

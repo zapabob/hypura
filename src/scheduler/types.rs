@@ -61,6 +61,8 @@ pub enum InferenceMode {
     KeepResident,
     /// MoE model: non-expert tensors resident, experts streamed from NVMe on demand.
     ExpertStreaming,
+    /// Dense model: attention + norms resident, FFN tensors streamed from NVMe on demand.
+    DenseFfnStreaming,
     /// Heavy NVMe spill: all NVMe layers streamed, loaded/released per token.
     FullStreaming,
 }

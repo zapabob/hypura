@@ -404,22 +404,29 @@ pub fn gpu_layers_from_placement(
     gpu_budget_bytes: u64,
 ) -> i32 {
     let expert_streaming = plan.inference_mode == InferenceMode::ExpertStreaming;
+    let dense_ffn_streaming = plan.inference_mode == InferenceMode::DenseFfnStreaming;
     let mut max_layer: i32 = -1;
     let mut first_nvme_layer: Option<u32> = None;
 
-    // Compute per-layer sizes (excluding expert tensors in expert-streaming mode)
+    // Compute per-layer sizes (excluding streamed tensors from GPU budget)
     let mut layer_sizes: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
 
     for t in &gguf.tensors {
         if let Some(layer_idx) = t.layer_index {
             max_layer = max_layer.max(layer_idx as i32);
 
-            // In expert-streaming, expert tensors go to the Hypura buffer,
-            // not Metal shared buffers — don't count them.
+            // In streaming modes, NVMe-streamed tensors go to the Hypura pool buffer,
+            // not Metal shared buffers — don't count them for GPU budget/NVMe cutoff.
             if expert_streaming {
                 let role = TensorRole::from_name(&t.name);
                 if matches!(role, TensorRole::MoeFusedExperts) {
-                    continue; // Skip expert tensors for GPU budget/NVMe cutoff
+                    continue;
+                }
+            }
+            if dense_ffn_streaming {
+                let role = TensorRole::from_name(&t.name);
+                if matches!(role, TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown) {
+                    continue;
                 }
             }
 
@@ -592,13 +599,20 @@ pub fn generate_with_nvme_scheduling(
         .count();
     tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
 
-    // Expert-streaming: use_mmap=false so Metal creates individual GPU buffers for
-    // non-expert tensors (~1.1 GB) instead of one giant MTLBuffer for the entire
-    // model file. With mmap, Metal wraps the full 30.9 GB file as one GPU resource,
-    // exceeding the working set limit even though only 1.1 GB is actually on GPU.
-    //
-    // Other modes: use_mmap=true for efficient Metal shared buffers.
-    let use_mmap = plan.inference_mode != InferenceMode::ExpertStreaming;
+    // Expert/dense-FFN streaming: use_mmap=false so Metal creates individual GPU buffers
+    // for resident tensors instead of one giant MTLBuffer for the entire model file.
+    let use_mmap = !matches!(
+        plan.inference_mode,
+        InferenceMode::ExpertStreaming | InferenceMode::DenseFfnStreaming
+    );
+
+    // Dense FFN streaming: redirect FFN tensor fread to a small scratch buffer during
+    // model loading. Without this, fread commits ~22 GB of anonymous mmap pages for
+    // FFN tensors, causing OOM on 32 GB machines.
+    if plan.inference_mode == InferenceMode::DenseFfnStreaming {
+        controller.enable_dense_ffn_scratch(gguf);
+    }
+
     let model = LlamaModel::load_with_overrides(
         model_path,
         n_gpu_layers,
@@ -683,10 +697,10 @@ pub fn generate_with_nvme_scheduling(
         );
     }
     let expert_streaming = plan.inference_mode == InferenceMode::ExpertStreaming;
+    let dense_ffn_streaming = plan.inference_mode == InferenceMode::DenseFfnStreaming;
 
     if expert_streaming {
         // Expert-streaming: non-expert tensors on GPU/Metal, experts on NVMe buffer.
-        // Activate pool buffer: allocate small pool, rewrite tensor->data, release loading buffer.
         let num_experts = gguf.get_u32("expert_count").unwrap_or(8);
         let pool = controller.activate_expert_pool(gguf, num_experts)?;
         tracing::info!(
@@ -696,11 +710,8 @@ pub fn generate_with_nvme_scheduling(
             pool.num_slots,
         );
 
-        // Transfer pool and tensor pointers to PrefetchState
         *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
-        // Note: fused_tensor_ptrs is set in build_prefetch_state from controller
         let tensor_ptrs = controller.take_tensor_ptrs();
-        // SAFETY: PrefetchState is behind Arc, tensor_ptrs are stable pointers from model loading
         let state_mut = unsafe {
             &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState)
         };
@@ -708,6 +719,26 @@ pub fn generate_with_nvme_scheduling(
 
         prefetch_state
             .expert_streaming
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    } else if dense_ffn_streaming {
+        // Dense FFN-streaming: attention+norms on GPU, FFN on NVMe pool buffer.
+        let pool = controller.activate_dense_ffn_pool(gguf)?;
+        tracing::info!(
+            "Dense FFN-streaming mode: {:.2} GB FFN tensors on NVMe, {:.0} MB pool ({} slots)",
+            nvme_bytes as f64 / (1u64 << 30) as f64,
+            pool.pool_size as f64 / 1e6,
+            pool.num_slots,
+        );
+
+        *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
+        let tensor_ptrs = controller.take_tensor_ptrs();
+        let state_mut = unsafe {
+            &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState)
+        };
+        state_mut.fused_tensor_ptrs = tensor_ptrs;
+
+        prefetch_state
+            .dense_ffn_streaming
             .store(true, std::sync::atomic::Ordering::Relaxed);
     } else {
         prefetch_state
@@ -724,9 +755,10 @@ pub fn generate_with_nvme_scheduling(
     // layers will be loaded lazily via ensure_layer_loaded on first use,
     // then kept resident (not released) for subsequent tokens.
     // Expert-streaming never preloads — experts are loaded on demand.
-    if !expert_streaming && should_preload {
+    let any_streaming = expert_streaming || dense_ffn_streaming;
+    if !any_streaming && should_preload {
         prefetch_state.preload_ram_layers();
-    } else if keep_resident && !expert_streaming {
+    } else if keep_resident && !any_streaming {
         tracing::info!(
             "Skipping preload: model {:.1} GB exceeds preload threshold {:.1} GB (will load lazily)",
             model_total_bytes as f64 / (1u64 << 30) as f64,
@@ -774,19 +806,19 @@ pub fn generate_with_nvme_scheduling(
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
     // Enable I/O tracing for streaming/expert-streaming diagnostics.
-    if !keep_resident || expert_streaming {
+    if !keep_resident || any_streaming {
         prefetch_state.enable_trace();
     }
 
     // Eagerly prefetch NVMe layers before the first forward pass.
-    // Expert-streaming: warm the neuron cache from co-activation data instead.
+    // Streaming modes: expert-streaming warms cache, dense FFN does nothing (loaded on demand).
     if expert_streaming {
         prefetch_state.warm_cache_from_coactivation();
-    } else {
+    } else if !dense_ffn_streaming {
         prefetch_state.prefetch_all_nvme();
     }
 
-    if keep_resident && !expert_streaming {
+    if keep_resident && !any_streaming {
         // Keep-resident mode: disable the eval callback immediately. Layer data
         // is provided by llama.cpp's own mmap mechanism (use_mmap=true) — our
         // buffer's posix_memalign pages are overlaid with mmap file pages during
@@ -864,7 +896,7 @@ pub fn generate_with_nvme_scheduling(
         // In standard streaming mode, request NVMe layers before next forward pass.
         // Keep-resident and expert-streaming modes don't need this — keep-resident
         // has all data loaded, expert-streaming loads experts via eval_callback.
-        if !keep_resident && !expert_streaming {
+        if !keep_resident && !any_streaming {
             prefetch_state.prefetch_all_nvme();
         }
 

@@ -42,11 +42,14 @@ pub fn compute_placement_with_context(
     // Score and sort tensors
     let scored = score_tensors(&model.tensors, &metadata);
 
-    // Try expert-streaming for MoE models where non-expert tensors fit in memory
+    // Try streaming modes: MoE expert-streaming, then dense FFN-streaming
     let (tier_assignments, inference_mode) =
         if let Some(es) = try_expert_streaming_assign(&scored, &capacities, &metadata) {
             tracing::info!("Expert-streaming placement: non-expert tensors on GPU/RAM, experts on NVMe");
             (es, InferenceMode::ExpertStreaming)
+        } else if let Some(ds) = try_dense_ffn_streaming_assign(&scored, &capacities, &metadata) {
+            tracing::info!("Dense FFN-streaming placement: attention+norms on GPU, FFN on NVMe");
+            (ds, InferenceMode::DenseFfnStreaming)
         } else {
             // Try LP first, fall back to greedy
             let assignments = match lp_assign(&scored, &capacities, hardware, &metadata) {
@@ -306,6 +309,85 @@ fn try_expert_streaming_assign(
         "Expert-streaming: {:.1} GB non-expert resident, {:.1} GB expert on NVMe",
         non_expert_bytes as f64 / (1u64 << 30) as f64,
         expert_bytes as f64 / (1u64 << 30) as f64,
+    );
+
+    Some(assignments)
+}
+
+/// Try dense FFN streaming for non-MoE models: attention + norms on GPU/RAM,
+/// FFN tensors (gate, up, down) on NVMe streamed through pool buffer.
+fn try_dense_ffn_streaming_assign(
+    tensors: &[ScoredTensor],
+    caps: &TierCapacities,
+    metadata: &ModelMetadata,
+) -> Option<HashMap<String, StorageTier>> {
+    if metadata.is_moe {
+        return None;
+    }
+
+    let is_ffn = |role: &TensorRole| {
+        matches!(
+            role,
+            TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+        )
+    };
+
+    let non_ffn_bytes: u64 = tensors
+        .iter()
+        .filter(|t| !is_ffn(&t.role))
+        .map(|t| t.size_bytes)
+        .sum();
+    let ffn_bytes: u64 = tensors.iter().filter(|t| is_ffn(&t.role)).map(|t| t.size_bytes).sum();
+
+    let total = non_ffn_bytes + ffn_bytes;
+    if non_ffn_bytes > caps.unified_limit || total <= caps.unified_limit {
+        return None; // Either doesn't fit at all, or everything fits
+    }
+
+    if ffn_bytes == 0 {
+        return None;
+    }
+
+    // Pool size: ~6 slots (2 layers × 3 FFN tensors)
+    let max_ffn_tensor: u64 = tensors
+        .iter()
+        .filter(|t| is_ffn(&t.role))
+        .map(|t| t.size_bytes)
+        .max()
+        .unwrap_or(0);
+    let estimated_pool = max_ffn_tensor * 6;
+    if non_ffn_bytes + estimated_pool > caps.gpu_bytes + GPU_RUNTIME_OVERHEAD {
+        tracing::debug!(
+            "Dense FFN streaming skipped: non-FFN ({:.1} GB) + pool ({:.1} GB) exceeds GPU budget",
+            non_ffn_bytes as f64 / (1u64 << 30) as f64,
+            estimated_pool as f64 / (1u64 << 30) as f64,
+        );
+        return None;
+    }
+
+    let mut assignments = HashMap::new();
+    let mut gpu_remaining = caps.gpu_bytes;
+
+    let mut non_ffn: Vec<&ScoredTensor> = tensors.iter().filter(|t| !is_ffn(&t.role)).collect();
+    non_ffn.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+    for t in non_ffn {
+        if t.size_bytes <= gpu_remaining {
+            gpu_remaining -= t.size_bytes;
+            assignments.insert(t.name.clone(), StorageTier::Gpu);
+        } else {
+            assignments.insert(t.name.clone(), StorageTier::Ram);
+        }
+    }
+
+    for t in tensors.iter().filter(|t| is_ffn(&t.role)) {
+        assignments.insert(t.name.clone(), StorageTier::Nvme);
+    }
+
+    tracing::info!(
+        "Dense FFN streaming: {:.1} GB non-FFN resident, {:.1} GB FFN on NVMe",
+        non_ffn_bytes as f64 / (1u64 << 30) as f64,
+        ffn_bytes as f64 / (1u64 << 30) as f64,
     );
 
     Some(assignments)

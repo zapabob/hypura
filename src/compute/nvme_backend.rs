@@ -324,6 +324,10 @@ pub struct PrefetchState {
 
     /// Expert-streaming mode: non-expert tensors GPU-resident, experts loaded on demand.
     pub expert_streaming: AtomicBool,
+    /// Dense FFN-streaming mode: attention+norms GPU-resident, FFN streamed from NVMe.
+    pub dense_ffn_streaming: AtomicBool,
+    /// Per-layer dense FFN tensor info for pool-based loading.
+    pub dense_ffn_layouts: HashMap<u32, Vec<DenseFfnLayout>>,
     /// Pool buffer for expert-streaming (slot allocator + pool base).
     pub expert_pool: Mutex<Option<ExpertPool>>,
     /// Captured ggml_tensor* pointers for fused expert tensors (for data pointer rewriting).
@@ -1041,6 +1045,196 @@ impl PrefetchState {
         }
     }
 
+    /// Load all dense FFN tensors for a layer into pool slots, blocking until complete.
+    pub fn ensure_dense_ffn_loaded(&self, layer_idx: u32) {
+        let layouts = match self.dense_ffn_layouts.get(&layer_idx) {
+            Some(l) if !l.is_empty() => l,
+            _ => return,
+        };
+
+        let tracing_on = self.trace_enabled.load(Ordering::Relaxed);
+
+        // Check if already loaded
+        {
+            let status = self.layer_status.lock().unwrap();
+            if status.get(&layer_idx).copied() == Some(LayerStatus::Loaded) {
+                // Already loaded — just rewrite tensor pointers
+                self.rewrite_dense_ffn_ptrs(layer_idx);
+                if tracing_on {
+                    self.trace.record(TraceEvent::LayerHit(layer_idx));
+                }
+                return;
+            }
+        }
+
+        let wait_start = Instant::now();
+
+        // Allocate pool slots
+        let slot_offsets = {
+            let mut pool = self.expert_pool.lock().unwrap();
+            let pool = pool.as_mut().expect("pool not initialized");
+            pool.allocate_layer(layer_idx, layouts.len())
+        };
+
+        // Rewrite tensor->data pointers
+        let pool_base = {
+            let pool = self.expert_pool.lock().unwrap();
+            pool.as_ref().unwrap().pool_base
+        };
+
+        for (i, layout) in layouts.iter().enumerate() {
+            if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
+                if !tensor_ptr.is_null() {
+                    unsafe {
+                        (*tensor_ptr).data =
+                            pool_base.add(slot_offsets[i]) as *mut c_void;
+                    }
+                }
+            }
+        }
+
+        // Build pread regions
+        let mut task_regions: Vec<Vec<(usize, usize, u64)>> = Vec::new();
+        for (i, layout) in layouts.iter().enumerate() {
+            task_regions.push(vec![(slot_offsets[i], layout.size, layout.file_offset)]);
+        }
+
+        // Submit and wait
+        {
+            let mut status = self.layer_status.lock().unwrap();
+            status.insert(layer_idx, LayerStatus::Loading);
+        }
+
+        let completion = Arc::new(IoCompletion {
+            remaining: AtomicUsize::new(task_regions.len()),
+            layer_idx,
+            update_status: true,
+        });
+
+        {
+            let pool_lock = self.io_pool.lock().unwrap();
+            if let Some(ref pool) = *pool_lock {
+                if let Some(ref tx) = pool.tx {
+                    for regions in task_regions {
+                        let _ = tx.send(IoPoolTask {
+                            regions,
+                            base: pool_base,
+                            completion: completion.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut status = self.layer_status.lock().unwrap();
+        while status.get(&layer_idx).copied() != Some(LayerStatus::Loaded) {
+            status = self.layer_notify.wait(status).unwrap();
+        }
+
+        if tracing_on {
+            let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+            self.trace
+                .record(TraceEvent::LayerStall { layer: layer_idx, wait_ms });
+        }
+    }
+
+    /// Non-blocking prefetch of next layer's dense FFN tensors into pool slots.
+    fn prefetch_dense_ffn(&self, layer_idx: u32) {
+        let layouts = match self.dense_ffn_layouts.get(&layer_idx) {
+            Some(l) if !l.is_empty() => l,
+            _ => return,
+        };
+
+        let slot_offsets = {
+            let mut pool = self.expert_pool.lock().unwrap();
+            let pool = pool.as_mut().expect("pool not initialized");
+            pool.allocate_layer(layer_idx, layouts.len())
+        };
+
+        let pool_base = {
+            let pool = self.expert_pool.lock().unwrap();
+            pool.as_ref().unwrap().pool_base
+        };
+
+        // Rewrite tensor pointers for when compute reaches this layer
+        for (i, layout) in layouts.iter().enumerate() {
+            if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
+                if !tensor_ptr.is_null() {
+                    unsafe {
+                        (*tensor_ptr).data =
+                            pool_base.add(slot_offsets[i]) as *mut c_void;
+                    }
+                }
+            }
+        }
+
+        let mut task_regions: Vec<Vec<(usize, usize, u64)>> = Vec::new();
+        for (i, layout) in layouts.iter().enumerate() {
+            task_regions.push(vec![(slot_offsets[i], layout.size, layout.file_offset)]);
+        }
+
+        if task_regions.is_empty() {
+            return;
+        }
+
+        {
+            let mut status = self.layer_status.lock().unwrap();
+            status.insert(layer_idx, LayerStatus::Loading);
+        }
+
+        let completion = Arc::new(IoCompletion {
+            remaining: AtomicUsize::new(task_regions.len()),
+            layer_idx,
+            update_status: true,
+        });
+
+        let pool_lock = self.io_pool.lock().unwrap();
+        if let Some(ref pool) = *pool_lock {
+            if let Some(ref tx) = pool.tx {
+                for regions in task_regions {
+                    let _ = tx.send(IoPoolTask {
+                        regions,
+                        base: pool_base,
+                        completion: completion.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Rewrite tensor->data for dense FFN tensors to their current pool slots.
+    fn rewrite_dense_ffn_ptrs(&self, layer_idx: u32) {
+        let layouts = match self.dense_ffn_layouts.get(&layer_idx) {
+            Some(l) => l,
+            None => return,
+        };
+
+        let pool = self.expert_pool.lock().unwrap();
+        let pool = match pool.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let slot_offsets: Vec<usize> = match pool.layer_slots.get(&layer_idx) {
+            Some(slots) => slots.iter().map(|&s| s * pool.slot_size).collect(),
+            None => return,
+        };
+
+        for (i, layout) in layouts.iter().enumerate() {
+            if i >= slot_offsets.len() {
+                break;
+            }
+            if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
+                if !tensor_ptr.is_null() {
+                    unsafe {
+                        (*tensor_ptr).data =
+                            pool.pool_base.add(slot_offsets[i]) as *mut c_void;
+                    }
+                }
+            }
+        }
+    }
+
     /// Warm the neuron cache by pre-loading the most frequently activated experts
     /// from co-activation data. Reduces first-token stalls in expert-streaming mode.
     pub fn warm_cache_from_coactivation(&self) {
@@ -1356,6 +1550,15 @@ impl ExpertPool {
     }
 }
 
+/// Layout of a dense FFN tensor for pool-based streaming.
+#[derive(Debug, Clone)]
+pub struct DenseFfnLayout {
+    pub tensor_name: String,
+    pub layer_index: u32,
+    pub file_offset: u64,
+    pub size: usize,
+}
+
 /// Controls the custom Hypura buffer type for NVMe-tier tensors.
 pub struct HypuraBuftController {
     buft_ptr: hypura_sys::ggml_backend_buffer_type_t,
@@ -1366,6 +1569,10 @@ pub struct HypuraBuftController {
     buffer_base: Mutex<*mut u8>,
     /// Captured ggml_tensor* pointers for fused expert tensors (for data pointer rewriting)
     tensor_ptrs: Mutex<HashMap<String, *mut hypura_sys::ggml_tensor>>,
+    /// Scratch buffer for dense FFN streaming: FFN tensor fread goes here instead of
+    /// committing 22+ GB of anonymous mmap pages during model loading.
+    loading_scratch: Mutex<*mut u8>,
+    loading_scratch_size: AtomicUsize,
 }
 
 // SAFETY: buft_ptr used only from the creating thread; buffer_base accessed under Mutex
@@ -1383,6 +1590,8 @@ impl HypuraBuftController {
             gguf_data_offset: gguf.data_offset,
             buffer_base: Mutex::new(std::ptr::null_mut()),
             tensor_ptrs: Mutex::new(HashMap::new()),
+            loading_scratch: Mutex::new(std::ptr::null_mut()),
+            loading_scratch_size: AtomicUsize::new(0),
         });
 
         let rust_ctx = &*controller as *const Self as *mut c_void;
@@ -1400,6 +1609,72 @@ impl HypuraBuftController {
 
     pub fn buft_ptr(&self) -> hypura_sys::ggml_backend_buffer_type_t {
         self.buft_ptr
+    }
+
+    /// Enable scratch buffer for dense FFN streaming. Must be called BEFORE model loading.
+    /// Allocates a scratch region sized to the largest FFN tensor. During init_tensor,
+    /// FFN tensor->data is redirected here so fread doesn't commit ~22 GB of mmap pages.
+    pub fn enable_dense_ffn_scratch(&self, gguf: &crate::model::gguf::GgufFile) {
+        let max_ffn_size = gguf
+            .tensors
+            .iter()
+            .filter(|t| {
+                let role = TensorRole::from_name(&t.name);
+                matches!(
+                    role,
+                    TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                )
+            })
+            .map(|t| t.size_bytes as usize)
+            .max()
+            .unwrap_or(0);
+
+        if max_ffn_size == 0 {
+            return;
+        }
+
+        let aligned = (max_ffn_size + 4095) & !4095;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                aligned,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            tracing::warn!("Failed to allocate FFN loading scratch ({aligned} bytes)");
+            return;
+        }
+
+        *self.loading_scratch.lock().unwrap() = ptr as *mut u8;
+        self.loading_scratch_size
+            .store(aligned, Ordering::Relaxed);
+        tracing::info!(
+            "Dense FFN scratch: {:.1} MB (redirects fread away from {:.1} GB loading buffer)",
+            aligned as f64 / 1e6,
+            gguf.tensors
+                .iter()
+                .filter(|t| {
+                    let role = TensorRole::from_name(&t.name);
+                    matches!(role, TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown)
+                })
+                .map(|t| t.size_bytes)
+                .sum::<u64>() as f64
+                / 1e9,
+        );
+    }
+
+    /// Free the loading scratch buffer (called after pool activation).
+    fn release_scratch(&self) {
+        let mut scratch = self.loading_scratch.lock().unwrap();
+        let size = self.loading_scratch_size.swap(0, Ordering::Relaxed);
+        if !scratch.is_null() && size > 0 {
+            unsafe { libc::munmap(*scratch as *mut libc::c_void, size) };
+            *scratch = std::ptr::null_mut();
+        }
     }
 
     /// After model loading, correlate tensor map with GGUF file offsets
@@ -1439,6 +1714,7 @@ impl HypuraBuftController {
         // --- Build expert layouts and non-expert region maps ---
         let mut expert_layouts: HashMap<u32, Vec<ExpertLayout>> = HashMap::new();
         let mut non_expert_regions: HashMap<u32, Vec<(usize, usize, u64)>> = HashMap::new();
+        let mut dense_ffn_layouts: HashMap<u32, Vec<DenseFfnLayout>> = HashMap::new();
 
         let num_experts_total = gguf.get_u32("expert_count").unwrap_or(0);
         let num_experts_used = gguf.get_u32("expert_used_count").unwrap_or(0);
@@ -1502,6 +1778,20 @@ impl HypuraBuftController {
                         total_size: loc.size,
                         expert_permutation: permutations.get(&layer_idx).cloned(),
                     });
+                }
+                TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                    if num_experts_total == 0 =>
+                {
+                    // Dense FFN tensor — track for pool-based streaming
+                    dense_ffn_layouts
+                        .entry(layer_idx)
+                        .or_default()
+                        .push(DenseFfnLayout {
+                            tensor_name: tensor_info.name.clone(),
+                            layer_index: layer_idx,
+                            file_offset: loc.file_offset,
+                            size: loc.size,
+                        });
                 }
                 _ => {
                     non_expert_regions
@@ -1586,6 +1876,8 @@ impl HypuraBuftController {
             co_activation: Mutex::new(co_activation),
             prev_layer_experts: Mutex::new(None),
             expert_streaming: AtomicBool::new(false),
+            dense_ffn_streaming: AtomicBool::new(false),
+            dense_ffn_layouts,
             expert_pool: Mutex::new(None),
             fused_tensor_ptrs: HashMap::new(),
             trace_enabled: AtomicBool::new(false),
@@ -1666,6 +1958,69 @@ impl HypuraBuftController {
         Ok(pool)
     }
 
+    /// Activate pool buffer for dense FFN streaming. Same as expert pool but sized
+    /// for individual FFN tensors (gate, up, down) rather than fused expert tensors.
+    pub fn activate_dense_ffn_pool(&self, gguf: &GgufFile) -> anyhow::Result<ExpertPool> {
+        let buffer = unsafe { hypura_sys::hypura_buft_get_last_buffer(self.buft_ptr) };
+        anyhow::ensure!(!buffer.is_null(), "No buffer allocated");
+
+        // Slot size = largest FFN tensor
+        let slot_size = gguf
+            .tensors
+            .iter()
+            .filter(|t| {
+                let role = TensorRole::from_name(&t.name);
+                matches!(
+                    role,
+                    TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                )
+            })
+            .map(|t| t.size_bytes as usize)
+            .max()
+            .unwrap_or(0);
+
+        anyhow::ensure!(slot_size > 0, "No FFN tensors found");
+
+        // 6 slots: 2 layers × 3 FFN tensors (double-buffering for prefetch)
+        let num_slots = 6;
+        let pool_size = num_slots * slot_size;
+
+        tracing::info!(
+            "Dense FFN pool: {} slots × {:.1} MB = {:.1} MB total",
+            num_slots,
+            slot_size as f64 / 1e6,
+            pool_size as f64 / 1e6,
+        );
+
+        let ret = unsafe { hypura_sys::hypura_buffer_init_pool(buffer, pool_size) };
+        anyhow::ensure!(ret == 0, "Failed to allocate FFN pool ({pool_size} bytes)");
+
+        let pool_base =
+            unsafe { hypura_sys::hypura_buffer_get_pool_base(buffer) } as *mut u8;
+        anyhow::ensure!(!pool_base.is_null(), "Pool base is null");
+
+        // Rewrite tensor->data for all FFN tensors to pool base (temporary valid address)
+        let tensor_ptrs = self.tensor_ptrs.lock().unwrap();
+        for (name, &ptr) in tensor_ptrs.iter() {
+            let role = TensorRole::from_name(name);
+            if matches!(
+                role,
+                TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+            ) && !ptr.is_null()
+            {
+                unsafe {
+                    (*ptr).data = pool_base as *mut c_void;
+                }
+            }
+        }
+
+        unsafe { hypura_sys::hypura_buffer_release_loading_buffer(buffer) };
+        self.release_scratch();
+        tracing::info!("Released loading buffer + scratch, FFN pool active");
+
+        Ok(ExpertPool::new(pool_base, pool_size, slot_size))
+    }
+
     /// Get captured tensor pointers (for transfer to PrefetchState).
     pub fn take_tensor_ptrs(&self) -> HashMap<String, *mut hypura_sys::ggml_tensor> {
         std::mem::take(&mut *self.tensor_ptrs.lock().unwrap())
@@ -1674,6 +2029,7 @@ impl HypuraBuftController {
 
 impl Drop for HypuraBuftController {
     fn drop(&mut self) {
+        self.release_scratch();
         if !self.buft_ptr.is_null() {
             unsafe { hypura_sys::hypura_buft_free(self.buft_ptr) }
         }
@@ -1687,9 +2043,14 @@ pub fn build_override_patterns(
     buft_ptr: hypura_sys::ggml_backend_buffer_type_t,
     n_gpu_layers: i32,
 ) -> (Vec<CString>, Vec<hypura_sys::llama_model_tensor_buft_override>) {
-    // Expert-streaming mode: only override tensors explicitly assigned to NVMe
-    // (expert tensors). Non-expert tensors in the same layer stay on Metal.
-    if plan.inference_mode == InferenceMode::ExpertStreaming {
+    // Streaming modes: only override tensors explicitly assigned to NVMe.
+    // Non-streamed tensors in the same layer stay on Metal.
+    // - ExpertStreaming: fused expert tensors on NVMe, attention/norms on Metal
+    // - DenseFfnStreaming: FFN (gate/up/down) on NVMe, attention/norms on Metal
+    if matches!(
+        plan.inference_mode,
+        InferenceMode::ExpertStreaming | InferenceMode::DenseFfnStreaming
+    ) {
         let mut patterns = Vec::new();
         for t in &gguf.tensors {
             if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
@@ -1844,6 +2205,11 @@ pub extern "C" fn eval_callback(
         return eval_callback_expert_streaming(state, layer_idx, ask);
     }
 
+    // Dense FFN-streaming mode: load FFN tensors on demand, attention is GPU-resident
+    if state.dense_ffn_streaming.load(Ordering::Relaxed) {
+        return eval_callback_dense_ffn_streaming(state, layer_idx, ask);
+    }
+
     if ask {
         state.ensure_layer_loaded(layer_idx);
     } else {
@@ -1927,6 +2293,53 @@ pub extern "C" fn eval_callback(
         }
     }
 
+    true
+}
+
+/// Dense FFN-streaming eval_callback path: load FFN tensors on demand per layer.
+fn eval_callback_dense_ffn_streaming(state: &PrefetchState, layer_idx: u32, ask: bool) -> bool {
+    if ask {
+        // Before computation: load FFN tensors for this layer if it has them
+        if state.dense_ffn_layouts.contains_key(&layer_idx) {
+            state.ensure_dense_ffn_loaded(layer_idx);
+        }
+    } else {
+        // After computation: release old layer, prefetch next
+        let prev = state
+            .current_layer
+            .swap(layer_idx as i32, Ordering::Relaxed);
+
+        if prev >= 0 {
+            let prev_layer = prev as u32;
+            if prev_layer != layer_idx
+                && prev_layer < layer_idx
+                && state.dense_ffn_layouts.contains_key(&prev_layer)
+            {
+                // Release previous layer's pool slots and status
+                {
+                    let mut pool = state.expert_pool.lock().unwrap();
+                    if let Some(pool) = pool.as_mut() {
+                        pool.release_layer(prev_layer);
+                    }
+                }
+                let mut status = state.layer_status.lock().unwrap();
+                status.insert(prev_layer, LayerStatus::NotLoaded);
+            }
+        }
+
+        // Prefetch next layer's FFN data (double-buffering)
+        let next = layer_idx + 1;
+        if next < state.num_layers && state.dense_ffn_layouts.contains_key(&next) {
+            let status = state.layer_status.lock().unwrap();
+            if status.get(&next).copied() != Some(LayerStatus::Loaded)
+                && status.get(&next).copied() != Some(LayerStatus::Loading)
+            {
+                drop(status);
+                // Non-blocking: allocate slots and start I/O, don't wait
+                state.prefetch_dense_ffn(next);
+            }
+        }
+    }
     true
 }
 
@@ -2163,14 +2576,36 @@ extern "C" fn on_tensor_init_cb(
         .unwrap_or("")
         .to_string();
 
-    // Capture fused expert tensor pointers for pool data-pointer rewriting
+    // Capture tensor pointers for pool data-pointer rewriting
+    // (fused expert tensors for MoE, FFN tensors for dense models)
     let role = TensorRole::from_name(&name_str);
-    if matches!(role, TensorRole::MoeFusedExperts) {
+    if matches!(
+        role,
+        TensorRole::MoeFusedExperts
+            | TensorRole::FfnGate
+            | TensorRole::FfnUp
+            | TensorRole::FfnDown
+    ) {
         controller
             .tensor_ptrs
             .lock()
             .unwrap()
             .insert(name_str, tensor);
+
+        // Dense FFN streaming: redirect FFN tensor->data to scratch buffer so
+        // llama.cpp's fread doesn't commit ~22 GB of anonymous mmap pages.
+        // on_tensor_loaded already captured the correct buffer offset above.
+        if matches!(
+            role,
+            TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+        ) {
+            let scratch = controller.loading_scratch.lock().unwrap();
+            if !scratch.is_null() {
+                unsafe {
+                    (*tensor).data = *scratch as *mut c_void;
+                }
+            }
+        }
     }
 }
 

@@ -4,7 +4,7 @@
 
 Hypura is a storage-tier-aware LLM inference scheduler for Apple Silicon. It places model tensors across GPU (Metal), RAM, and NVMe based on access patterns and hardware bandwidth — enabling you to run models that exceed your available memory where vanilla llama.cpp would OOM or thrash to a halt.
 
-Run a 31 GB Mixtral 8x7B on a 32 GB Mac Mini. Vanilla llama.cpp crashes. Hypura runs it at ~1 tok/s.
+Run a 31 GB Mixtral 8x7B on a 32 GB Mac Mini at 2.2 tok/s. A 40 GB Llama 70B at 0.2 tok/s. Vanilla llama.cpp crashes on both.
 
 ## How it works
 
@@ -16,19 +16,23 @@ Hypura reads the GGUF file, profiles your hardware (GPU working set, RAM, NVMe b
 - **RAM** — Overflow layers that don't fit in the GPU working set. Accessed via mmap.
 - **NVMe** — Remaining layers loaded on-demand via direct I/O (`F_NOCACHE` + `pread`), prefetched ahead of the forward pass.
 
-For models that barely overflow (like Mixtral Q5 at 30.9 GB on 32 GB), Hypura's **keep-resident mode** loads NVMe-spill layers once and keeps them in memory — eliminating all disk I/O after the first forward pass.
+Hypura selects the best inference mode automatically:
+
+- **Keep-resident** — For small NVMe spill. Loads NVMe layers once, keeps them in memory. Zero disk I/O after the first pass.
+- **Expert-streaming** — For MoE models (Mixtral). Only non-expert tensors (~1 GB) stay on GPU. Expert tensors stream from NVMe through a pool buffer on demand, with a neuron cache (99.5% hit rate) that eliminates most I/O after warmup.
+- **Dense FFN-streaming** — For dense models too large for GPU (Llama 70B). Attention + norms stay on GPU (~8 GB). FFN tensors (~32 GB) stream from NVMe through a pool buffer, with layer-ahead prefetch.
 
 ## Performance
 
 All benchmarks on **M1 Max, 32 GB unified memory, ~5.1 GB/s NVMe sequential read**.
 
-| Model | Size | GPU | RAM | NVMe | Hypura | llama.cpp | Notes |
+| Model | Size | GPU | NVMe | Mode | Hypura | llama.cpp | Notes |
 |---|---|---|---|---|---|---|---|
-| Qwen 2.5 14B Q4_K_M | 8.4 GB | 8.4 GB | — | — | **21 tok/s** | ~21 tok/s | Fits in GPU; no overhead |
-| Mixtral 8x7B Q5_K_M | 30.9 GB | 22.7 GB | 6.3 GB | 2.0 GB | **0.83 tok/s** | **OOM** | Keep-resident; runs vs. crashes |
-| Llama 3.3 70B Q4_K_M | 39.6 GB | 22.8 GB | 7.0 GB | 9.8 GB | **0.03 tok/s** | **OOM** | NVMe streaming; I/O-bound |
+| Qwen 2.5 14B Q4_K_M | 8.4 GB | 8.4 GB | — | full-resident | **21 tok/s** | ~21 tok/s | Fits in GPU; no overhead |
+| Mixtral 8x7B Q5_K_M | 30.9 GB | 1.1 GB | 29.8 GB | expert-streaming | **2.2 tok/s** | **OOM** | All layers on Metal; 99.5% cache hit rate |
+| Llama 3.3 70B Q4_K_M | 39.6 GB | 7.8 GB | 31.8 GB | dense-FFN-streaming | **0.2 tok/s** | **OOM** | All layers on Metal; I/O-bound (~50ms/layer) |
 
-**Key takeaway:** For models that fit in memory, Hypura adds zero overhead. For models that don't fit, Hypura is the difference between "runs" and "crashes." The sweet spot is models that barely overflow — the 2 GB NVMe spill on Mixtral stays resident after the first pass, giving usable interactive speeds.
+**Key takeaway:** For models that fit in memory, Hypura adds zero overhead. For models that don't fit, Hypura is the difference between "runs" and "crashes." Expert-streaming on Mixtral achieves usable interactive speeds by keeping only non-expert tensors on GPU and exploiting MoE sparsity (only 2/8 experts fire per token). Dense FFN-streaming extends this to non-MoE models like Llama 70B.
 
 ## Install
 
@@ -136,7 +140,7 @@ Hypura is a Cargo workspace with two crates:
 |---|---|
 | `scheduler/placement.rs` | LP + greedy tensor placement across GPU/RAM/NVMe tiers |
 | `compute/inference.rs` | Inference engine: `generate_blocking`, `generate_with_nvme_scheduling`, server-oriented `load_model` / `generate_from_loaded` |
-| `compute/nvme_backend.rs` | Custom GGML buffer type for NVMe-tier tensors with layer-level prefetch |
+| `compute/nvme_backend.rs` | Custom GGML buffer type, pool-based expert/FFN streaming, neuron cache, eval callback |
 | `server/routes.rs` | Axum HTTP handlers for Ollama-compatible API |
 | `profiler/` | Hardware detection (CPU, GPU, memory bandwidth, NVMe throughput) |
 | `cli/bench.rs` | A/B benchmark harness |
