@@ -557,14 +557,33 @@ shows a bimodal pattern: some layers stall 3-15ms (well-prefetched) while others
 boundary — possibly because `prefetch_all_nvme()` or the token-boundary callback reset
 interferes with the in-flight prefetch pipeline.
 
-#### Investigation needed: token 3 regression
+#### Root cause of token 3 regression: I/O pipe idle at token boundary
 
-The token 2 → token 3 regression suggests the prefetch pipeline isn't restarting cleanly
-between tokens. Possible causes:
-1. Token boundary code in `generate_with_nvme_scheduling` calls `prefetch_all_nvme()` which
-   may conflict with the eval_callback's per-layer prefetch
-2. Pool slot eviction at token boundary — releasing all layers then re-prefetching from scratch
-3. `current_layer` atomic reset between tokens causes the callback to misidentify layer transitions
+**Diagnosis:** At the end of each token's forward pass, layer 79's ask=false callback
+tries to prefetch layers 80-82 which don't exist → the I/O pipe goes idle. During the
+sampling/emission gap (~10-20ms), no I/O is submitted. When the next token starts, layer
+0's ask=true blocks on a cold load, and the prefetch pipeline needs several layers to
+refill. Token 2 was fast because the pipeline was warm from prompt eval → token 1 overlap.
+
+**Fix applied:** Added between-token prefetch priming in the generation loop
+(`src/compute/inference.rs`). Before each `ctx.decode()`, pre-submit prefetches for
+layers 0-3 (same as initial warm-up). This keeps the I/O pipe busy through the token
+boundary gap so early layers of the next token are already loaded or loading.
+
+**Status: READY FOR TESTING**
+
+Test command: `cargo run --release -- bench --max-tokens 3 --context 512 ./test-models/llama-3.3-70b-q4_k_m.gguf`
+
+**Result:** Token 3 improved (53 stalls/4308ms vs 60/4731ms before) but didn't match
+token 2 (29 stalls/2984ms). Overall tok/s stays at 0.3. The token boundary priming helps
+but the gap is likely NVMe controller variance after sustained sequential I/O — the first
+layers of each new token read from low file offsets after the controller was reading from
+high offsets, causing a seek penalty even on NVMe.
+
+**Memory headroom observation:** Dense FFN-streaming uses only ~10 GB committed (7.8 GB
+non-FFN + 2.3 GB pool). The 22 GB loading buffer stays uncommitted (scratch fix). This
+leaves ~20 GB headroom vs ~1 GB in the old full-streaming mode. This headroom could be
+used for larger pool (more prefetch depth), partial layer residency, or larger KV cache.
 
 ---
 

@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::compute::ffi::*;
 use crate::compute::nvme_backend::{
-    build_override_patterns, eval_callback, HypuraBuftController, PrefetchState,
+    build_override_patterns, eval_callback, HypuraBuftController, LayerStatus, PrefetchState,
 };
 use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
@@ -905,6 +905,29 @@ pub fn generate_with_nvme_scheduling(
         // has all data loaded, expert-streaming loads experts via eval_callback.
         if !keep_resident && !any_streaming {
             prefetch_state.prefetch_all_nvme();
+        }
+
+        // Dense FFN-streaming: pre-submit early layer prefetches before the next
+        // forward pass. At the token boundary, the I/O pipe goes idle (the last
+        // eval_callback has nothing to prefetch past layer 79). Priming layers 0-3
+        // keeps the pipe busy through the sampling/emission gap so the first layers
+        // of the next token don't stall.
+        if dense_ffn_streaming {
+            let status = prefetch_state.layer_status.lock().unwrap();
+            let mut to_prefetch = Vec::new();
+            for layer in 0..4.min(num_layers) {
+                if !prefetch_state.dense_ffn_layouts.contains_key(&layer) {
+                    continue;
+                }
+                let s = status.get(&layer).copied();
+                if s != Some(LayerStatus::Loaded) && s != Some(LayerStatus::Loading) {
+                    to_prefetch.push(layer);
+                }
+            }
+            drop(status);
+            for layer in to_prefetch {
+                prefetch_state.prefetch_dense_ffn(layer);
+            }
         }
 
         let decode_start = std::time::Instant::now();
