@@ -744,9 +744,9 @@ pub fn generate_with_nvme_scheduling(
     let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
 
     let kv_quant = plan.kv_cache_plan.kv_quantization;
-    // Expert-streaming: use small batch size to limit Metal compute buffer for MoE
-    // intermediates. Prompt eval is slower but generation (n_batch=1) is unaffected.
-    let effective_batch = if expert_streaming { 1 } else { config.n_batch };
+    // Expert-streaming with use_mmap=false + pool buffer keeps Metal working set small
+    // enough for full batch size. No n_batch reduction needed.
+    let effective_batch = config.n_batch;
     let mut ctx = LlamaContext::new_with_callback_and_kv(
         &model,
         config.n_ctx,
@@ -800,7 +800,7 @@ pub fn generate_with_nvme_scheduling(
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Process prompt (expert-streaming uses n_batch=1 to limit Metal compute buffer)
+    // Process prompt
     let prompt_start = Instant::now();
     let prompt_batch = effective_batch as usize;
     for chunk in tokens.chunks(prompt_batch) {

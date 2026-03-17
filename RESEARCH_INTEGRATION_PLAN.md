@@ -364,48 +364,95 @@ Isolated microbenchmark testing raw pread throughput under each condition:
 
 ---
 
-## Revised Strategy: Mixtral (keep-resident, compute-bound)
+## Expert-Streaming Mode: IMPLEMENTED (2026-03-17)
 
-Mixtral runs in keep-resident mode: after the first forward pass, all layers are in physical memory and the eval callback is disabled. Generation is **purely GPU-compute-bound**. I/O optimizations have zero effect on generation tok/s.
+### Results: Mixtral 8x7B Q5_K_M on M1 Max 32 GB
 
-Current bottleneck: only 24 of 32 layers run on the Metal GPU backend. The remaining 8 layers (6.3 GB RAM + 2.0 GB NVMe) use the CPU backend, which is dramatically slower for matmuls.
+| Mode | tok/s | n_gpu_layers | NVMe I/O | Memory footprint |
+|------|-------|-------------|----------|-----------------|
+| Keep-resident (before) | 0.87 | 24 (8 on CPU) | 0 (all resident) | ~31 GB committed |
+| Expert-streaming (after) | **2.19** | **33 (all Metal)** | 23 GB/s via pool | ~5 GB committed |
 
-### Change 8: Tighten GPU Headroom Reservations
+**2.5x improvement.** 99.5% neuron cache hit rate after warmup. All 33 layers on Metal GPU.
 
-**Problem:** The placement solver reserves 2 GB for `GPU_RUNTIME_OVERHEAD` (compute buffers + Metal overhead) and KV cache headroom based on conservative estimates. If either is overestimated, the freed GPU space could fit 1-2 more layers on Metal — each one replacing a slow CPU-backend layer.
+### Architecture
 
-**File:** `src/scheduler/placement.rs`
+- Non-expert tensors (attention, norms, router): ~1.1 GB on GPU, permanently resident
+- Expert tensors: 29.8 GB on NVMe, streamed through 2.3 GB pool buffer (6 slots × 385 MB)
+- Pool buffer: small mmap'd region. Loading buffer (29.8 GB) munmap'd after tensor->data rewriting
+- `use_mmap=false`: prevents Metal from creating a single 30.9 GB MTLBuffer for the model file
+- `n_batch=1`: limits Metal compute buffer for MoE intermediates (prompt eval is token-by-token)
 
-**What to investigate:**
-1. Run Mixtral and measure actual Metal compute buffer usage via `recommendedMaxWorkingSetSize` vs actual working set. If Metal uses only 1.2 GB of the 2 GB reservation, reclaim the difference.
-2. Check KV cache sizing: with Q8 KV at context=2048, the KV cache is ~80 MB. The current 20%-of-GPU-budget allocation may over-reserve.
-3. Test empirically: try `GPU_RUNTIME_OVERHEAD = 1.5 GB` and `1.0 GB`, run Mixtral, see if it OOMs or gains GPU layers.
+### Key Learnings
 
-**Expected impact:** Each additional GPU layer replaces a CPU-backend layer. Going from 24 → 26 GPU layers could improve tok/s by 10-20% (2 fewer slow layers in the critical path).
-
-### Change 9: Q4 KV Cache
-
-**Problem:** KV cache uses Q8_0 or FP16. Q4_0 uses 0.28x the memory of FP16 (vs 0.53x for Q8_0), freeing GPU space for model layers.
-
-**File:** `src/scheduler/placement.rs` (KV cache plan), `src/compute/inference.rs` (KV quantization selection)
-
-**What to change:** Add Q4_0 as an auto-selection option when GPU budget is very tight. The quality impact of Q4 KV is model-dependent but generally acceptable for short-context inference.
-
-**Expected impact:** On Mixtral at context=2048, KV cache shrinks from ~80 MB (Q8) to ~42 MB (Q4). Marginal GPU savings, but combined with Change 8 could push one more layer onto GPU.
-
-### Change 10: Measure CPU Backend Cost Directly
-
-**Diagnostic, not a code change.** Run Mixtral with `n_gpu_layers=32` (all layers on Metal) to measure the tok/s ceiling if the CPU backend were eliminated entirely. This will OOM or swap on 32 GB, but even a single-token measurement shows the theoretical maximum. Compare against current 24-layer performance to quantify the CPU backend cost per layer.
-
-```sh
-# WARNING: may OOM. Use --max-tokens 1 and monitor memory.
-cargo run --release -- bench --max-tokens 1 --context 512 --force ./test-models/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf
-# With manual n_gpu_layers override (if supported)
-```
+1. **The bottleneck was CPU backend layers, not I/O.** Keep-resident mode had 8 layers on CPU backend (slow matmuls). Expert-streaming puts all layers on Metal by only keeping 1.1 GB of non-expert tensors in GPU.
+2. **Pool buffer avoids Metal OOM.** On unified memory, any virtual mapping counts against Metal's address space. The 29.8 GB loading buffer is released after pool activation; Metal only sees the 2.3 GB pool.
+3. **Neuron cache is highly effective for MoE.** Mixtral top-2-of-8 with 32 layers: after ~2 tokens, the cache is warm and 99.5% of expert loads are hits. Steady-state NVMe I/O is near-zero.
 
 ---
 
-## Revised Strategy: Llama 70B Streaming (I/O-bound, 300 MB/s mystery)
+## Next Optimizations (post expert-streaming)
+
+### Change 11: Increase n_batch for Expert-Streaming Prompt Eval
+
+**Status: HIGHEST PRIORITY — quick win**
+
+**Problem:** Expert-streaming uses `n_batch=1` to avoid Metal compute buffer OOM from MoE intermediates. This makes prompt eval very slow (4.5s for 9 tokens — each token processed individually). Generation is unaffected (already n_batch=1).
+
+**Opportunity:** n_batch=1 was chosen to avoid OOM at n_batch=512. There's a large gap between 1 and 512. Testing n_batch=16, 32, 64 would find the sweet spot that speeds up prompt eval without OOM.
+
+**File:** `src/compute/inference.rs`
+
+**Expected impact:** Prompt eval speedup of 5-15x (from 4.5s to ~0.3-0.9s). No effect on generation tok/s. Directly improves time-to-first-token (TTFT).
+
+### Change 12: Warm Neuron Cache from Co-Activation Data
+
+**Problem:** Token 1 has 64 stalls (752ms) because the neuron cache is cold. The co-activation persistence file (`~/.hypura/coactivation/{model}.json`) already records which experts fire most frequently at each layer.
+
+**What to change:** On startup in expert-streaming mode, pre-load the top-2 most frequently activated experts per layer from co-activation data. This fills the neuron cache before the first token.
+
+**File:** `src/compute/nvme_backend.rs` (add `warm_cache_from_coactivation` method)
+
+**Expected impact:** Eliminate most first-token stalls. Token 1 goes from 752ms stall to near-zero.
+
+### Change 13: Expert-Streaming for Dense Models (Llama 70B)
+
+**Problem:** Llama 70B on 32 GB: 0.03 tok/s with 34 layers on CPU backend. The I/O trace showed 30-40s decode times — same root cause as Mixtral before expert-streaming (CPU backend layers).
+
+**Opportunity:** The same pool buffer approach can work for dense models. Treat FFN tensors (gate, up, down weights — ~60% of per-layer size) as "expert-like" and stream them through the pool, keeping attention tensors on GPU.
+
+**What to change:** Extend `try_expert_streaming_assign` to detect dense models where non-FFN tensors fit in GPU but full layers don't. Route FFN weights to NVMe, attention/norms to GPU. The eval_callback loads FFN data into pool slots before each layer's FFN computation.
+
+**Complexity:** Higher than MoE expert-streaming because dense FFN tensors are not fused — each layer has 3 separate weight tensors (gate, up, down) rather than 3 fused expert tensors. The pool slot management and tensor->data rewriting need to handle individual tensors.
+
+**Expected impact:** Similar 2-3x improvement if all layers can move to Metal. May transform Llama 70B from 0.03 tok/s to 0.06-0.10 tok/s.
+
+### Change 14: Tune Pool Slot Count and Neuron Cache Size
+
+**Problem:** Current: 6 pool slots, default neuron cache capacity. The 99.5% hit rate is excellent, suggesting we might be over-provisioned on some dimension and under-provisioned on others.
+
+**Tests to run:**
+- 3 slots (minimum: current layer only) — does prefetch still help?
+- 9 slots (3 layers) — does deeper prefetch improve hit rate further?
+- Neuron cache capacity: current auto-sizing vs explicit 64/128/256 entries
+
+### Change 15: Deeper Speculative Prefetch
+
+**Problem:** The eval_callback currently prefetches 1 MoE layer ahead. With 6 pool slots, we have room for 2 layers of data. Prefetching 2-3 layers ahead would start I/O earlier, hiding latency behind compute.
+
+**What to change:** In `eval_callback_expert_streaming`, increase the prefetch lookahead from `1..4` to `1..6` (or based on available pool slots).
+
+---
+
+## Changes 8-10: SUPERSEDED BY EXPERT-STREAMING
+
+Changes 8 (GPU headroom), 9 (Q4 KV), and 10 (CPU backend measurement) were designed to squeeze more layers onto Metal under keep-resident mode. Expert-streaming achieved the same goal more effectively — all 33 layers on Metal with only 1.1 GB GPU footprint. These changes are no longer needed for Mixtral.
+
+They may still be relevant for dense models that can't use expert-streaming (Change 13 addresses this).
+
+---
+
+## Revised Strategy: Llama 70B Streaming (CPU-backend-bound)
 
 The iobench proves the raw I/O path achieves 6.8 GB/s. The 300 MB/s effective throughput during inference means **~95% of I/O bandwidth is lost to the inference-I/O interaction**, not to the I/O path itself.
 
@@ -453,28 +500,36 @@ The iobench proves the raw I/O path achieves 6.8 GB/s. The 300 MB/s effective th
 
 ---
 
-## Implementation Priority & Dependencies (Revised)
+## Implementation Priority (Revised 2026-03-17)
 
-### For Mixtral (compute-bound):
-1. **Change 10** (diagnostic) — measure CPU backend cost, zero effort
-2. **Change 8** (GPU headroom) — tune constants, low risk, potentially +10-20% tok/s
-3. **Change 9** (Q4 KV) — small change, marginal gain on this hardware
+### Immediate (high confidence, low effort):
+1. **Change 11** (n_batch tuning) — find optimal batch size for expert-streaming prompt eval. Quick binary search, directly measurable.
+2. **Change 12** (warm neuron cache) — pre-load frequently-activated experts on startup. Infrastructure exists.
 
-### For Llama 70B (streaming, 300 MB/s mystery):
-1. **Theory E test** (prefetch timing) — add tracing, identify I/O gaps, highest-probability fix
-2. **Theory B test** (synchronous loading) — same tracing, look for dead time
-3. **Theory A test** (lock contention) — instrument mutex, easy to measure
-4. **Theory D test** (MADV_FREE vs MADV_DONTNEED) — one-line change, quick experiment
-5. **Theory C test** (Metal blocking) — harder to measure, investigate last
+### Medium-term (high impact, moderate effort):
+3. **Change 13** (dense model expert-streaming) — extend pool buffer to Llama 70B. Same architecture, different tensor classification.
+4. **Change 15** (deeper prefetch) — increase prefetch lookahead for expert-streaming.
 
-### Previously planned changes — status:
+### Low priority / deferred:
+5. **Change 14** (pool/cache tuning) — measure once other changes stabilize
+6. **Theories A-E** (Llama 70B streaming) — may be superseded by Change 13
+7. **Changes 2-4** (I/O coalescing, async, double buffer) — disproven or superseded
+8. **Changes 8-10** (GPU headroom) — superseded by expert-streaming for MoE models
+
+### Status of all changes:
 - **Change 1** (LP objective) — DONE
-- **Change 2** (I/O coalescing) — DISPROVEN, skip
-- **Change 3** (async I/O) — preadv irrelevant (syscall count not the issue). dispatch_io still possible but speculative.
-- **Change 4** (double buffering) — deferred until bandwidth mystery is solved
-- **Change 5** (MoE expert loading) — already implemented
-- **Change 6** (cache heuristic) — low priority, no impact on current hardware
-- **Change 7** (layer skip) — experimental, deferred
+- **Change 2** (I/O coalescing) — DISPROVEN
+- **Change 3** (async I/O) — SUPERSEDED
+- **Change 4** (double buffering) — SUPERSEDED
+- **Change 5** (MoE expert loading) — DONE (integrated into expert-streaming)
+- **Change 6** (cache heuristic) — deferred (LRU is sufficient at 99.5% hit rate)
+- **Change 7** (layer skip) — deferred
+- **Changes 8-10** — SUPERSEDED by expert-streaming
+- **Change 11** (n_batch tuning) — **NEXT**
+- **Change 12** (warm cache) — planned
+- **Change 13** (dense expert-streaming) — planned
+- **Change 14** (pool/cache tuning) — planned
+- **Change 15** (deeper prefetch) — planned
 
 ---
 
@@ -493,9 +548,11 @@ cargo run --release -- iobench ./test-models/mixtral-8x7b-instruct-v0.1.Q5_K_M.g
 ```
 
 Current baselines (2026-03-17):
-- Mixtral keep-resident: 0.87 tok/s (target: 2.0+)
-- Llama 70B streaming: 0.03 tok/s (target: 0.1+)
+- Mixtral expert-streaming: **2.19 tok/s** (was 0.87 keep-resident)
+- Mixtral prompt eval (n_batch=1): 4.5s for 9 tokens (target: <1s with n_batch tuning)
+- Llama 70B streaming: 0.03 tok/s (target: 0.1+ via Change 13)
 - Raw I/O (MT + F_NOCACHE + MADV_FREE): 6.8 GB/s
+- Neuron cache hit rate: 99.5% (expert-streaming Mixtral)
 
 Save results to `benchmarks/results/` for tracking.
 
