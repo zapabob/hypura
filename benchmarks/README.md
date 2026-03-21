@@ -231,3 +231,4 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 - Keep-resident threshold: `gpu_committed_60% + buffer_bytes + 2.5GB overhead + nvme_bytes < RAM - 4GB`
 - This correctly enables keep-resident for Mixtral (26.3 GB < 28 GB) while
   forcing streaming for Llama 70B (33 + 9.8 GB >> 28 GB).
+| 2026-03-21 | qwen2.5-32b-instruct-q5_k_m Q5K | Apple M1 Max 32GB | 21.7 GB | 0.0 GB | 0.0 GB | — | 6.6 | — |
