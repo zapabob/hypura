@@ -922,7 +922,10 @@ pub fn generate_with_nvme_scheduling(
             // Only activate residency when available memory is >50% of total RAM.
             // On 32 GB M1 Max, residency causes memory pressure that slows Metal
             // compute more than the I/O savings. Needs 64 GB+ to be beneficial.
-            let min_available_for_residency = total_ram * 60 / 100;
+            // Residency needs abundant headroom — Metal compute buffers, KV cache,
+            // and page cache all compete with resident data. On 32 GB, even 7 GB
+            // of resident data causes measurable compute slowdown.
+            let min_available_for_residency = total_ram * 75 / 100;
             if num_resident >= 4 && budget.available > min_available_for_residency {
                 if let Some((base, size, layers, offsets)) =
                     prefetch_state.activate_resident_ffn(num_resident)
