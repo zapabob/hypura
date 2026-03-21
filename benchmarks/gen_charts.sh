@@ -96,6 +96,32 @@ def fits_in_gpu(r):
     """Model fits entirely in GPU (no NVMe/RAM spill)."""
     return r["placement"]["nvme_gb"] < 0.01 and r["placement"]["ram_gb"] < 0.01
 
+def model_base_name(name):
+    """Extract base model family name for color grouping."""
+    n = name.lower()
+    if "tinyllama" in n: return "tinyllama"
+    if "qwen" in n and "32b" in n: return "qwen-32b"
+    if "qwen" in n and "14b" in n: return "qwen-14b"
+    if "qwen" in n: return "qwen"
+    if "mixtral" in n: return "mixtral"
+    if "llama" in n and "70b" in n: return "llama-70b"
+    if "llama" in n: return "llama"
+    return n.split("-")[0]
+
+# Distinct colors per model family (colorblind-friendly palette)
+MODEL_COLORS = {
+    "tinyllama": "#7ee787",   # green
+    "qwen-14b":  "#58a6ff",   # blue
+    "qwen-32b":  "#bc8cff",   # purple
+    "mixtral":   "#f0883e",   # orange
+    "llama-70b": "#f778ba",   # pink
+}
+MODEL_COLOR_DEFAULT = "#8b949e"  # gray fallback
+
+def get_model_color(r):
+    base = model_base_name(r["model"]["name"])
+    return MODEL_COLORS.get(base, MODEL_COLOR_DEFAULT)
+
 # --- Chart styling ---
 
 import matplotlib
@@ -138,6 +164,7 @@ if streaming_entries:
     models = []
     hypura_vals = []
     baseline_vals = []
+    model_colors = []
     for r in streaming_entries:
         model = short_model(r["model"]["name"])
         size = format_size(r["model"]["size_gb"])
@@ -146,6 +173,7 @@ if streaming_entries:
         hypura_vals.append(r["hypura"]["tok_per_sec"])
         bl = r.get("baseline")
         baseline_vals.append(bl["tok_per_sec"] if bl and bl.get("tok_per_sec", 0) > 0 else 0)
+        model_colors.append(get_model_color(r))
 
     y = range(len(models))
     bar_h = 0.35
@@ -162,26 +190,32 @@ if streaming_entries:
             ax.text(0.5, i + bar_h/2, "llama.cpp: crashes (model exceeds RAM)",
                     va="center", fontsize=9, color=RED, fontstyle="italic")
 
-    # Hypura bars
+    # Hypura bars (colored by model)
     for i in y:
         ax.barh(i - bar_h/2, hypura_vals[i], height=bar_h,
-                color=GREEN, edgecolor=BORDER, zorder=2)
+                color=model_colors[i], edgecolor=BORDER, zorder=2)
         offset = max(hypura_vals[i] * 0.02, 0.3)
         ax.text(hypura_vals[i] + offset, i - bar_h/2, f"{hypura_vals[i]:.1f}",
                 va="center", fontsize=10, fontweight="bold", color=FG)
 
     ax.set_yticks(list(y))
     ax.set_yticklabels(models, fontsize=10)
+    for i in y:
+        ax.get_yticklabels()[i].set_color(model_colors[i])
     ax.set_xlabel("tok/s (higher is better)", fontsize=11)
     ax.set_title("NVMe-Streaming Models: Hypura vs llama.cpp", fontsize=14, fontweight="bold", pad=12)
     ax.grid(axis="x", alpha=0.3)
     all_vals = hypura_vals + [v for v in baseline_vals if v > 0]
     ax.set_xlim(0, max(all_vals) * 1.18)
 
-    legend_elements = [
-        Patch(facecolor=GREEN, edgecolor=BORDER, label="Hypura (NVMe streaming)"),
-        Patch(facecolor="#484f58", edgecolor=BORDER, label="llama.cpp baseline"),
-    ]
+    seen = {}
+    legend_elements = []
+    for r, c in zip(streaming_entries, model_colors):
+        base = model_base_name(r["model"]["name"])
+        if base not in seen:
+            seen[base] = True
+            legend_elements.append(Patch(facecolor=c, edgecolor=BORDER, label=base))
+    legend_elements.append(Patch(facecolor="#484f58", edgecolor=BORDER, label="llama.cpp baseline"))
     ax.legend(handles=legend_elements, loc="lower right", fontsize=9,
               facecolor=BG, edgecolor=BORDER, labelcolor=FG)
 
@@ -199,6 +233,7 @@ if gpu_entries:
     models = []
     hypura_vals = []
     baseline_vals = []
+    model_colors = []
     for r in gpu_entries:
         model = short_model(r["model"]["name"])
         size = format_size(r["model"]["size_gb"])
@@ -207,6 +242,7 @@ if gpu_entries:
         hypura_vals.append(r["hypura"]["tok_per_sec"])
         bl = r.get("baseline")
         baseline_vals.append(bl["tok_per_sec"] if bl and bl.get("tok_per_sec", 0) > 0 else 0)
+        model_colors.append(get_model_color(r))
 
     y = range(len(models))
     bar_h = 0.35
@@ -221,23 +257,29 @@ if gpu_entries:
 
     for i in y:
         ax.barh(i - bar_h/2, hypura_vals[i], height=bar_h,
-                color=ACCENT, edgecolor=BORDER, zorder=2)
+                color=model_colors[i], edgecolor=BORDER, zorder=2)
         offset = max(hypura_vals[i] * 0.02, 0.3)
         ax.text(hypura_vals[i] + offset, i - bar_h/2, f"{hypura_vals[i]:.1f}",
                 va="center", fontsize=10, fontweight="bold", color=FG)
 
     ax.set_yticks(list(y))
     ax.set_yticklabels(models, fontsize=10)
+    for i in y:
+        ax.get_yticklabels()[i].set_color(model_colors[i])
     ax.set_xlabel("tok/s (higher is better)", fontsize=11)
     ax.set_title("GPU-Resident Models (no NVMe needed)", fontsize=14, fontweight="bold", pad=12)
     ax.grid(axis="x", alpha=0.3)
     all_vals = hypura_vals + [v for v in baseline_vals if v > 0]
     ax.set_xlim(0, max(all_vals) * 1.18)
 
-    legend_elements = [
-        Patch(facecolor=ACCENT, edgecolor=BORDER, label="Hypura"),
-        Patch(facecolor="#484f58", edgecolor=BORDER, label="llama.cpp baseline"),
-    ]
+    seen = {}
+    legend_elements = []
+    for r, c in zip(gpu_entries, model_colors):
+        base = model_base_name(r["model"]["name"])
+        if base not in seen:
+            seen[base] = True
+            legend_elements.append(Patch(facecolor=c, edgecolor=BORDER, label=base))
+    legend_elements.append(Patch(facecolor="#484f58", edgecolor=BORDER, label="llama.cpp baseline"))
     ax.legend(handles=legend_elements, loc="lower right", fontsize=9,
               facecolor=BG, edgecolor=BORDER, labelcolor=FG)
 
@@ -275,6 +317,9 @@ for i, r in enumerate(entries):
 
 ax.set_yticks(range(len(models_p)))
 ax.set_yticklabels(models_p, fontsize=10)
+# Color y-axis labels by model
+for i, r in enumerate(entries):
+    ax.get_yticklabels()[i].set_color(get_model_color(r))
 ax.set_xlabel("Size (GB)", fontsize=11)
 ax.set_title("Memory Placement by Tier", fontsize=14, fontweight="bold", pad=12)
 ax.grid(axis="x", alpha=0.3)
