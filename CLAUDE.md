@@ -32,6 +32,24 @@ cargo run --release -- bench ./test-models/model.gguf
 cargo run --release -- bench --baseline ./test-models/model.gguf  # A/B comparison
 ```
 
+## Benchmark charts
+
+ASCII charts are auto-generated from JSON results in `benchmarks/results/`.
+
+```sh
+# Run benchmarks (saves JSON to benchmarks/results/)
+cargo run --release -- bench --max-tokens 30 ./test-models/model.gguf
+
+# Regenerate charts from all results
+./benchmarks/gen_charts.sh
+
+# Charts are written to benchmarks/CHARTS.md
+```
+
+The script picks the best tok/s per model per machine, so results from multiple
+machines accumulate. To add your machine's results: run benchmarks, commit the
+JSON files in `benchmarks/results/`, then run `gen_charts.sh` to update the charts.
+
 ## Safety
 
 - `bench --baseline` is hard-blocked when model exceeds RAM - 4GB headroom. Use `--force` to override.
