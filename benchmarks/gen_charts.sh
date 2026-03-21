@@ -76,15 +76,25 @@ entries = sorted(best.values(), key=lambda r: r["hypura"]["tok_per_sec"])
 
 def short_model(name):
     name = name.replace("-instruct-v0.1", "")
+    name = name.replace("-instruct", "")
     name = name.replace(".Q5_K_M", " Q5")
     name = name.replace(".Q4_K_M", " Q4")
     name = name.replace("-q4_k_m", " Q4")
+    name = name.replace("-q5_k_m", " Q5")
     name = name.replace("Q4_K_M", "Q4")
     name = name.replace("Q5_K_M", "Q5")
     return name
 
+def short_hw(cpu, ram_gb):
+    chip = cpu.replace("Apple ", "")
+    return f"{chip} {ram_gb:.0f}GB"
+
 def format_size(gb):
     return f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"
+
+def fits_in_gpu(r):
+    """Model fits entirely in GPU (no NVMe/RAM spill)."""
+    return r["placement"]["nvme_gb"] < 0.01 and r["placement"]["ram_gb"] < 0.01
 
 # --- Chart styling ---
 
@@ -115,68 +125,69 @@ plt.rcParams.update({
     "font.size": 12,
 })
 
-# --- Chart 1: Generation speed (Hypura vs baseline) ---
+# --- Chart 1: Generation speed — only models that need NVMe streaming ---
 
 from matplotlib.patches import Patch
 
-fig, ax = plt.subplots(figsize=(10, max(3, len(entries) * 1.1 + 1.5)))
+# Filter to models that actually need Hypura (exceed GPU)
+streaming_entries = [r for r in entries if not fits_in_gpu(r)]
 
-models = []
-hypura_vals = []
-baseline_vals = []
-colors = []
-for r in entries:
-    model = short_model(r["model"]["name"])
-    size = format_size(r["model"]["size_gb"])
-    exceeds = r["model"]["size_gb"] > r["hardware"]["ram_gb"] - 4
-    models.append(f"{model}\n({size})")
-    hypura_vals.append(r["hypura"]["tok_per_sec"])
-    bl = r.get("baseline")
-    baseline_vals.append(bl["tok_per_sec"] if bl and bl.get("tok_per_sec", 0) > 0 else 0)
-    colors.append(RED if exceeds else GREEN)
+if streaming_entries:
+    fig, ax = plt.subplots(figsize=(10, max(3, len(streaming_entries) * 1.1 + 1.5)))
 
-y = range(len(models))
-bar_h = 0.35
+    models = []
+    hypura_vals = []
+    baseline_vals = []
+    for r in streaming_entries:
+        model = short_model(r["model"]["name"])
+        size = format_size(r["model"]["size_gb"])
+        hw = short_hw(r["hardware"]["cpu"], r["hardware"]["ram_gb"])
+        models.append(f"{model}\n({size}) — {hw}")
+        hypura_vals.append(r["hypura"]["tok_per_sec"])
+        bl = r.get("baseline")
+        baseline_vals.append(bl["tok_per_sec"] if bl and bl.get("tok_per_sec", 0) > 0 else 0)
 
-# Baseline bars (behind, gray)
-for i in y:
-    if baseline_vals[i] > 0:
-        ax.barh(i + bar_h/2, baseline_vals[i], height=bar_h,
-                color="#484f58", edgecolor=BORDER, zorder=1)
-        offset = max(baseline_vals[i] * 0.02, 0.3)
-        ax.text(baseline_vals[i] + offset, i + bar_h/2, f"{baseline_vals[i]:.1f}",
-                va="center", fontsize=9, color="#8b949e")
-    elif colors[i] == RED:
-        ax.text(0.5, i + bar_h/2, "OOM", va="center", fontsize=9,
-                color=RED, fontstyle="italic")
+    y = range(len(models))
+    bar_h = 0.35
 
-# Hypura bars (front, colored)
-for i in y:
-    ax.barh(i - bar_h/2, hypura_vals[i], height=bar_h,
-            color=colors[i], edgecolor=BORDER, zorder=2)
-    offset = max(hypura_vals[i] * 0.02, 0.3)
-    ax.text(hypura_vals[i] + offset, i - bar_h/2, f"{hypura_vals[i]:.1f}",
-            va="center", fontsize=10, fontweight="bold", color=FG)
+    # Baseline bars — show "impossible" when OOM
+    for i in y:
+        if baseline_vals[i] > 0:
+            ax.barh(i + bar_h/2, baseline_vals[i], height=bar_h,
+                    color="#484f58", edgecolor=BORDER, zorder=1)
+            offset = max(baseline_vals[i] * 0.02, 0.3)
+            ax.text(baseline_vals[i] + offset, i + bar_h/2, f"{baseline_vals[i]:.1f}",
+                    va="center", fontsize=9, color="#8b949e")
+        else:
+            ax.text(0.5, i + bar_h/2, "llama.cpp: crashes (model exceeds RAM)",
+                    va="center", fontsize=9, color=RED, fontstyle="italic")
 
-ax.set_yticks(list(y))
-ax.set_yticklabels(models, fontsize=10)
-ax.set_xlabel("tok/s (higher is better)", fontsize=11)
-ax.set_title("Generation Speed: Hypura vs llama.cpp", fontsize=14, fontweight="bold", pad=12)
-ax.grid(axis="x", alpha=0.3)
-all_vals = hypura_vals + [v for v in baseline_vals if v > 0]
-ax.set_xlim(0, max(all_vals) * 1.18)
+    # Hypura bars
+    for i in y:
+        ax.barh(i - bar_h/2, hypura_vals[i], height=bar_h,
+                color=GREEN, edgecolor=BORDER, zorder=2)
+        offset = max(hypura_vals[i] * 0.02, 0.3)
+        ax.text(hypura_vals[i] + offset, i - bar_h/2, f"{hypura_vals[i]:.1f}",
+                va="center", fontsize=10, fontweight="bold", color=FG)
 
-legend_elements = [
-    Patch(facecolor=GREEN, edgecolor=BORDER, label="Hypura (fits in memory)"),
-    Patch(facecolor=RED, edgecolor=BORDER, label="Hypura (exceeds RAM)"),
-    Patch(facecolor="#484f58", edgecolor=BORDER, label="llama.cpp baseline"),
-]
-ax.legend(handles=legend_elements, loc="lower right", fontsize=9,
-          facecolor=BG, edgecolor=BORDER, labelcolor=FG)
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(models, fontsize=10)
+    ax.set_xlabel("tok/s (higher is better)", fontsize=11)
+    ax.set_title("NVMe-Streaming Models: Hypura vs llama.cpp", fontsize=14, fontweight="bold", pad=12)
+    ax.grid(axis="x", alpha=0.3)
+    all_vals = hypura_vals + [v for v in baseline_vals if v > 0]
+    ax.set_xlim(0, max(all_vals) * 1.18)
 
-fig.tight_layout()
-fig.savefig(os.path.join(charts_dir, "generation_speed.png"), dpi=150, bbox_inches="tight")
-plt.close()
+    legend_elements = [
+        Patch(facecolor=GREEN, edgecolor=BORDER, label="Hypura (NVMe streaming)"),
+        Patch(facecolor="#484f58", edgecolor=BORDER, label="llama.cpp baseline"),
+    ]
+    ax.legend(handles=legend_elements, loc="lower right", fontsize=9,
+              facecolor=BG, edgecolor=BORDER, labelcolor=FG)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "generation_speed.png"), dpi=150, bbox_inches="tight")
+    plt.close()
 
 # --- Chart 2: Memory placement ---
 
@@ -189,7 +200,8 @@ NVME_COLOR = "#8b949e"
 models_p = []
 for i, r in enumerate(entries):
     model = short_model(r["model"]["name"])
-    models_p.append(model)
+    hw = short_hw(r["hardware"]["cpu"], r["hardware"]["ram_gb"])
+    models_p.append(f"{model}\n{hw}")
     gpu = r["placement"]["gpu_gb"]
     ram = r["placement"]["ram_gb"]
     nvme = r["placement"]["nvme_gb"]
@@ -228,48 +240,52 @@ fig.tight_layout()
 fig.savefig(os.path.join(charts_dir, "memory_placement.png"), dpi=150, bbox_inches="tight")
 plt.close()
 
-# --- Chart 3: Prompt eval vs generation ---
+# --- Chart 3: Prompt eval vs generation — only NVMe-streaming models ---
 
-fig, ax = plt.subplots(figsize=(10, max(3, len(entries) * 0.9 + 1.2)))
+streaming_entries_3 = [r for r in entries if not fits_in_gpu(r)]
 
-models_e = []
-prompt_vals = []
-gen_vals = []
-for r in entries:
-    model = short_model(r["model"]["name"])
-    models_e.append(model)
-    prompt_ms = r["hypura"]["prompt_eval_ms"]
-    prompt_token_est = int(len(r["config"]["prompt"].split()) * 1.3)
-    prompt_tps = prompt_token_est / (prompt_ms / 1000) if prompt_ms > 0 else 0
-    prompt_vals.append(prompt_tps)
-    gen_vals.append(r["hypura"]["tok_per_sec"])
+if streaming_entries_3:
+    fig, ax = plt.subplots(figsize=(10, max(3, len(streaming_entries_3) * 0.9 + 1.2)))
 
-y = range(len(models_e))
-bar_h = 0.3
-ax.barh([i + bar_h/2 for i in y], prompt_vals, height=bar_h,
-        color=ACCENT, edgecolor=BORDER, label="Prompt eval")
-ax.barh([i - bar_h/2 for i in y], gen_vals, height=bar_h,
-        color=GREEN, edgecolor=BORDER, label="Generation")
+    models_e = []
+    prompt_vals = []
+    gen_vals = []
+    for r in streaming_entries_3:
+        model = short_model(r["model"]["name"])
+        hw = short_hw(r["hardware"]["cpu"], r["hardware"]["ram_gb"])
+        models_e.append(f"{model}\n{hw}")
+        prompt_ms = r["hypura"]["prompt_eval_ms"]
+        prompt_token_est = int(len(r["config"]["prompt"].split()) * 1.3)
+        prompt_tps = prompt_token_est / (prompt_ms / 1000) if prompt_ms > 0 else 0
+        prompt_vals.append(prompt_tps)
+        gen_vals.append(r["hypura"]["tok_per_sec"])
 
-for i in y:
-    offset_p = max(prompt_vals[i] * 0.02, 0.2)
-    offset_g = max(gen_vals[i] * 0.02, 0.2)
-    ax.text(prompt_vals[i] + offset_p, i + bar_h/2, f"{prompt_vals[i]:.1f}",
-            va="center", fontsize=9, color=FG)
-    ax.text(gen_vals[i] + offset_g, i - bar_h/2, f"{gen_vals[i]:.1f}",
-            va="center", fontsize=9, color=FG)
+    y = range(len(models_e))
+    bar_h = 0.3
+    ax.barh([i + bar_h/2 for i in y], prompt_vals, height=bar_h,
+            color=ACCENT, edgecolor=BORDER, label="Prompt eval")
+    ax.barh([i - bar_h/2 for i in y], gen_vals, height=bar_h,
+            color=GREEN, edgecolor=BORDER, label="Generation")
 
-ax.set_yticks(list(y))
-ax.set_yticklabels(models_e, fontsize=10)
-ax.set_xlabel("tok/s", fontsize=11)
-ax.set_title("Prompt Eval vs Generation Speed", fontsize=14, fontweight="bold", pad=12)
-ax.grid(axis="x", alpha=0.3)
-ax.set_xlim(0, max(max(prompt_vals), max(gen_vals)) * 1.15)
-ax.legend(loc="lower right", fontsize=9, facecolor=BG, edgecolor=BORDER, labelcolor=FG)
+    for i in y:
+        offset_p = max(prompt_vals[i] * 0.02, 0.2)
+        offset_g = max(gen_vals[i] * 0.02, 0.2)
+        ax.text(prompt_vals[i] + offset_p, i + bar_h/2, f"{prompt_vals[i]:.1f}",
+                va="center", fontsize=9, color=FG)
+        ax.text(gen_vals[i] + offset_g, i - bar_h/2, f"{gen_vals[i]:.1f}",
+                va="center", fontsize=9, color=FG)
 
-fig.tight_layout()
-fig.savefig(os.path.join(charts_dir, "prompt_vs_generation.png"), dpi=150, bbox_inches="tight")
-plt.close()
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(models_e, fontsize=10)
+    ax.set_xlabel("tok/s", fontsize=11)
+    ax.set_title("NVMe-Streaming: Prompt Eval vs Generation", fontsize=14, fontweight="bold", pad=12)
+    ax.grid(axis="x", alpha=0.3)
+    ax.set_xlim(0, max(max(prompt_vals), max(gen_vals)) * 1.15)
+    ax.legend(loc="lower right", fontsize=9, facecolor=BG, edgecolor=BORDER, labelcolor=FG)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "prompt_vs_generation.png"), dpi=150, bbox_inches="tight")
+    plt.close()
 
 # --- Generate CHARTS.md ---
 
