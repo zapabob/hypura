@@ -64,6 +64,7 @@ Benchmarks run on:
 |------|-------|--------|-------|------|------|-----|------|--------------|----------|-------|
 | 2026-03-21 | TinyLlama 1.1B | 1.1B | Q4_K_M | 0.6 GB | full-resident | 0.6 GB | — | 268.3 | 250.9 | 1.1x, fits in GPU |
 | 2026-03-21 | Qwen 2.5 14B | 14.8B | Q4_K_M | 8.4 GB | full-resident | 8.4 GB | — | 27.2 | 27.2 | 1.0x, fits in GPU |
+| 2026-03-21 | Phi-3.5-MoE | 41.9B | Q4_K_M | 23.6 GB | expert-streaming | 0.9 GB | 22.7 GB | **3.2** | OOM | 16 experts, 2 active |
 | 2026-03-21 | Mixtral 8x7B | 46.7B | Q5_K_M | 30.9 GB | expert-streaming | 1.1 GB | 29.8 GB | **2.7** | OOM | Expert streaming |
 | 2026-03-21 | Qwen3-Coder-Next | 79.7B | Q4_K_M | 45.2 GB | expert-streaming | 1.6 GB | 43.6 GB | **1.3** | OOM | MoE 80B-A3B, expert streaming |
 | 2026-03-21 | Llama 3.3 70B | 70.6B | Q4_K_M | 39.6 GB | dense-FFN-streaming | 7.8 GB | 31.8 GB | **0.3** | OOM | All layers on Metal, I/O-bound |
