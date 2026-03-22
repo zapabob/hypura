@@ -100,6 +100,7 @@ def model_base_name(name):
     """Extract base model family name for color grouping."""
     n = name.lower()
     if "tinyllama" in n: return "tinyllama"
+    if "phi" in n: return "phi"
     if "qwen3-coder-next" in n or "qwen3-coder-next" in n.replace(" ", "-"): return "qwen3-coder-next"
     if "qwen" in n and "coder" in n and "32b" in n: return "qwen-coder-32b"
     if "qwen" in n and "32b" in n: return "qwen-32b"
@@ -117,6 +118,7 @@ MODEL_COLORS = {
     "qwen-32b":          "#bc8cff",   # purple
     "qwen-coder-32b":    "#d2a8ff",   # light purple
     "qwen3-coder-next":  "#79c0ff",   # light blue
+    "phi":               "#ffa657",   # amber
     "mixtral":           "#f0883e",   # orange
     "llama-70b":         "#f778ba",   # pink
 }
