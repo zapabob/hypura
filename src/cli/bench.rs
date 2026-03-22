@@ -123,62 +123,66 @@ async fn run_async(
     // --- Baseline run (naive mmap) ---
     let mut baseline_result = None;
     if run_baseline {
-        if !baseline_safe {
+        // For oversized models, use CPU-only mode (ngl=0) instead of GPU offloading.
+        // This avoids Metal OOM while still providing a valid performance comparison.
+        // The baseline will be slow (CPU matmul + swap pressure) but won't crash.
+        let baseline_ngl = if baseline_safe {
+            n_gpu_layers
+        } else {
+            0 // CPU-only: no Metal buffers, just mmap + CPU compute
+        };
+
+        let baseline_label = if baseline_safe {
+            "llama.cpp (full GPU)".to_string()
+        } else {
             let model_gb = model_total_bytes as f64 / (1u64 << 30) as f64;
             let total_gb = total_ram as f64 / (1u64 << 30) as f64;
-            if force {
-                println!("  WARNING: model ({model_gb:.1} GB) exceeds RAM ({total_gb:.1} GB) — baseline forced, expect heavy swap pressure.");
-            } else {
-                println!("  Skipping baseline: model ({model_gb:.1} GB) exceeds RAM ({total_gb:.1} GB).");
-                println!("  Naive mmap of this model will cause severe swap thrashing / OOM.");
-                println!("  Use --force to run baseline anyway.");
+            println!(
+                "  Model ({model_gb:.1} GB) exceeds RAM ({total_gb:.1} GB) — baseline using CPU-only (ngl=0)."
+            );
+            "llama.cpp CPU-only (ngl=0)".to_string()
+        };
+
+        println!("  Run 1: {baseline_label}");
+        println!("    Running...");
+
+        let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
+        let path_c = path.to_path_buf();
+        let prompt_c = prompt_text.to_string();
+        let config_c = config.clone();
+        let telemetry = Arc::new(TelemetryEmitter::new(64));
+
+        let wall_start = Instant::now();
+        let handle = tokio::task::spawn_blocking(move || {
+            generate_blocking(&path_c, &prompt_c, &config_c, baseline_ngl, token_tx, telemetry)
+        });
+
+        // Drain tokens (discard output)
+        while token_rx.recv().await.is_some() {}
+
+        match handle.await {
+            Ok(Ok(result)) => {
+                let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
+                print_run_result(&baseline_label, &result, wall_ms);
+                baseline_result = Some((result, wall_ms));
+            }
+            Ok(Err(e)) => {
+                println!("    Baseline failed: {e}");
+                println!("    Continuing with Hypura run...");
+                println!();
+            }
+            Err(e) => {
+                println!("    Baseline panicked: {e}");
+                println!("    Continuing with Hypura run...");
                 println!();
             }
         }
 
-        if baseline_safe || force {
-            println!("  Run 1: Naive mmap (baseline)");
-            println!("    Running...");
-
-            let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
-            let path_c = path.to_path_buf();
-            let prompt_c = prompt_text.to_string();
-            let config_c = config.clone();
-            let telemetry = Arc::new(TelemetryEmitter::new(64));
-
-            let wall_start = Instant::now();
-            let handle = tokio::task::spawn_blocking(move || {
-                generate_blocking(&path_c, &prompt_c, &config_c, n_gpu_layers, token_tx, telemetry)
-            });
-
-            // Drain tokens (discard output)
-            while token_rx.recv().await.is_some() {}
-
-            match handle.await {
-                Ok(Ok(result)) => {
-                    let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
-                    print_run_result("Naive mmap (baseline)", &result, wall_ms);
-                    baseline_result = Some((result, wall_ms));
-                }
-                Ok(Err(e)) => {
-                    println!("    Baseline failed: {e}");
-                    println!("    Continuing with Hypura run...");
-                    println!();
-                }
-                Err(e) => {
-                    println!("    Baseline panicked: {e}");
-                    println!("    Continuing with Hypura run...");
-                    println!();
-                }
-            }
-
-            // When model exceeds RAM, give the OS time to reclaim pages from the
-            // baseline's GPU/mmap buffers before loading again for the Hypura run.
-            // Without this, back-to-back loads can spike to 2x model size and OOM.
-            if !baseline_safe && has_nvme {
-                println!("  Reclaiming memory before Hypura run...");
-                std::thread::sleep(std::time::Duration::from_secs(3));
-            }
+        // When model exceeds RAM, give the OS time to reclaim pages from the
+        // baseline's mmap buffers before loading again for the Hypura run.
+        if !baseline_safe && has_nvme {
+            println!("  Reclaiming memory before Hypura run...");
+            std::thread::sleep(std::time::Duration::from_secs(3));
         }
     }
 

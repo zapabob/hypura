@@ -42,9 +42,12 @@ pub fn compute_placement_with_context(
     // Score and sort tensors
     let scored = score_tensors(&model.tensors, &metadata);
 
-    // Try streaming modes: MoE expert-streaming, then dense FFN-streaming
+    // Try streaming modes: sparse MoE mmap, expert-streaming, then dense FFN-streaming
     let (tier_assignments, inference_mode) =
-        if let Some(es) = try_expert_streaming_assign(&scored, &capacities, &metadata) {
+        if let Some(assignments) = try_sparse_moe_mmap(&scored, &capacities, &metadata) {
+            tracing::info!("Sparse MoE mmap: active working set fits in RAM, using OS page cache");
+            (assignments, InferenceMode::SparseMoeMmap)
+        } else if let Some(es) = try_expert_streaming_assign(&scored, &capacities, &metadata) {
             tracing::info!("Expert-streaming placement: non-expert tensors on GPU/RAM, experts on NVMe");
             (es, InferenceMode::ExpertStreaming)
         } else if let Some(ds) = try_dense_ffn_streaming_assign(&scored, &capacities, &metadata) {
@@ -233,6 +236,60 @@ fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<Scored
 /// Try expert-streaming placement for MoE models: non-expert tensors on GPU/RAM,
 /// all expert (MoeFusedExperts) tensors on NVMe. Returns None if the model is not
 /// MoE or non-expert tensors don't fit in unified memory.
+/// Ultra-sparse MoE: if the active working set (experts_used/expert_count × model_size)
+/// fits comfortably in RAM, skip the pool/callback machinery entirely. Use mmap and let
+/// the OS page cache handle sparsity — only the active expert pages get loaded into
+/// physical memory. This avoids eval callback overhead, pool slot allocation, and tensor
+/// pointer rewriting, which dominate latency for very sparse models (e.g. 2% activation).
+fn try_sparse_moe_mmap(
+    tensors: &[ScoredTensor],
+    caps: &TierCapacities,
+    metadata: &ModelMetadata,
+) -> Option<HashMap<String, StorageTier>> {
+    if !metadata.is_moe {
+        return None;
+    }
+
+    let experts_total = metadata.num_experts.unwrap_or(1).max(1) as u64;
+    let experts_used = metadata.num_experts_used.unwrap_or(1).max(1) as u64;
+    let activation_ratio = experts_used as f64 / experts_total as f64;
+
+    // Only use this path for sparse models (activation ratio < 15%)
+    if activation_ratio >= 0.15 {
+        return None;
+    }
+
+    let total_bytes: u64 = tensors.iter().map(|t| t.size_bytes).sum();
+    let active_bytes = (total_bytes as f64 * activation_ratio) as u64;
+
+    // Active working set must fit in 30% of unified memory limit
+    if active_bytes > caps.unified_limit * 30 / 100 {
+        return None;
+    }
+
+    // All tensors go to GPU tier — mmap handles data.
+    // If the model exceeds Metal's working set, gpu_layers_from_placement will
+    // detect this and return ngl=0 (CPU-only). The OS page cache still works
+    // because only ~2% of pages are active per token.
+    let mut assignments = HashMap::new();
+    for t in tensors {
+        assignments.insert(t.name.clone(), StorageTier::Gpu);
+    }
+
+    let fits_gpu = total_bytes <= caps.gpu_bytes + GPU_RUNTIME_OVERHEAD;
+    tracing::info!(
+        "Sparse MoE mmap: {:.0}% activation ({}/{} experts), {:.1} GB active of {:.1} GB total{}",
+        activation_ratio * 100.0,
+        experts_used,
+        experts_total,
+        active_bytes as f64 / (1u64 << 30) as f64,
+        total_bytes as f64 / (1u64 << 30) as f64,
+        if fits_gpu { "" } else { " (exceeds GPU, will use CPU-only)" },
+    );
+
+    Some(assignments)
+}
+
 fn try_expert_streaming_assign(
     tensors: &[ScoredTensor],
     caps: &TierCapacities,

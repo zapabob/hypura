@@ -63,6 +63,10 @@ pub enum InferenceMode {
     ExpertStreaming,
     /// Dense model: attention + norms resident, FFN tensors streamed from NVMe on demand.
     DenseFfnStreaming,
+    /// Ultra-sparse MoE: active working set fits in RAM. Use mmap, let OS page cache
+    /// handle sparsity. No pool, no eval callback — faster than expert-streaming when
+    /// activation ratio is very low (e.g. 512 experts, 10 active = 2%).
+    SparseMoeMmap,
     /// Heavy NVMe spill: all NVMe layers streamed, loaded/released per token.
     FullStreaming,
 }
