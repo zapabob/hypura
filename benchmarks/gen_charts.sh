@@ -72,6 +72,20 @@ for r in results:
 
 entries = sorted(best.values(), key=lambda r: r["hypura"]["tok_per_sec"])
 
+# Best result per model+machine WITH baseline data (for CPU-only comparison chart)
+best_with_baseline = {}
+for r in results:
+    bl = r.get("baseline")
+    if not bl or bl.get("tok_per_sec", 0) <= 0:
+        continue
+    hw = r["hardware"]["cpu"]
+    ram = r["hardware"]["ram_gb"]
+    model = r["model"]["name"]
+    tps = r["hypura"]["tok_per_sec"]
+    key = (hw, ram, model)
+    if key not in best_with_baseline or tps > best_with_baseline[key]["hypura"]["tok_per_sec"]:
+        best_with_baseline[key] = r
+
 # --- Helpers ---
 
 def short_model(name):
@@ -95,6 +109,10 @@ def format_size(gb):
 def fits_in_gpu(r):
     """Model fits entirely in GPU (no NVMe/RAM spill)."""
     return r["placement"]["nvme_gb"] < 0.01 and r["placement"]["ram_gb"] < 0.01
+
+def exceeds_ram(r):
+    """Model exceeds available RAM (llama.cpp would crash with full GPU offload)."""
+    return r["model"]["size_gb"] > r["hardware"]["ram_gb"] - 4
 
 def model_base_name(name):
     """Extract base model family name for color grouping."""
@@ -394,6 +412,139 @@ if streaming_entries_3:
     fig.savefig(os.path.join(charts_dir, "prompt_vs_generation.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
+# --- Chart 4: Social — "Models That Crash llama.cpp" ---
+
+social_entries = sorted(
+    [r for r in best.values() if exceeds_ram(r)],
+    key=lambda r: r["hypura"]["tok_per_sec"],
+)
+
+if social_entries:
+    fig, ax = plt.subplots(figsize=(10, max(3, len(social_entries) * 1.1 + 1.5)))
+
+    models = []
+    hypura_vals = []
+    model_colors = []
+    for r in social_entries:
+        model = short_model(r["model"]["name"])
+        size = format_size(r["model"]["size_gb"])
+        hw = short_hw(r["hardware"]["cpu"], r["hardware"]["ram_gb"])
+        models.append(f"{model}\n({size}) — {hw}")
+        hypura_vals.append(r["hypura"]["tok_per_sec"])
+        model_colors.append(get_model_color(r))
+
+    y = range(len(models))
+    bar_h = 0.35
+
+    # "Crashes" text for llama.cpp baseline
+    for i in y:
+        ax.text(0.5, i + bar_h/2, "llama.cpp: crashes (model exceeds RAM)",
+                va="center", fontsize=9, color=RED, fontstyle="italic")
+
+    # Hypura bars
+    for i in y:
+        ax.barh(i - bar_h/2, hypura_vals[i], height=bar_h,
+                color=model_colors[i], edgecolor=BORDER, zorder=2)
+        offset = max(hypura_vals[i] * 0.02, 0.3)
+        ax.text(hypura_vals[i] + offset, i - bar_h/2, f"{hypura_vals[i]:.1f} tok/s",
+                va="center", fontsize=10, fontweight="bold", color=FG)
+
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(models, fontsize=10)
+    for i in y:
+        ax.get_yticklabels()[i].set_color(model_colors[i])
+    ax.set_xlabel("tok/s (higher is better)", fontsize=11)
+    ax.set_title("Hypura: Models That Crash llama.cpp", fontsize=14, fontweight="bold", pad=12)
+    ax.grid(axis="x", alpha=0.3)
+    ax.set_xlim(0, max(hypura_vals) * 1.25)
+
+    seen = {}
+    legend_elements = []
+    for r, c in zip(social_entries, model_colors):
+        base = model_base_name(r["model"]["name"])
+        if base not in seen:
+            seen[base] = True
+            legend_elements.append(Patch(facecolor=c, edgecolor=BORDER, label=base))
+    legend_elements.append(Patch(facecolor=RED, edgecolor=BORDER, label="llama.cpp (OOM)"))
+    ax.legend(handles=legend_elements, loc="lower right", fontsize=9,
+              facecolor=BG, edgecolor=BORDER, labelcolor=FG)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "social_nvme_streaming.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+# --- Chart 5: CPU-only comparison (models that exceed RAM with baseline data) ---
+
+cpu_only_entries = sorted(
+    [r for r in best_with_baseline.values() if exceeds_ram(r)],
+    key=lambda r: r["hypura"]["tok_per_sec"],
+)
+
+if cpu_only_entries:
+    fig, ax = plt.subplots(figsize=(12, max(3, len(cpu_only_entries) * 1.4 + 1.5)))
+
+    models = []
+    hypura_vals = []
+    baseline_vals = []
+    model_colors = []
+    for r in cpu_only_entries:
+        model = short_model(r["model"]["name"])
+        size = format_size(r["model"]["size_gb"])
+        hw = short_hw(r["hardware"]["cpu"], r["hardware"]["ram_gb"])
+        models.append(f"{model}\n({size}) — {hw}")
+        hypura_vals.append(r["hypura"]["tok_per_sec"])
+        baseline_vals.append(r["baseline"]["tok_per_sec"])
+        model_colors.append(get_model_color(r))
+
+    y = range(len(models))
+    bar_h = 0.35
+
+    # Baseline bars (CPU-only)
+    for i in y:
+        ax.barh(i + bar_h/2, baseline_vals[i], height=bar_h,
+                color="#484f58", edgecolor=BORDER, zorder=1)
+        offset = max(baseline_vals[i] * 0.02, 0.15)
+        ax.text(baseline_vals[i] + offset, i + bar_h/2, f"{baseline_vals[i]:.1f} tok/s",
+                va="center", fontsize=9, color="#8b949e")
+
+    # Hypura bars with speedup annotation
+    for i in y:
+        ax.barh(i - bar_h/2, hypura_vals[i], height=bar_h,
+                color=model_colors[i], edgecolor=BORDER, zorder=2)
+        offset = max(hypura_vals[i] * 0.02, 0.15)
+        speedup = hypura_vals[i] / baseline_vals[i] if baseline_vals[i] > 0 else 0
+        label = f"{hypura_vals[i]:.1f} tok/s"
+        if speedup >= 1.5:
+            label += f" ({speedup:.0f}x)"
+        ax.text(hypura_vals[i] + offset, i - bar_h/2, label,
+                va="center", fontsize=10, fontweight="bold", color=FG)
+
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(models, fontsize=10)
+    for i in y:
+        ax.get_yticklabels()[i].set_color(model_colors[i])
+    ax.set_xlabel("tok/s (higher is better)", fontsize=11)
+    ax.set_title("Hypura vs llama.cpp CPU-only (models that exceed RAM)",
+                 fontsize=14, fontweight="bold", pad=12)
+    ax.grid(axis="x", alpha=0.3)
+    all_vals = hypura_vals + baseline_vals
+    ax.set_xlim(0, max(all_vals) * 1.25)
+
+    seen = {}
+    legend_elements = []
+    for r, c in zip(cpu_only_entries, model_colors):
+        base = model_base_name(r["model"]["name"])
+        if base not in seen:
+            seen[base] = True
+            legend_elements.append(Patch(facecolor=c, edgecolor=BORDER, label=base))
+    legend_elements.append(Patch(facecolor="#484f58", edgecolor=BORDER, label="llama.cpp CPU-only (ngl=0)"))
+    ax.legend(handles=legend_elements, loc="lower right", fontsize=9,
+              facecolor=BG, edgecolor=BORDER, labelcolor=FG)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "cpu_only_comparison.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
 # --- Generate CHARTS.md ---
 
 with open(output_md, "w") as f:
@@ -411,6 +562,12 @@ with open(output_md, "w") as f:
 
     f.write("## Prompt Eval vs Generation\n\n")
     f.write("![Prompt vs Generation](charts/prompt_vs_generation.png)\n\n")
+
+    f.write("## Models That Crash llama.cpp\n\n")
+    f.write("![Social NVMe Streaming](charts/social_nvme_streaming.png)\n\n")
+
+    f.write("## Hypura vs llama.cpp CPU-only\n\n")
+    f.write("![CPU-Only Comparison](charts/cpu_only_comparison.png)\n\n")
 
     f.write("## Hardware\n\n")
     machines = set()

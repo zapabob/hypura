@@ -18,9 +18,17 @@
 
 ![Prompt vs Generation](charts/prompt_vs_generation.png)
 
+## Models That Crash llama.cpp
+
+![Social NVMe Streaming](charts/social_nvme_streaming.png)
+
+## Hypura vs llama.cpp CPU-only
+
+![CPU-Only Comparison](charts/cpu_only_comparison.png)
+
 ## Hardware
 
 - **Apple M1 Max**, 32 GB unified, 5.1 GB/s NVMe seq read
 - **Apple M5 Pro**, 24 GB unified, 33.4 GB/s NVMe seq read
 
-*Generated 2026-03-21*
+*Generated 2026-03-22*
