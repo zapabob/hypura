@@ -4,7 +4,9 @@ use std::path::PathBuf;
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let llama_dir = PathBuf::from(&manifest_dir).join("../vendor/llama.cpp");
-    let llama_dir = llama_dir.canonicalize().expect(
+    // dunce::canonicalize strips the \\?\ UNC prefix that std::fs::canonicalize
+    // adds on Windows, which would otherwise cause MSBuild to reject source paths.
+    let llama_dir = dunce::canonicalize(&llama_dir).expect(
         "vendor/llama.cpp not found — run: git submodule update --init --recursive",
     );
 
