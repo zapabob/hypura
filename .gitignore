@@ -1,0 +1,12 @@
+/target/
+vendor/llama.cpp/build/
+vendor/llama.cpp/build-*/
+benchmarks/results/*.json
+test-models/
+*.gguf
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
