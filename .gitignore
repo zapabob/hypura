@@ -32,6 +32,9 @@ target-codex/
 target-codex*/
 debug-*.log
 _docs/logs/
+dist/
+*.tar.gz
+*.zip
 
 # Local assistant/session metadata
 .specstory/
