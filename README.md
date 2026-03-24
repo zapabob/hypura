@@ -442,6 +442,34 @@ hypura serve ./model.gguf
 #   Ollama-compatible API: /api/generate, /api/chat, /api/tags
 ```
 
+### Windows central launcher (generic)
+
+For long-running local usage (desktop shortcut / Startup), use the launcher scripts in `scripts/`:
+
+```powershell
+# update/create desktop launchers
+.\scripts\Configure-HypuraCentralShortcut.ps1
+
+# run central server with stateful context policy
+.\scripts\hypura-central-smart.ps1
+```
+
+The launcher is path-agnostic and resolves resources in this order:
+
+- `hypura.exe`: `HYPURA_EXE` -> `target\release\hypura.exe` -> latest `dist\**\hypura.exe`
+- model (`*.gguf`): `HYPURA_MODEL` -> latest `test-models\*.gguf` -> latest `models\*.gguf`
+
+Optional environment overrides:
+
+```powershell
+$env:HYPURA_EXE = "C:\path\to\hypura.exe"
+$env:HYPURA_MODEL = "D:\models\my-model.gguf"
+$env:HYPURA_HOST = "127.0.0.1"
+$env:HYPURA_PORT = "8080"
+$env:HYPURA_CONTEXT = "8192"
+.\scripts\hypura-central-smart.ps1
+```
+
 ### Endpoints
 
 | Endpoint | Description |

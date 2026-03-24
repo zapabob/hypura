@@ -12,7 +12,10 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $ShortcutName = "Hypura 中枢 (Ollama API).lnk"
+    [string[]] $ShortcutNames = @(
+        "Hypura 中枢 (Ollama API).lnk",
+        "Hypura 荳ｭ譫｢ (Ollama API).lnk"
+    )
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,14 +54,16 @@ Get-ChildItem -Path $desktop -Filter *.lnk -File -ErrorAction SilentlyContinue |
     }
 }
 
-$newPath = Join-Path $desktop $ShortcutName
-$scNew = $wsh.CreateShortcut($newPath)
-$scNew.TargetPath = $psExe
-$scNew.Arguments = $argsLine
-$scNew.WorkingDirectory = $repoRoot
-$scNew.Description = "Hypura 中枢: state %LOCALAPPDATA%\Hypura\central-state.json"
-$scNew.Save()
-Write-Host "[shortcut] primary (always write): $newPath"
+foreach ($name in $ShortcutNames) {
+    $newPath = Join-Path $desktop $name
+    $scNew = $wsh.CreateShortcut($newPath)
+    $scNew.TargetPath = $psExe
+    $scNew.Arguments = $argsLine
+    $scNew.WorkingDirectory = $repoRoot
+    $scNew.Description = "Hypura 中枢: state %LOCALAPPDATA%\Hypura\central-state.json"
+    $scNew.Save()
+    Write-Host "[shortcut] ensured: $newPath"
+}
 
 if ($updated.Count -gt 0) {
     Write-Host "[shortcut] updated: $($updated -join ', ')"

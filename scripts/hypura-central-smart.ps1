@@ -50,8 +50,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$defaultExe = Join-Path $repoRoot "dist\hypura-rtx30-windows-stable-2026-03-24\hypura.exe"
-$defaultModel = "C:\Users\downl\Downloads\Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
+$defaultModelName = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-BF16"
 
 $stateDir = Join-Path $env:LOCALAPPDATA "Hypura"
 $statePath = Join-Path $stateDir "central-state.json"
@@ -60,6 +59,49 @@ function Ensure-Dir {
     if (-not (Test-Path -LiteralPath $stateDir)) {
         New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
     }
+}
+
+function Resolve-HypuraExe {
+    if ($HypuraExe -and (Test-Path -LiteralPath $HypuraExe)) {
+        return $HypuraExe
+    }
+
+    $releaseExe = Join-Path $repoRoot "target\release\hypura.exe"
+    if (Test-Path -LiteralPath $releaseExe) {
+        return $releaseExe
+    }
+
+    $distExe = Get-ChildItem -Path (Join-Path $repoRoot "dist") -Filter "hypura.exe" -Recurse -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($distExe) {
+        return $distExe.FullName
+    }
+
+    return $null
+}
+
+function Resolve-ModelPath {
+    if ($ModelPath -and (Test-Path -LiteralPath $ModelPath)) {
+        return $ModelPath
+    }
+
+    $candidates = @(
+        (Join-Path $repoRoot "test-models"),
+        (Join-Path $repoRoot "models")
+    )
+
+    foreach ($dir in $candidates) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $model = Get-ChildItem -Path $dir -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($model) {
+            return $model.FullName
+        }
+    }
+
+    return $null
 }
 
 function Read-State {
@@ -113,14 +155,14 @@ if ($ShowState) {
     exit 0
 }
 
-if (-not $HypuraExe) { $HypuraExe = $defaultExe }
-if (-not $ModelPath) { $ModelPath = $defaultModel }
+$HypuraExe = Resolve-HypuraExe
+$ModelPath = Resolve-ModelPath
 
 if (-not (Test-Path -LiteralPath $HypuraExe)) {
-    Write-Error "hypura.exe not found: $HypuraExe"
+    Write-Error "hypura.exe not found. Set HYPURA_EXE or place one at target\release\hypura.exe / dist\**\hypura.exe"
 }
 if (-not (Test-Path -LiteralPath $ModelPath)) {
-    Write-Error "GGUF not found: $ModelPath"
+    Write-Error "GGUF not found. Set HYPURA_MODEL or place a *.gguf under test-models/ or models/"
 }
 
 if ($SmokeAndPromote) {
@@ -146,6 +188,7 @@ if ($env:HYPURA_CONTEXT) {
 Write-Host ('[hypura-central-smart] state file: {0}' -f $statePath)
 Write-Host ('[hypura-central-smart] exe     = {0}' -f $HypuraExe)
 Write-Host ('[hypura-central-smart] model   = {0}' -f $ModelPath)
+Write-Host ('[hypura-central-smart] tag     = {0}' -f $defaultModelName)
 Write-Host ('[hypura-central-smart] bind    = http://{0}:{1}/' -f $BindHost, $Port)
 Write-Host ('[hypura-central-smart] context = {0}  (tier={1})' -f $ctx, $st.tier)
 if ($ctx -eq 8192) {
@@ -153,4 +196,5 @@ if ($ctx -eq 8192) {
 }
 Write-Host ""
 
+$env:HYPURA_MODEL_NAME = $defaultModelName
 & $HypuraExe serve $ModelPath --host $BindHost --port $Port --context $ctx
