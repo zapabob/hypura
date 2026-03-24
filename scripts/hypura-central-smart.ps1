@@ -51,7 +51,7 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $defaultExe = Join-Path $repoRoot "dist\hypura-rtx30-windows-stable-2026-03-24\hypura.exe"
-$defaultModel = "F:\Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf"
+$defaultModel = "C:\Users\downl\Downloads\Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
 
 $stateDir = Join-Path $env:LOCALAPPDATA "Hypura"
 $statePath = Join-Path $stateDir "central-state.json"
@@ -66,15 +66,15 @@ function Read-State {
     Ensure-Dir
     if (-not (Test-Path -LiteralPath $statePath)) {
         return @{
-            context = 2048
+            context = 16384
             tier    = "safe"
-            note    = "default 2048; PromoteTo8192 or SmokeAndPromote for long context + KV window/compact"
+            note    = "default 16384 for Q4_K_M profile"
         }
     }
     $raw = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8
     $j = $raw | ConvertFrom-Json
     $ctx = [int]$j.context
-    if ($ctx -ne 2048 -and $ctx -ne 8192) { $ctx = 2048 }
+    if ($ctx -ne 2048 -and $ctx -ne 8192 -and $ctx -ne 16384) { $ctx = 16384 }
     return @{
         context = $ctx
         tier    = [string]$j.tier
