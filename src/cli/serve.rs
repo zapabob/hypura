@@ -75,7 +75,14 @@ async fn run_async(model_path: &str, host: &str, port: u16, context: u32) -> any
     .await??;
 
     let load_duration_ns = load_start.elapsed().as_nanos() as u64;
-    let model_name = loaded.model_name.clone();
+    // Allow explicit model tag override for Ollama-compatible `/api/tags` naming.
+    // This is used by local operators who need a stable tag suffix (e.g. `-Q4_K_M`)
+    // even when GGUF metadata `general.name` omits quantization details.
+    let model_name = std::env::var("HYPURA_MODEL_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| loaded.model_name.clone());
 
     let telemetry = Arc::new(TelemetryEmitter::new(256));
 
