@@ -32,3 +32,4 @@ dist/
 .specstory/
 .cargo/
 .cursor/
+scripts/__pycache__/
