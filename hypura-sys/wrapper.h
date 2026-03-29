@@ -6,3 +6,4 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "hypura_buft.h"
+#include "hypura_kv_codec.h"

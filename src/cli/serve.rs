@@ -3,50 +3,58 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hypura::compute::inference;
-use hypura::model::gguf::GgufFile;
-use hypura::model::metadata::ModelMetadata;
-use hypura::profiler;
-use hypura::scheduler::placement::compute_placement_with_context;
+use hypura::model::turboquant_sidecar::TurboQuantMode;
 use hypura::server::ollama_types::GgufInfo;
 use hypura::server::routes::{self, AppState};
 use hypura::telemetry::metrics::TelemetryEmitter;
 
-pub fn run(model_path: &str, host: &str, port: u16, context: u32) -> anyhow::Result<()> {
+pub fn run(
+    model_path: &str,
+    host: &str,
+    port: u16,
+    context: u32,
+    turboquant_mode: TurboQuantMode,
+    turboquant_config: Option<&str>,
+) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(model_path, host, port, context))
+    rt.block_on(run_async(
+        model_path,
+        host,
+        port,
+        context,
+        turboquant_mode,
+        turboquant_config,
+    ))
 }
 
-async fn run_async(model_path: &str, host: &str, port: u16, context: u32) -> anyhow::Result<()> {
+async fn run_async(
+    model_path: &str,
+    host: &str,
+    port: u16,
+    context: u32,
+    turboquant_mode: TurboQuantMode,
+    turboquant_config: Option<&str>,
+) -> anyhow::Result<()> {
     let path = Path::new(model_path);
-    anyhow::ensure!(path.exists(), "Model file not found: {model_path}");
-
-    // Load hardware profile
-    let hardware = match profiler::load_cached_profile()? {
-        Some(p) if !profiler::is_profile_stale(&p) => p,
-        _ => {
-            println!("No hardware profile found. Running profiler...");
-            let p = profiler::run_full_profile()?;
-            profiler::save_profile(&p)?;
-            p
-        }
-    };
-
-    // Parse GGUF and compute placement
-    let gguf = GgufFile::open(path)?;
-    let metadata = ModelMetadata::from_gguf(&gguf)?;
+    let runtime = inference::resolve_runtime_setup(
+        path,
+        context,
+        turboquant_mode,
+        turboquant_config.map(Path::new),
+    )?;
     let file_size = std::fs::metadata(path)?.len();
 
     let gguf_info = GgufInfo {
         file_size,
-        architecture: metadata.architecture.clone(),
-        parameter_count: metadata.parameter_count,
-        quantization: metadata.quantization.clone().unwrap_or_else(|| "unknown".into()),
-        context_length: metadata.context_length,
+        architecture: runtime.metadata.architecture.clone(),
+        parameter_count: runtime.metadata.parameter_count,
+        quantization: runtime
+            .metadata
+            .quantization
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
+        context_length: runtime.metadata.context_length,
     };
-
-    let plan = compute_placement_with_context(&gguf, &hardware, context)?;
-    let gpu_budget = inference::compute_gpu_budget(&hardware, &metadata, context);
-    let n_gpu_layers = inference::gpu_layers_from_placement(&plan, &gguf, gpu_budget);
 
     let config = inference::InferenceConfig {
         n_ctx: context,
@@ -58,10 +66,12 @@ async fn run_async(model_path: &str, host: &str, port: u16, context: u32) -> any
     let load_start = Instant::now();
 
     let path_owned = path.to_path_buf();
-    let plan_arc = Arc::new(plan);
-    let gguf_arc = Arc::new(gguf);
+    let plan_arc = Arc::new(runtime.plan.clone());
+    let gguf_arc = Arc::new(runtime.gguf.clone());
+    let turboquant = runtime.turboquant.clone();
     let plan_for_load = plan_arc.clone();
     let gguf_for_load = gguf_arc.clone();
+    let n_gpu_layers = runtime.n_gpu_layers;
 
     let loaded = tokio::task::spawn_blocking(move || {
         inference::load_model(
@@ -70,6 +80,7 @@ async fn run_async(model_path: &str, host: &str, port: u16, context: u32) -> any
             n_gpu_layers,
             &plan_for_load,
             &gguf_for_load,
+            &turboquant,
         )
     })
     .await??;
@@ -92,9 +103,10 @@ async fn run_async(model_path: &str, host: &str, port: u16, context: u32) -> any
         gguf_info,
         load_duration_ns,
         telemetry,
+        turboquant: runtime.turboquant,
     });
 
-    let app = routes::router(state);
+    let app = routes::router(state.clone());
     let bind_addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
@@ -102,6 +114,21 @@ async fn run_async(model_path: &str, host: &str, port: u16, context: u32) -> any
     println!("Hypura serving {model_name}");
     println!("  Endpoint: http://{bind_addr}");
     println!("  Ollama-compatible API: /api/generate, /api/chat, /api/tags");
+    println!(
+        "  TurboQuant: mode={}, schema={}, config={}, runtime_status={}",
+        state.turboquant.mode,
+        state.turboquant.schema_label(),
+        state.turboquant.source_label(),
+        if state.turboquant.mode == hypura::model::turboquant_sidecar::TurboQuantMode::Exact {
+            "inactive"
+        } else if state.turboquant.mode
+            == hypura::model::turboquant_sidecar::TurboQuantMode::PaperFullKv
+        {
+            "experimental-full-kv"
+        } else {
+            "faithful-attached"
+        }
+    );
     println!();
 
     axum::serve(listener, app).await?;

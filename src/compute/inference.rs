@@ -1,10 +1,14 @@
+use std::collections::HashMap;
+use std::ffi::{c_void, CStr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::cache::kv_codec::{build_kv_codec, KvCodec};
 use crate::compute::ffi::*;
 use crate::compute::nvme_backend::{
     build_override_patterns, eval_callback, HypuraBuftController, LayerStatus, PrefetchState,
@@ -12,7 +16,12 @@ use crate::compute::nvme_backend::{
 use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 use crate::model::tensor_role::TensorRole;
+use crate::model::turboquant_sidecar::{
+    resolve_turboquant_config, ResolvedTurboQuantConfig, TurboQuantMode,
+};
+use crate::profiler;
 use crate::profiler::types::HardwareProfile;
+use crate::scheduler::placement::{compute_placement_with_context, summarize_placement};
 use crate::scheduler::types::*;
 use crate::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
 
@@ -66,6 +75,8 @@ pub struct LoadedModel {
     pub config: InferenceConfig,
     pub n_gpu_layers: i32,
     pub model_name: String,
+    pub turboquant: ResolvedTurboQuantConfig,
+    turboquant_layout: Option<TurboQuantRuntimeLayout>,
     // NVMe scheduling state (None when all tensors fit in GPU+RAM)
     _controller: Option<Box<HypuraBuftController>>,
     prefetch_state: Option<Arc<PrefetchState>>,
@@ -92,6 +103,580 @@ pub struct GenerateFromLoadedParams<'a> {
     pub telemetry: Arc<TelemetryEmitter>,
 }
 
+#[derive(Debug)]
+pub struct RuntimeSetup {
+    pub hardware: HardwareProfile,
+    pub gguf: GgufFile,
+    pub metadata: ModelMetadata,
+    pub plan: PlacementPlan,
+    pub placement_summary: PlacementSummary,
+    pub n_gpu_layers: i32,
+    pub turboquant: ResolvedTurboQuantConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TurboQuantRuntimeLayout {
+    tracked_layers: u32,
+    tracked_heads: u32,
+    tracked_head_dim: usize,
+}
+
+pub struct TurboQuantRuntimeSession {
+    mode: TurboQuantMode,
+    layout: TurboQuantRuntimeLayout,
+    codec: Mutex<Box<dyn KvCodec + Send>>,
+    query_vectors: Mutex<HashMap<(u32, u32, u32), Vec<f32>>>,
+    softmax_weights: Mutex<HashMap<(u32, u32, u32), Vec<f32>>>,
+    next_token_index: AtomicU32,
+    pending_batch: Mutex<Option<PendingBatch>>,
+    q_callback_hits: AtomicU32,
+    k_callback_hits: AtomicU32,
+    v_callback_hits: AtomicU32,
+    kq_callback_hits: AtomicU32,
+    kq_soft_max_callback_hits: AtomicU32,
+    kqv_callback_hits: AtomicU32,
+    kq_overwrites: AtomicU32,
+    kqv_overwrites: AtomicU32,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBatch {
+    start_token: u32,
+    token_ids: Vec<i32>,
+}
+
+struct InferenceCallbackState {
+    prefetch_state: Option<Arc<PrefetchState>>,
+    turboquant: Option<Arc<TurboQuantRuntimeSession>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeTensorComponent {
+    Query,
+    Key,
+    Value,
+    Score,
+    ScoreSoftmax,
+    ValueOutput,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeTensorShape {
+    dim0: usize,
+    dim1: usize,
+    dim2: usize,
+    dim3: usize,
+}
+
+impl RuntimeTensorShape {
+    fn total_elements(self) -> usize {
+        self.dim0
+            .saturating_mul(self.dim1)
+            .saturating_mul(self.dim2)
+            .saturating_mul(self.dim3)
+    }
+
+    fn width(self) -> usize {
+        self.dim0
+    }
+
+    fn tokens_per_stream(self) -> usize {
+        self.dim1
+    }
+
+    fn n_heads(self) -> usize {
+        self.dim2.max(1)
+    }
+
+    fn n_streams(self) -> usize {
+        self.dim3.max(1)
+    }
+
+    fn total_tokens(self) -> usize {
+        self.tokens_per_stream().saturating_mul(self.n_streams())
+    }
+}
+
+pub fn resolve_runtime_setup(
+    model_path: &Path,
+    context: u32,
+    turboquant_mode: TurboQuantMode,
+    turboquant_config: Option<&Path>,
+) -> anyhow::Result<RuntimeSetup> {
+    anyhow::ensure!(
+        model_path.exists(),
+        "Model file not found: {}",
+        model_path.display()
+    );
+
+    let hardware = match profiler::load_cached_profile()? {
+        Some(p) if !profiler::is_profile_stale(&p) => p,
+        _ => {
+            println!("No hardware profile found. Running profiler...");
+            let p = profiler::run_full_profile()?;
+            profiler::save_profile(&p)?;
+            p
+        }
+    };
+
+    let gguf = GgufFile::open(model_path)?;
+    let metadata = ModelMetadata::from_gguf(&gguf)?;
+    let turboquant =
+        resolve_turboquant_config(model_path, &metadata, turboquant_mode, turboquant_config)?;
+    let plan = compute_placement_with_context(&gguf, &hardware, context)?;
+    let placement_summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
+    let gpu_budget = compute_gpu_budget(&hardware, &metadata, context);
+    let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf, gpu_budget);
+
+    Ok(RuntimeSetup {
+        hardware,
+        gguf,
+        metadata,
+        plan,
+        placement_summary,
+        n_gpu_layers,
+        turboquant,
+    })
+}
+
+impl TurboQuantRuntimeSession {
+    fn new(
+        mode: TurboQuantMode,
+        layout: TurboQuantRuntimeLayout,
+        codec: Box<dyn KvCodec + Send>,
+    ) -> Self {
+        Self {
+            mode,
+            layout,
+            codec: Mutex::new(codec),
+            query_vectors: Mutex::new(HashMap::new()),
+            softmax_weights: Mutex::new(HashMap::new()),
+            next_token_index: AtomicU32::new(0),
+            pending_batch: Mutex::new(None),
+            q_callback_hits: AtomicU32::new(0),
+            k_callback_hits: AtomicU32::new(0),
+            v_callback_hits: AtomicU32::new(0),
+            kq_callback_hits: AtomicU32::new(0),
+            kq_soft_max_callback_hits: AtomicU32::new(0),
+            kqv_callback_hits: AtomicU32::new(0),
+            kq_overwrites: AtomicU32::new(0),
+            kqv_overwrites: AtomicU32::new(0),
+        }
+    }
+
+    fn begin_batch(&self, tokens: &[i32]) {
+        let start_token = self
+            .next_token_index
+            .fetch_add(tokens.len() as u32, Ordering::Relaxed);
+        *self.pending_batch.lock().unwrap() = Some(PendingBatch {
+            start_token,
+            token_ids: tokens.to_vec(),
+        });
+    }
+
+    fn end_batch(&self) {
+        *self.pending_batch.lock().unwrap() = None;
+    }
+
+    fn uses_full_kv(&self) -> bool {
+        self.mode == TurboQuantMode::PaperFullKv
+    }
+
+    fn observe_eval_callback(&self, tensor: *mut hypura_sys::ggml_tensor, ask: bool) {
+        if ask || tensor.is_null() {
+            return;
+        }
+
+        let Ok(name) = unsafe { CStr::from_ptr((*tensor).name.as_ptr()) }.to_str() else {
+            return;
+        };
+
+        // Loose `contains` matching to count all node variants (e.g. "Qcur_0", "kqv_rope").
+        // apply_runtime_tensor uses strict base-name equality to avoid false positives on
+        // future nodes such as "kqv_add" that would match "kqv" via contains.
+        if name.contains("Qcur") {
+            self.q_callback_hits.fetch_add(1, Ordering::Relaxed);
+        } else if name.contains("Kcur") {
+            self.k_callback_hits.fetch_add(1, Ordering::Relaxed);
+        } else if name.contains("Vcur") {
+            self.v_callback_hits.fetch_add(1, Ordering::Relaxed);
+        } else if name.contains("kq_soft_max") {
+            self.kq_soft_max_callback_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else if name.contains("kqv") {
+            self.kqv_callback_hits.fetch_add(1, Ordering::Relaxed);
+        } else if name.contains("kq") {
+            self.kq_callback_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn apply_runtime_tensor(&self, tensor: *mut hypura_sys::ggml_tensor) -> anyhow::Result<()> {
+        if tensor.is_null() {
+            return Ok(());
+        }
+
+        let name = unsafe { CStr::from_ptr((*tensor).name.as_ptr()) }
+            .to_string_lossy()
+            .to_string();
+        let Some(component) = runtime_tensor_component(&name) else {
+            return Ok(());
+        };
+        let Some(layer) = runtime_tensor_layer(&name) else {
+            return Ok(());
+        };
+        if layer >= self.layout.tracked_layers {
+            return Ok(());
+        }
+
+        let pending = self.pending_batch.lock().unwrap().clone();
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+
+        let shape = tensor_shape(tensor);
+        if shape.width() == 0 || shape.n_heads() == 0 || shape.total_tokens() == 0 {
+            return Ok(());
+        }
+
+        let tracked_heads = shape.n_heads().min(self.layout.tracked_heads as usize);
+        let tracked_dim = shape.width().min(self.layout.tracked_head_dim);
+        let tracked_tokens = shape.total_tokens().min(pending.token_ids.len());
+
+        if component == RuntimeTensorComponent::Query {
+            let values = read_tensor_f32(tensor, shape.total_elements())?;
+            let mut queries = self.query_vectors.lock().unwrap();
+            for token_offset in 0..tracked_tokens {
+                let token = pending.start_token + token_offset as u32;
+                let (stream, token_in_stream) = stream_position(token_offset, shape);
+                for head in 0..tracked_heads {
+                    let range = tensor_vector_range(shape, token_in_stream, head, stream);
+                    let mut vector = values[range].to_vec();
+                    vector.truncate(tracked_dim);
+                    queries.insert((layer, head as u32, token), vector);
+                }
+            }
+            return Ok(());
+        }
+
+        if component == RuntimeTensorComponent::Score {
+            let mut values = read_tensor_f32(tensor, shape.total_elements())?;
+            let mut queries = self.query_vectors.lock().unwrap();
+            let codec = self.codec.lock().unwrap();
+            let tracked_scores = shape.width();
+
+            for token_offset in 0..tracked_tokens {
+                let token = pending.start_token + token_offset as u32;
+                let (stream, token_in_stream) = stream_position(token_offset, shape);
+                for head in 0..tracked_heads {
+                    let Some(query) = queries.remove(&(layer, head as u32, token)) else {
+                        continue;
+                    };
+                    let scores =
+                        codec.score_k(layer, head as u32, &query, 0..tracked_scores as u32)?;
+                    let range = tensor_vector_range(shape, token_in_stream, head, stream);
+                    for (dst, src) in values[range].iter_mut().zip(scores.iter()) {
+                        *dst = *src;
+                    }
+                }
+            }
+
+            write_tensor_f32(tensor, &values)?;
+            self.kq_overwrites.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        if component == RuntimeTensorComponent::ScoreSoftmax {
+            if !self.uses_full_kv() {
+                return Ok(());
+            }
+
+            let values = read_tensor_f32(tensor, shape.total_elements())?;
+            let mut weights = self.softmax_weights.lock().unwrap();
+            for token_offset in 0..tracked_tokens {
+                let token = pending.start_token + token_offset as u32;
+                let (stream, token_in_stream) = stream_position(token_offset, shape);
+                for head in 0..tracked_heads {
+                    let range = tensor_vector_range(shape, token_in_stream, head, stream);
+                    weights.insert((layer, head as u32, token), values[range].to_vec());
+                }
+            }
+            return Ok(());
+        }
+
+        if component == RuntimeTensorComponent::ValueOutput {
+            if !self.uses_full_kv() {
+                return Ok(());
+            }
+
+            let mut values = read_tensor_f32(tensor, shape.total_elements())?;
+            let mut weights = self.softmax_weights.lock().unwrap();
+            let codec = self.codec.lock().unwrap();
+
+            for token_offset in 0..tracked_tokens {
+                let token = pending.start_token + token_offset as u32;
+                let (stream, token_in_stream) = stream_position(token_offset, shape);
+                for head in 0..tracked_heads {
+                    let Some(attn) = weights.remove(&(layer, head as u32, token)) else {
+                        continue;
+                    };
+                    let read_back = codec.read_v(layer, head as u32, 0..attn.len() as u32)?;
+                    if read_back.is_empty() {
+                        continue;
+                    }
+                    let mut output = vec![0.0f32; tracked_dim];
+                    for (token_idx, weight) in attn.iter().enumerate() {
+                        let base = token_idx.saturating_mul(tracked_dim);
+                        if base + tracked_dim > read_back.len() {
+                            break;
+                        }
+                        for dim in 0..tracked_dim {
+                            output[dim] += *weight * read_back[base + dim];
+                        }
+                    }
+                    let range = tensor_vector_range(shape, token_in_stream, head, stream);
+                    for (dst, src) in values[range].iter_mut().zip(output.iter()) {
+                        *dst = *src;
+                    }
+                }
+            }
+
+            write_tensor_f32(tensor, &values)?;
+            self.kqv_overwrites.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        let mut values = read_tensor_f32(tensor, shape.total_elements())?;
+        let mut codec = self.codec.lock().unwrap();
+
+        for token_offset in 0..tracked_tokens {
+            let token = pending.start_token + token_offset as u32;
+            let (stream, token_in_stream) = stream_position(token_offset, shape);
+            for head in 0..tracked_heads {
+                let range = tensor_vector_range(shape, token_in_stream, head, stream);
+                let mut vector = values[range.clone()].to_vec();
+                vector.truncate(tracked_dim);
+
+                let transformed = match component {
+                    RuntimeTensorComponent::Key => {
+                        codec.ingest_k(layer, head as u32, token, &vector)?
+                    }
+                    RuntimeTensorComponent::Value => {
+                        codec.ingest_v(layer, head as u32, token, &vector)?
+                    }
+                    RuntimeTensorComponent::Query
+                    | RuntimeTensorComponent::Score
+                    | RuntimeTensorComponent::ScoreSoftmax
+                    | RuntimeTensorComponent::ValueOutput => unreachable!(),
+                };
+
+                for (dst, src) in values[range].iter_mut().zip(transformed.iter()) {
+                    *dst = *src;
+                }
+            }
+        }
+
+        write_tensor_f32(tensor, &values)?;
+
+        Ok(())
+    }
+
+    fn callback_hits(&self) -> RuntimeCallbackStats {
+        RuntimeCallbackStats {
+            q_hits: self.q_callback_hits.load(Ordering::Relaxed),
+            k_hits: self.k_callback_hits.load(Ordering::Relaxed),
+            v_hits: self.v_callback_hits.load(Ordering::Relaxed),
+            kq_hits: self.kq_callback_hits.load(Ordering::Relaxed),
+            kq_soft_max_hits: self.kq_soft_max_callback_hits.load(Ordering::Relaxed),
+            kqv_hits: self.kqv_callback_hits.load(Ordering::Relaxed),
+            kq_overwrites: self.kq_overwrites.load(Ordering::Relaxed),
+            kqv_overwrites: self.kqv_overwrites.load(Ordering::Relaxed),
+        }
+    }
+
+    fn mode(&self) -> TurboQuantMode {
+        self.mode
+    }
+}
+
+fn turboquant_runtime_layout(
+    metadata: &ModelMetadata,
+    mode: TurboQuantMode,
+) -> Option<TurboQuantRuntimeLayout> {
+    if mode == TurboQuantMode::Exact {
+        return None;
+    }
+
+    let tracked_layers = metadata.num_layers.max(1);
+    let tracked_heads = metadata.num_kv_heads.max(1);
+    let head_dim = if metadata.num_heads > 0 {
+        (metadata.embedding_dim / metadata.num_heads).max(1) as usize
+    } else {
+        1
+    };
+
+    Some(TurboQuantRuntimeLayout {
+        tracked_layers,
+        tracked_heads,
+        tracked_head_dim: head_dim.max(1),
+    })
+}
+
+fn build_turboquant_runtime_session(
+    turboquant: &ResolvedTurboQuantConfig,
+    layout: Option<TurboQuantRuntimeLayout>,
+) -> anyhow::Result<Option<Arc<TurboQuantRuntimeSession>>> {
+    let Some(layout) = layout else {
+        return Ok(None);
+    };
+
+    let codec = build_kv_codec(turboquant)?;
+    Ok(Some(Arc::new(TurboQuantRuntimeSession::new(
+        turboquant.mode,
+        layout,
+        codec,
+    ))))
+}
+
+fn validate_turboquant_runtime_mode(turboquant: &ResolvedTurboQuantConfig) -> anyhow::Result<()> {
+    match turboquant.mode {
+        TurboQuantMode::Exact | TurboQuantMode::PaperKeyOnly | TurboQuantMode::PaperFullKv => {
+            Ok(())
+        }
+        TurboQuantMode::ResearchKvSplit => Err(anyhow::anyhow!(
+            "TurboQuant mode `research-kv-split` is experimental and not implemented yet"
+        )),
+    }
+}
+
+extern "C" fn eval_callback_with_runtime(
+    tensor: *mut hypura_sys::ggml_tensor,
+    ask: bool,
+    user_data: *mut c_void,
+) -> bool {
+    if tensor.is_null() || user_data.is_null() {
+        return true;
+    }
+
+    let state = unsafe { &*(user_data as *const InferenceCallbackState) };
+    if let Some(ref turboquant) = state.turboquant {
+        turboquant.observe_eval_callback(tensor, ask);
+        if !ask {
+            if let Err(err) = turboquant.apply_runtime_tensor(tensor) {
+                tracing::warn!("TurboQuant runtime callback failed: {err}");
+            }
+        }
+    }
+
+    if let Some(ref prefetch_state) = state.prefetch_state {
+        eval_callback(tensor, ask, Arc::as_ptr(prefetch_state) as *mut c_void)
+    } else {
+        true
+    }
+}
+
+fn runtime_tensor_component(name: &str) -> Option<RuntimeTensorComponent> {
+    let base = name.split('-').next().unwrap_or(name);
+    if base.starts_with("Qcur") {
+        Some(RuntimeTensorComponent::Query)
+    } else if base.starts_with("Kcur") {
+        Some(RuntimeTensorComponent::Key)
+    } else if base.starts_with("Vcur") {
+        Some(RuntimeTensorComponent::Value)
+    } else if base == "kq_soft_max" {
+        Some(RuntimeTensorComponent::ScoreSoftmax)
+    } else if base == "kqv" {
+        Some(RuntimeTensorComponent::ValueOutput)
+    } else if base == "kq" {
+        Some(RuntimeTensorComponent::Score)
+    } else {
+        None
+    }
+}
+
+fn runtime_tensor_layer(name: &str) -> Option<u32> {
+    name.rsplit_once('-')
+        .and_then(|(_, raw)| raw.parse::<u32>().ok())
+}
+
+fn tensor_shape(tensor: *mut hypura_sys::ggml_tensor) -> RuntimeTensorShape {
+    RuntimeTensorShape {
+        dim0: unsafe { (*tensor).ne[0].max(0) as usize },
+        dim1: unsafe { (*tensor).ne[1].max(1) as usize },
+        dim2: unsafe { (*tensor).ne[2].max(1) as usize },
+        dim3: unsafe { (*tensor).ne[3].max(1) as usize },
+    }
+}
+
+fn tensor_vector_range(
+    shape: RuntimeTensorShape,
+    token_in_stream: usize,
+    head: usize,
+    stream: usize,
+) -> std::ops::Range<usize> {
+    let base = ((((stream * shape.n_heads()) + head) * shape.tokens_per_stream())
+        + token_in_stream)
+        * shape.width();
+    base..(base + shape.width())
+}
+
+fn stream_position(token_offset: usize, shape: RuntimeTensorShape) -> (usize, usize) {
+    let tokens_per_stream = shape.tokens_per_stream().max(1);
+    let stream = token_offset / tokens_per_stream;
+    let token_in_stream = token_offset % tokens_per_stream;
+    (
+        stream.min(shape.n_streams().saturating_sub(1)),
+        token_in_stream,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeCallbackStats {
+    q_hits: u32,
+    k_hits: u32,
+    v_hits: u32,
+    kq_hits: u32,
+    kq_soft_max_hits: u32,
+    kqv_hits: u32,
+    kq_overwrites: u32,
+    kqv_overwrites: u32,
+}
+
+fn read_tensor_f32(
+    tensor: *mut hypura_sys::ggml_tensor,
+    elements: usize,
+) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(
+        unsafe { (*tensor).type_ } == hypura_sys::ggml_type_GGML_TYPE_F32,
+        "TurboQuant runtime currently expects F32 callback tensors"
+    );
+    let mut out = vec![0.0f32; elements];
+    unsafe {
+        hypura_sys::ggml_backend_tensor_get(
+            tensor,
+            out.as_mut_ptr() as *mut c_void,
+            0,
+            elements * std::mem::size_of::<f32>(),
+        );
+    }
+    Ok(out)
+}
+
+fn write_tensor_f32(tensor: *mut hypura_sys::ggml_tensor, values: &[f32]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        unsafe { (*tensor).type_ } == hypura_sys::ggml_type_GGML_TYPE_F32,
+        "TurboQuant runtime currently expects F32 callback tensors"
+    );
+    unsafe {
+        hypura_sys::ggml_backend_tensor_set(
+            tensor,
+            values.as_ptr() as *const c_void,
+            0,
+            std::mem::size_of_val(values),
+        );
+    }
+    Ok(())
+}
+
 /// Load a model once for repeated generation (server use case).
 ///
 /// Extracts the model loading logic from `generate_with_nvme_scheduling` so the
@@ -103,8 +688,12 @@ pub fn load_model(
     n_gpu_layers: i32,
     plan: &PlacementPlan,
     gguf: &GgufFile,
+    turboquant: &ResolvedTurboQuantConfig,
 ) -> anyhow::Result<LoadedModel> {
     let backend = LlamaBackend::init();
+    let metadata = ModelMetadata::from_gguf(gguf)?;
+    let turboquant_layout = turboquant_runtime_layout(&metadata, turboquant.mode);
+    validate_turboquant_runtime_mode(turboquant)?;
 
     let has_nvme = plan
         .tier_assignments
@@ -130,6 +719,8 @@ pub fn load_model(
             config: config.clone(),
             n_gpu_layers,
             model_name,
+            turboquant: turboquant.clone(),
+            turboquant_layout,
             _controller: None,
             prefetch_state: None,
             keep_resident: false,
@@ -187,8 +778,8 @@ pub fn load_model(
     let estimated_committed = gpu_committed_estimate + buffer_bytes + runtime_overhead;
     let headroom: u64 = 4 * (1 << 30);
 
-    let keep_resident = nvme_bytes > 0
-        && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(headroom);
+    let keep_resident =
+        nvme_bytes > 0 && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(headroom);
 
     let should_preload = keep_resident
         && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(6 * (1 << 30));
@@ -238,6 +829,8 @@ pub fn load_model(
         config: config.clone(),
         n_gpu_layers,
         model_name,
+        turboquant: turboquant.clone(),
+        turboquant_layout,
         _controller: Some(controller),
         prefetch_state: Some(prefetch_state),
         keep_resident,
@@ -259,25 +852,39 @@ pub fn generate_from_loaded(
     } = params;
 
     // Build context — with or without NVMe callback
+    let turboquant_session =
+        build_turboquant_runtime_session(&loaded.turboquant, loaded.turboquant_layout)?;
     let config = &loaded.config;
-    let mut ctx = if let Some(ref prefetch_state) = loaded.prefetch_state {
-        let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
-        let ctx = LlamaContext::new_with_callback(
+    let callback_state = if loaded.prefetch_state.is_some() || turboquant_session.is_some() {
+        Some(Box::new(InferenceCallbackState {
+            prefetch_state: loaded.prefetch_state.clone(),
+            turboquant: turboquant_session.clone(),
+        }))
+    } else {
+        None
+    };
+    let callback_ptr = callback_state
+        .as_ref()
+        .map(|state| state.as_ref() as *const InferenceCallbackState as *mut c_void);
+    let mut ctx = if let Some(state_ptr) = callback_ptr {
+        LlamaContext::new_with_callback_and_options(
             &loaded.model,
             config.n_ctx,
             config.n_batch,
             config.n_threads,
-            Some(eval_callback),
+            Some(eval_callback_with_runtime),
             state_ptr,
-        )?;
+            turboquant_session.is_some(),
+        )?
         // Immediately convert back to avoid leak — the PrefetchState is kept alive
         // by the Arc in LoadedModel, not by this raw pointer.
-        unsafe {
-            Arc::from_raw(state_ptr as *const PrefetchState);
-        }
-        ctx
     } else {
-        LlamaContext::new(&loaded.model, config.n_ctx, config.n_batch, config.n_threads)?
+        LlamaContext::new(
+            &loaded.model,
+            config.n_ctx,
+            config.n_batch,
+            config.n_threads,
+        )?
     };
 
     let mut sampler = LlamaSampler::new(sampling);
@@ -295,7 +902,13 @@ pub fn generate_from_loaded(
     let prompt_start = Instant::now();
     let batch_size = config.n_batch as usize;
     for chunk in tokens.chunks(batch_size) {
+        if let Some(ref session) = turboquant_session {
+            session.begin_batch(chunk);
+        }
         ctx.decode(chunk)?;
+        if let Some(ref session) = turboquant_session {
+            session.end_batch();
+        }
     }
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -346,7 +959,29 @@ pub fn generate_from_loaded(
             }
         }
 
+        if let Some(ref session) = turboquant_session {
+            session.begin_batch(&[token_id]);
+        }
         ctx.decode(&[token_id])?;
+        if let Some(ref session) = turboquant_session {
+            session.end_batch();
+        }
+    }
+
+    if let Some(ref session) = turboquant_session {
+        let stats = session.callback_hits();
+        tracing::debug!(
+            "TurboQuant request session complete: mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+            session.mode(),
+            stats.q_hits,
+            stats.k_hits,
+            stats.v_hits,
+            stats.kq_hits,
+            stats.kq_soft_max_hits,
+            stats.kqv_hits,
+            stats.kq_overwrites,
+            stats.kqv_overwrites,
+        );
     }
 
     let perf = ctx.perf();
@@ -369,7 +1004,11 @@ pub fn generate_from_loaded(
 
 /// Compute GPU budget for model weights (bytes) after reserving space for
 /// KV cache and compute buffers within the Metal working set.
-pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, context_length: u32) -> u64 {
+pub fn compute_gpu_budget(
+    hw: &HardwareProfile,
+    metadata: &ModelMetadata,
+    context_length: u32,
+) -> u64 {
     let gpu_working_set = hw.gpu.as_ref().map_or(0, |g| g.vram_bytes);
     // KV cache on GPU: 2 * layers * kv_heads * head_dim * 2 bytes * context
     let head_dim = if metadata.num_heads > 0 {
@@ -377,7 +1016,8 @@ pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, contex
     } else {
         0
     };
-    let kv_on_gpu = 2 * metadata.num_layers as u64
+    let kv_on_gpu = 2
+        * metadata.num_layers as u64
         * metadata.num_kv_heads as u64
         * head_dim
         * 2
@@ -408,7 +1048,12 @@ pub fn gpu_layers_from_placement(
     if plan.inference_mode == InferenceMode::SparseMoeMmap {
         let total_bytes = gguf.total_tensor_bytes();
         if total_bytes <= gpu_budget_bytes {
-            let max_layer = gguf.tensors.iter().filter_map(|t| t.layer_index).max().unwrap_or(0);
+            let max_layer = gguf
+                .tensors
+                .iter()
+                .filter_map(|t| t.layer_index)
+                .max()
+                .unwrap_or(0);
             return max_layer as i32 + 1 + 1; // all layers + output
         } else {
             tracing::info!(
@@ -442,7 +1087,10 @@ pub fn gpu_layers_from_placement(
             }
             if dense_ffn_streaming {
                 let role = TensorRole::from_name(&t.name);
-                if matches!(role, TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown) {
+                if matches!(
+                    role,
+                    TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                ) {
                     continue;
                 }
             }
@@ -499,10 +1147,51 @@ pub fn generate_blocking(
     token_tx: mpsc::UnboundedSender<GeneratedToken>,
     telemetry: Arc<TelemetryEmitter>,
 ) -> anyhow::Result<GenerationResult> {
+    generate_blocking_internal(
+        model_path,
+        prompt,
+        config,
+        n_gpu_layers,
+        token_tx,
+        telemetry,
+        None,
+    )
+}
+
+fn generate_blocking_internal(
+    model_path: &Path,
+    prompt: &str,
+    config: &InferenceConfig,
+    n_gpu_layers: i32,
+    token_tx: mpsc::UnboundedSender<GeneratedToken>,
+    telemetry: Arc<TelemetryEmitter>,
+    turboquant_session: Option<Arc<TurboQuantRuntimeSession>>,
+) -> anyhow::Result<GenerationResult> {
     let _backend = LlamaBackend::init();
 
     let model = LlamaModel::load(model_path, n_gpu_layers, true)?;
-    let mut ctx = LlamaContext::new(&model, config.n_ctx, config.n_batch, config.n_threads)?;
+    let callback_state = turboquant_session.as_ref().map(|session| {
+        Box::new(InferenceCallbackState {
+            prefetch_state: None,
+            turboquant: Some(session.clone()),
+        })
+    });
+    let callback_ptr = callback_state
+        .as_ref()
+        .map(|state| state.as_ref() as *const InferenceCallbackState as *mut c_void);
+    let mut ctx = if let Some(state_ptr) = callback_ptr {
+        LlamaContext::new_with_callback_and_options(
+            &model,
+            config.n_ctx,
+            config.n_batch,
+            config.n_threads,
+            Some(eval_callback_with_runtime),
+            state_ptr,
+            turboquant_session.is_some(),
+        )?
+    } else {
+        LlamaContext::new(&model, config.n_ctx, config.n_batch, config.n_threads)?
+    };
     let mut sampler = LlamaSampler::new(&config.sampling);
 
     // Tokenize prompt
@@ -515,7 +1204,13 @@ pub fn generate_blocking(
     // Decode in batches if prompt is longer than n_batch
     let batch_size = config.n_batch as usize;
     for chunk in tokens.chunks(batch_size) {
+        if let Some(ref session) = turboquant_session {
+            session.begin_batch(chunk);
+        }
         ctx.decode(chunk)?;
+        if let Some(ref session) = turboquant_session {
+            session.end_batch();
+        }
     }
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -559,7 +1254,29 @@ pub fn generate_blocking(
             break;
         }
 
+        if let Some(ref session) = turboquant_session {
+            session.begin_batch(&[token_id]);
+        }
         ctx.decode(&[token_id])?;
+        if let Some(ref session) = turboquant_session {
+            session.end_batch();
+        }
+    }
+
+    if let Some(ref session) = turboquant_session {
+        let stats = session.callback_hits();
+        tracing::debug!(
+            "TurboQuant blocking session complete: mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+            session.mode(),
+            stats.q_hits,
+            stats.k_hits,
+            stats.v_hits,
+            stats.kq_hits,
+            stats.kq_soft_max_hits,
+            stats.kqv_hits,
+            stats.kq_overwrites,
+            stats.kqv_overwrites,
+        );
     }
 
     let perf = ctx.perf();
@@ -589,10 +1306,14 @@ pub fn generate_with_nvme_scheduling(
     n_gpu_layers: i32,
     plan: &PlacementPlan,
     gguf: &GgufFile,
+    turboquant: &ResolvedTurboQuantConfig,
     token_tx: mpsc::UnboundedSender<GeneratedToken>,
     telemetry: Arc<TelemetryEmitter>,
 ) -> anyhow::Result<GenerationResult> {
     let _backend = LlamaBackend::init();
+    let metadata = ModelMetadata::from_gguf(gguf)?;
+    let turboquant_layout = turboquant_runtime_layout(&metadata, turboquant.mode);
+    let turboquant_session = build_turboquant_runtime_session(turboquant, turboquant_layout)?;
 
     // Check if there are any NVMe tensors
     let has_nvme = plan
@@ -601,7 +1322,15 @@ pub fn generate_with_nvme_scheduling(
         .any(|t| *t == StorageTier::Nvme);
 
     if !has_nvme {
-        return generate_blocking(model_path, prompt, config, n_gpu_layers, token_tx, telemetry);
+        return generate_blocking_internal(
+            model_path,
+            prompt,
+            config,
+            n_gpu_layers,
+            token_tx,
+            telemetry,
+            turboquant_session,
+        );
     }
 
     // Create custom buffer type for NVMe-tier tensors
@@ -630,12 +1359,8 @@ pub fn generate_with_nvme_scheduling(
         controller.enable_dense_ffn_scratch(gguf);
     }
 
-    let model = LlamaModel::load_with_overrides(
-        model_path,
-        n_gpu_layers,
-        use_mmap,
-        overrides.as_ptr(),
-    )?;
+    let model =
+        LlamaModel::load_with_overrides(model_path, n_gpu_layers, use_mmap, overrides.as_ptr())?;
 
     // Build prefetch state with layer groupings and file offsets
     let num_layers = model.n_layers() as u32;
@@ -689,8 +1414,8 @@ pub fn generate_with_nvme_scheduling(
     let estimated_committed = gpu_committed_estimate + buffer_bytes + runtime_overhead;
     let headroom: u64 = 4 * (1 << 30); // 4 GB for page cache + system
 
-    let keep_resident = nvme_bytes > 0
-        && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(headroom);
+    let keep_resident =
+        nvme_bytes > 0 && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(headroom);
 
     // Preloading is separate: only preload when estimated committed memory
     // (including all buffer layers pre-loaded) fits with 6 GB headroom.
@@ -781,9 +1506,7 @@ pub fn generate_with_nvme_scheduling(
 
         *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
         let tensor_ptrs = controller.take_tensor_ptrs();
-        let state_mut = unsafe {
-            &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState)
-        };
+        let state_mut = unsafe { &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState) };
         state_mut.fused_tensor_ptrs = tensor_ptrs;
 
         prefetch_state
@@ -820,9 +1543,7 @@ pub fn generate_with_nvme_scheduling(
         let lookahead = ((num_slots / 3).saturating_sub(1)).max(1) as u32;
         *prefetch_state.expert_pool.lock().unwrap() = Some(pool);
         let tensor_ptrs = controller.take_tensor_ptrs();
-        let state_mut = unsafe {
-            &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState)
-        };
+        let state_mut = unsafe { &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState) };
         state_mut.fused_tensor_ptrs = tensor_ptrs;
         state_mut.dense_ffn_lookahead = lookahead;
 
@@ -857,25 +1578,27 @@ pub fn generate_with_nvme_scheduling(
 
     let nvme_tensor_count = prefetch_state.tensor_map.len();
     let nvme_layer_count = prefetch_state.layer_regions.len();
-    tracing::info!(
-        "Prefetch state: {nvme_tensor_count} tensors across {nvme_layer_count} layers"
-    );
+    tracing::info!("Prefetch state: {nvme_tensor_count} tensors across {nvme_layer_count} layers");
 
-    // Pass PrefetchState to cb_eval callback
-    let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
+    let callback_state = Box::new(InferenceCallbackState {
+        prefetch_state: Some(prefetch_state.clone()),
+        turboquant: turboquant_session.clone(),
+    });
+    let state_ptr = callback_state.as_ref() as *const InferenceCallbackState as *mut c_void;
 
     let kv_quant = plan.kv_cache_plan.kv_quantization;
     // Expert-streaming with use_mmap=false + pool buffer keeps Metal working set small
     // enough for full batch size. No n_batch reduction needed.
     let effective_batch = config.n_batch;
-    let mut ctx = LlamaContext::new_with_callback_and_kv(
+    let mut ctx = LlamaContext::new_with_callback_and_kv_and_options(
         &model,
         config.n_ctx,
         effective_batch,
         config.n_threads,
-        Some(eval_callback),
+        Some(eval_callback_with_runtime),
         state_ptr,
         kv_quant,
+        turboquant_session.is_some(),
     )?;
 
     let mut sampler = LlamaSampler::new(&config.sampling);
@@ -947,9 +1670,8 @@ pub fn generate_with_nvme_scheduling(
                 if let Some((base, size, layers, offsets)) =
                     prefetch_state.activate_resident_ffn(num_resident)
                 {
-                    let state_mut = unsafe {
-                        &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState)
-                    };
+                    let state_mut =
+                        unsafe { &mut *(Arc::as_ptr(&prefetch_state) as *mut PrefetchState) };
                     state_mut.resident_ffn_base = base;
                     state_mut.resident_ffn_size = size;
                     state_mut.resident_ffn_layers = layers;
@@ -995,7 +1717,13 @@ pub fn generate_with_nvme_scheduling(
     let prompt_start = Instant::now();
     let prompt_batch = effective_batch as usize;
     for chunk in tokens.chunks(prompt_batch) {
+        if let Some(ref session) = turboquant_session {
+            session.begin_batch(chunk);
+        }
         ctx.decode(chunk)?;
+        if let Some(ref session) = turboquant_session {
+            session.end_batch();
+        }
     }
     let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1081,7 +1809,13 @@ pub fn generate_with_nvme_scheduling(
         }
 
         let decode_start = std::time::Instant::now();
+        if let Some(ref session) = turboquant_session {
+            session.begin_batch(&[token_id]);
+        }
         ctx.decode(&[token_id])?;
+        if let Some(ref session) = turboquant_session {
+            session.end_batch();
+        }
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         prefetch_state.record_decode(decode_ms);
     }
@@ -1092,9 +1826,20 @@ pub fn generate_with_nvme_scheduling(
     // Stop I/O pool and clean up
     prefetch_state.stop_io_pool();
 
-    // Clean up the Arc we leaked into the callback
-    unsafe {
-        Arc::from_raw(state_ptr as *const PrefetchState);
+    if let Some(ref session) = turboquant_session {
+        let stats = session.callback_hits();
+        tracing::debug!(
+            "TurboQuant NVMe session complete: mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+            session.mode(),
+            stats.q_hits,
+            stats.k_hits,
+            stats.v_hits,
+            stats.kq_hits,
+            stats.kq_soft_max_hits,
+            stats.kqv_hits,
+            stats.kq_overwrites,
+            stats.kqv_overwrites,
+        );
     }
 
     let perf = ctx.perf();
@@ -1135,14 +1880,22 @@ fn total_physical_memory() -> u64 {
             );
             size
         };
-        if total == 0 { 32 * (1 << 30) } else { total }
+        if total == 0 {
+            32 * (1 << 30)
+        } else {
+            total
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total = sys.total_memory();
-        if total == 0 { 16 * (1 << 30) } else { total }
+        if total == 0 {
+            16 * (1 << 30)
+        } else {
+            total
+        }
     }
 }
 
@@ -1202,13 +1955,19 @@ mod tests {
             model_id: "test".into(),
             hardware_profile_hash: "".into(),
             tier_assignments: assignments,
-            prefetch_schedule: PrefetchSchedule { layer_prefetches: vec![] },
+            prefetch_schedule: PrefetchSchedule {
+                layer_prefetches: vec![],
+            },
             estimated_tok_per_sec: 0.0,
             estimated_time_to_first_token: 0.0,
             kv_cache_plan: KvCachePlan {
-                hot_window_tokens: 0, warm_window_tokens: 0,
-                hot_tier: StorageTier::Gpu, warm_tier: StorageTier::Ram,
-                hot_bytes: 0, warm_bytes: 0, kv_quantization: None,
+                hot_window_tokens: 0,
+                warm_window_tokens: 0,
+                hot_tier: StorageTier::Gpu,
+                warm_tier: StorageTier::Ram,
+                hot_bytes: 0,
+                warm_bytes: 0,
+                kv_quantization: None,
             },
             experience_tier: ExperienceTier::Fast,
             inference_mode: InferenceMode::FullStreaming,
@@ -1258,5 +2017,48 @@ mod tests {
         };
         let plan = make_plan(HashMap::new());
         assert_eq!(gpu_layers_from_placement(&plan, &gguf, u64::MAX), 0);
+    }
+
+    #[test]
+    fn runtime_tensor_component_maps_attention_nodes() {
+        assert_eq!(
+            runtime_tensor_component("Qcur-3"),
+            Some(RuntimeTensorComponent::Query)
+        );
+        assert_eq!(
+            runtime_tensor_component("Kcur-3"),
+            Some(RuntimeTensorComponent::Key)
+        );
+        assert_eq!(
+            runtime_tensor_component("Vcur-3"),
+            Some(RuntimeTensorComponent::Value)
+        );
+        assert_eq!(
+            runtime_tensor_component("kq-3"),
+            Some(RuntimeTensorComponent::Score)
+        );
+        assert_eq!(
+            runtime_tensor_component("kq_soft_max-3"),
+            Some(RuntimeTensorComponent::ScoreSoftmax)
+        );
+        assert_eq!(
+            runtime_tensor_component("kqv-3"),
+            Some(RuntimeTensorComponent::ValueOutput)
+        );
+    }
+
+    #[test]
+    fn tensor_vector_range_accounts_for_streams() {
+        let shape = RuntimeTensorShape {
+            dim0: 4,
+            dim1: 2,
+            dim2: 3,
+            dim3: 2,
+        };
+
+        assert_eq!(tensor_vector_range(shape, 0, 0, 0), 0..4);
+        assert_eq!(tensor_vector_range(shape, 1, 0, 0), 4..8);
+        assert_eq!(tensor_vector_range(shape, 0, 1, 0), 8..12);
+        assert_eq!(tensor_vector_range(shape, 0, 0, 1), 24..28);
     }
 }

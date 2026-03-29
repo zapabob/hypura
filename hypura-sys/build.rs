@@ -6,9 +6,8 @@ fn main() {
     let llama_dir = PathBuf::from(&manifest_dir).join("../vendor/llama.cpp");
     // dunce::canonicalize strips the \\?\ UNC prefix that std::fs::canonicalize
     // adds on Windows, which would otherwise cause MSBuild to reject source paths.
-    let llama_dir = dunce::canonicalize(&llama_dir).expect(
-        "vendor/llama.cpp not found — run: git submodule update --init --recursive",
-    );
+    let llama_dir = dunce::canonicalize(&llama_dir)
+        .expect("vendor/llama.cpp not found — run: git submodule update --init --recursive");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let use_metal = target_os == "macos";
@@ -18,6 +17,8 @@ fn main() {
     let mut cmake_config = cmake::Config::new(&llama_dir);
     cmake_config
         .define("BUILD_SHARED_LIBS", "OFF")
+        .define("CMAKE_BUILD_TYPE", "Release")
+        .define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL")
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
@@ -36,8 +37,8 @@ fn main() {
         // Target RTX 20xx (sm_75) and up through RTX 50xx / H100 (sm_120).
         // "native" detects only the current machine's GPU; a fixed list enables
         // building a binary that runs on multiple NVIDIA generations.
-        let cuda_arches = env::var("HYPURA_CUDA_ARCHITECTURES")
-            .unwrap_or_else(|_| "75;86;89;90".to_string());
+        let cuda_arches =
+            env::var("HYPURA_CUDA_ARCHITECTURES").unwrap_or_else(|_| "75;86;89;90".to_string());
 
         cmake_config
             .define("GGML_METAL", "OFF")
@@ -106,6 +107,7 @@ fn main() {
     let mut cc_build = cc::Build::new();
     cc_build
         .file(src_dir.join("hypura_buft.c"))
+        .file(src_dir.join("hypura_kv_codec.c"))
         .include(llama_dir.join("include"))
         .include(llama_dir.join("ggml/include"))
         .include(&include_ggml_internal)
@@ -119,6 +121,8 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/hypura_buft.c");
     println!("cargo:rerun-if-changed=src/hypura_buft.h");
+    println!("cargo:rerun-if-changed=src/hypura_kv_codec.c");
+    println!("cargo:rerun-if-changed=src/hypura_kv_codec.h");
 
     // ── Generate Rust bindings via bindgen ───────────────────────────────────
     let include_llama = llama_dir.join("include");
@@ -148,6 +152,7 @@ fn main() {
         .allowlist_var("GGUF_.*")
         .derive_debug(true)
         .derive_default(true)
+        .layout_tests(false)
         .generate()
         .expect("Failed to generate bindings");
 
@@ -161,10 +166,7 @@ fn main() {
         "cargo:rerun-if-changed={}",
         llama_dir.join("include").display()
     );
-    println!(
-        "cargo:rerun-if-changed={}",
-        llama_dir.join("src").display()
-    );
+    println!("cargo:rerun-if-changed={}", llama_dir.join("src").display());
     println!(
         "cargo:rerun-if-changed={}",
         llama_dir.join("ggml").display()
