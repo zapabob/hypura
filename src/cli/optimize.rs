@@ -59,14 +59,8 @@ pub fn run(model: &str) -> anyhow::Result<()> {
     }
 
     // Build output path
-    let stem = model_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let ext = model_path
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let stem = model_path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = model_path.extension().unwrap_or_default().to_string_lossy();
     let output_path = model_path.with_file_name(format!("{stem}.optimized.{ext}"));
 
     tracing::info!("Writing optimized model to {}", output_path.display());

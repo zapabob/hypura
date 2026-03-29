@@ -14,7 +14,11 @@ pub fn profile_memory() -> anyhow::Result<MemoryProfile> {
     // available_memory can return 0 on some macOS versions; fall back to free_memory
     let available_bytes = {
         let avail = sys.available_memory();
-        if avail > 0 { avail } else { sys.free_memory() }
+        if avail > 0 {
+            avail
+        } else {
+            sys.free_memory()
+        }
     };
     let bandwidth_bytes_per_sec = measure_memory_bandwidth();
     let is_unified = cfg!(all(target_os = "macos", target_arch = "aarch64"));

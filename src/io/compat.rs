@@ -113,8 +113,8 @@ mod imp {
 
     pub fn open_direct_fd(path: &std::path::Path) -> std::io::Result<NativeFd> {
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN,
-            FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+            CreateFileW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ,
+            FILE_SHARE_READ, OPEN_EXISTING,
         };
 
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -126,18 +126,18 @@ mod imp {
                 std::ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN,
-                0,
+                std::ptr::null_mut(),
             )
         };
-        if handle == INVALID_HANDLE_VALUE {
+        if handle as isize == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(handle)
+        Ok(handle as isize)
     }
 
     pub fn close_fd(fd: NativeFd) {
         unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(fd);
+            windows_sys::Win32::Foundation::CloseHandle(fd as *mut _);
         }
     }
 
@@ -155,7 +155,7 @@ mod imp {
 
         let ok = unsafe {
             ReadFile(
-                fd,
+                fd as *mut _,
                 dst as *mut _,
                 read_size,
                 &mut bytes_read,
@@ -176,7 +176,7 @@ mod imp {
 
     pub fn alloc_pages(size: usize) -> *mut u8 {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
         };
         unsafe {
             VirtualAlloc(
@@ -189,7 +189,7 @@ mod imp {
     }
 
     pub fn free_pages(ptr: *mut u8, _size: usize) {
-        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
         if !ptr.is_null() {
             unsafe {
                 VirtualFree(ptr as *mut _, 0, MEM_RELEASE);

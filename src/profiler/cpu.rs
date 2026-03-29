@@ -4,8 +4,8 @@ pub fn profile_cpu() -> anyhow::Result<CpuProfile> {
     let model_name = get_cpu_model_name();
     let (cores_performance, cores_efficiency) = get_core_counts();
 
-    let is_apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && model_name.contains("Apple");
+    let is_apple_silicon =
+        cfg!(all(target_os = "macos", target_arch = "aarch64")) && model_name.contains("Apple");
 
     let int8_gflops = estimate_int8_gflops(&model_name, cores_performance);
 
@@ -73,7 +73,7 @@ fn get_core_counts() -> (u32, u32) {
 fn get_core_counts() -> (u32, u32) {
     let mut sys = sysinfo::System::new();
     sys.refresh_cpu_all();
-    let physical = sys.physical_cpu_count().unwrap_or(
+    let physical = sys.physical_core_count().unwrap_or(
         std::thread::available_parallelism()
             .map(|n| n.get() / 2)
             .unwrap_or(2),
@@ -158,9 +158,19 @@ pub(crate) fn sysctl_string(name: &str) -> anyhow::Result<String> {
     let mut size: libc::size_t = 0;
 
     let ret = unsafe {
-        libc::sysctlbyname(c_name.as_ptr(), std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0)
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
     };
-    anyhow::ensure!(ret == 0, "sysctlbyname({name}) failed: {}", std::io::Error::last_os_error());
+    anyhow::ensure!(
+        ret == 0,
+        "sysctlbyname({name}) failed: {}",
+        std::io::Error::last_os_error()
+    );
 
     let mut buf = vec![0u8; size];
     let ret = unsafe {
@@ -172,7 +182,11 @@ pub(crate) fn sysctl_string(name: &str) -> anyhow::Result<String> {
             0,
         )
     };
-    anyhow::ensure!(ret == 0, "sysctlbyname({name}) read failed: {}", std::io::Error::last_os_error());
+    anyhow::ensure!(
+        ret == 0,
+        "sysctlbyname({name}) read failed: {}",
+        std::io::Error::last_os_error()
+    );
 
     let cstr = CStr::from_bytes_until_nul(&buf)
         .unwrap_or_else(|_| unsafe { CStr::from_ptr(buf.as_ptr() as *const i8) });
@@ -194,17 +208,23 @@ pub(crate) fn sysctl_u32(name: &str) -> anyhow::Result<u32> {
             0,
         )
     };
-    anyhow::ensure!(ret == 0, "sysctlbyname({name}) failed: {}", std::io::Error::last_os_error());
+    anyhow::ensure!(
+        ret == 0,
+        "sysctlbyname({name}) failed: {}",
+        std::io::Error::last_os_error()
+    );
     Ok(value)
 }
 
 /// Stub sysctl functions for non-macOS — callers already have `unwrap_or` fallbacks.
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub(crate) fn sysctl_string(_name: &str) -> anyhow::Result<String> {
     anyhow::bail!("sysctl is not available on this platform")
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub(crate) fn sysctl_u32(_name: &str) -> anyhow::Result<u32> {
     anyhow::bail!("sysctl is not available on this platform")
 }

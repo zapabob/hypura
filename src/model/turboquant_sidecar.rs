@@ -75,6 +75,54 @@ impl fmt::Display for TurboQuantSchemaKind {
     }
 }
 
+/// Rotation policies for TurboQuant KV compression
+/// Based on: random_haar, block_so8_static, block_so8_learned (zapabob/Turboquant-CUDA)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum RotationPolicy {
+    /// Random Haar orthogonal rotation (paper baseline)
+    RandomHaar,
+    /// Block-diagonal SO(8) static rotation
+    BlockSo8Static,
+    /// Block-diagonal SO(8) with learned rotations
+    BlockSo8Learned,
+    /// Triality vector view (standard basis)
+    TrialityVector,
+    /// Triality spinor+ view
+    TrialitySpinorPlus,
+    /// Triality spinor- view
+    TrialitySpinorMinus,
+}
+
+impl RotationPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RandomHaar => "random_haar",
+            Self::BlockSo8Static => "block_so8_static",
+            Self::BlockSo8Learned => "block_so8_learned",
+            Self::TrialityVector => "triality_vector",
+            Self::TrialitySpinorPlus => "triality_spinor_plus",
+            Self::TrialitySpinorMinus => "triality_spinor_minus",
+        }
+    }
+
+    pub fn is_triality(&self) -> bool {
+        matches!(
+            self,
+            Self::TrialityVector | Self::TrialitySpinorPlus | Self::TrialitySpinorMinus
+        )
+    }
+
+    pub fn triality_view(&self) -> Option<&'static str> {
+        match self {
+            Self::TrialityVector => Some("vector"),
+            Self::TrialitySpinorPlus => Some("spinor_plus_proxy"),
+            Self::TrialitySpinorMinus => Some("spinor_minus_proxy"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotationArtifact {
     #[serde(default)]

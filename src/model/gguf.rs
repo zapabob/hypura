@@ -290,14 +290,11 @@ impl GgufFile {
 
     /// Get a string metadata value, trying both `general.X` and `X` keys.
     pub fn get_string(&self, key: &str) -> Option<&str> {
-        self.metadata
-            .get(key)
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                self.metadata
-                    .get(&format!("general.{key}"))
-                    .and_then(|v| v.as_str())
-            })
+        self.metadata.get(key).and_then(|v| v.as_str()).or_else(|| {
+            self.metadata
+                .get(&format!("general.{key}"))
+                .and_then(|v| v.as_str())
+        })
     }
 
     /// Get a u32 metadata value, trying architecture-prefixed keys.
@@ -397,13 +394,7 @@ mod tests {
         buf.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn write_tensor_info(
-        buf: &mut Vec<u8>,
-        name: &str,
-        dims: &[u64],
-        dtype: u32,
-        offset: u64,
-    ) {
+    fn write_tensor_info(buf: &mut Vec<u8>, name: &str, dims: &[u64], dtype: u32, offset: u64) {
         write_string(buf, name);
         buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
         for &d in dims {
@@ -430,10 +421,7 @@ mod tests {
 
         assert_eq!(gguf.version, 3);
         assert_eq!(gguf.metadata.len(), 2);
-        assert_eq!(
-            gguf.get_string("general.architecture"),
-            Some("llama")
-        );
+        assert_eq!(gguf.get_string("general.architecture"), Some("llama"));
         assert_eq!(gguf.tensors.len(), 1);
         assert_eq!(gguf.tensors[0].name, "blk.0.attn_q.weight");
         assert_eq!(gguf.tensors[0].dtype, GgmlType::F32);

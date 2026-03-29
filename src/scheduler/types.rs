@@ -205,20 +205,14 @@ impl MemoryBudget {
         };
 
         // KV cache: 2 (K+V) × layers × kv_heads × head_dim × 2 (FP16) × context
-        let kv_raw = 2 * num_layers as u64
-            * num_kv_heads as u64
-            * head_dim
-            * 2
-            * context_length as u64;
+        let kv_raw =
+            2 * num_layers as u64 * num_kv_heads as u64 * head_dim * 2 * context_length as u64;
         let kv_cache_bytes = match kv_quant {
             Some(q) => (kv_raw as f64 * q.memory_scale()) as u64,
             None => kv_raw,
         };
 
-        let total_committed = gpu_committed
-            + kv_cache_bytes
-            + METAL_COMPUTE_OVERHEAD
-            + OS_RESERVED;
+        let total_committed = gpu_committed + kv_cache_bytes + METAL_COMPUTE_OVERHEAD + OS_RESERVED;
 
         let available = total_ram.saturating_sub(total_committed);
 

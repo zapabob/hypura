@@ -29,12 +29,18 @@ pub fn run(force: bool) -> anyhow::Result<()> {
 
 fn print_profile(p: &HardwareProfile) {
     println!();
-    println!("Hardware Profile ({})", p.timestamp.format("%Y-%m-%dT%H:%M:%SZ"));
+    println!(
+        "Hardware Profile ({})",
+        p.timestamp.format("%Y-%m-%dT%H:%M:%SZ")
+    );
     println!("{}", "─".repeat(48));
 
     println!();
     println!("  System");
-    println!("    Machine:     {} ({} {})", p.system.machine_model, p.system.os, p.system.arch);
+    println!(
+        "    Machine:     {} ({} {})",
+        p.system.machine_model, p.system.os, p.system.arch
+    );
     println!(
         "    CPU:         {} ({}P + {}E cores)",
         p.cpu.model_name, p.cpu.cores_performance, p.cpu.cores_efficiency
@@ -45,10 +51,20 @@ fn print_profile(p: &HardwareProfile) {
     println!(
         "    Total:       {}{}",
         format_bytes(p.memory.total_bytes),
-        if p.memory.is_unified { " (unified)" } else { "" }
+        if p.memory.is_unified {
+            " (unified)"
+        } else {
+            ""
+        }
     );
-    println!("    Available:   {}", format_bytes(p.memory.available_bytes));
-    println!("    Bandwidth:   {}", format_bandwidth(p.memory.bandwidth_bytes_per_sec));
+    println!(
+        "    Available:   {}",
+        format_bytes(p.memory.available_bytes)
+    );
+    println!(
+        "    Bandwidth:   {}",
+        format_bandwidth(p.memory.bandwidth_bytes_per_sec)
+    );
 
     if let Some(ref gpu) = p.gpu {
         println!();
@@ -59,7 +75,10 @@ fn print_profile(p: &HardwareProfile) {
             format_bytes(gpu.vram_bytes),
             if p.memory.is_unified { " (shared)" } else { "" }
         );
-        println!("    Bandwidth:   {}", format_bandwidth(gpu.bandwidth_bytes_per_sec));
+        println!(
+            "    Bandwidth:   {}",
+            format_bandwidth(gpu.bandwidth_bytes_per_sec)
+        );
         println!("    FP16:        {:.1} TFLOPS", gpu.fp16_tflops);
     }
 

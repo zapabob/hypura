@@ -124,8 +124,7 @@ fn default_true() -> bool {
 
 /// Produce an RFC 3339 timestamp with nanosecond precision.
 pub fn now_rfc3339() -> String {
-    chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
 /// Lightweight GGUF info kept in AppState (no tensor data).

@@ -74,7 +74,11 @@ impl LlamaModel {
         params.use_mmap = use_mmap;
 
         let ptr = unsafe { hypura_sys::llama_model_load_from_file(c_path.as_ptr(), params) };
-        anyhow::ensure!(!ptr.is_null(), "Failed to load model from {}", path.display());
+        anyhow::ensure!(
+            !ptr.is_null(),
+            "Failed to load model from {}",
+            path.display()
+        );
 
         let vocab = unsafe { hypura_sys::llama_model_get_vocab(ptr) };
         anyhow::ensure!(!vocab.is_null(), "Failed to get vocab from model");
@@ -101,7 +105,11 @@ impl LlamaModel {
         params.tensor_buft_overrides = overrides;
 
         let ptr = unsafe { hypura_sys::llama_model_load_from_file(c_path.as_ptr(), params) };
-        anyhow::ensure!(!ptr.is_null(), "Failed to load model from {}", path.display());
+        anyhow::ensure!(
+            !ptr.is_null(),
+            "Failed to load model from {}",
+            path.display()
+        );
 
         let vocab = unsafe { hypura_sys::llama_model_get_vocab(ptr) };
         anyhow::ensure!(!vocab.is_null(), "Failed to get vocab from model");
@@ -220,8 +228,22 @@ pub struct LlamaContext {
 
 impl LlamaContext {
     /// Create a new inference context from a loaded model.
-    pub fn new(model: &LlamaModel, n_ctx: u32, n_batch: u32, n_threads: i32) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, None, std::ptr::null_mut(), None)
+    pub fn new(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_threads: i32,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            model,
+            n_ctx,
+            n_batch,
+            n_threads,
+            None,
+            std::ptr::null_mut(),
+            None,
+            false,
+        )
     }
 
     /// Create a context with a cb_eval callback for layer tracking.
@@ -234,7 +256,36 @@ impl LlamaContext {
         cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
         callback_data: *mut std::ffi::c_void,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, cb_eval, callback_data, None)
+        Self::new_with_callback_and_options(
+            model,
+            n_ctx,
+            n_batch,
+            n_threads,
+            cb_eval,
+            callback_data,
+            false,
+        )
+    }
+
+    pub fn new_with_callback_and_options(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_threads: i32,
+        cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
+        callback_data: *mut std::ffi::c_void,
+        disable_flash_attn: bool,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            model,
+            n_ctx,
+            n_batch,
+            n_threads,
+            cb_eval,
+            callback_data,
+            None,
+            disable_flash_attn,
+        )
     }
 
     /// Create a context with callback and KV cache quantization.
@@ -247,7 +298,38 @@ impl LlamaContext {
         callback_data: *mut std::ffi::c_void,
         kv_quant: Option<crate::scheduler::types::KvQuantization>,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(model, n_ctx, n_batch, n_threads, cb_eval, callback_data, kv_quant)
+        Self::new_with_callback_and_kv_and_options(
+            model,
+            n_ctx,
+            n_batch,
+            n_threads,
+            cb_eval,
+            callback_data,
+            kv_quant,
+            false,
+        )
+    }
+
+    pub fn new_with_callback_and_kv_and_options(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_threads: i32,
+        cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
+        callback_data: *mut std::ffi::c_void,
+        kv_quant: Option<crate::scheduler::types::KvQuantization>,
+        disable_flash_attn: bool,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(
+            model,
+            n_ctx,
+            n_batch,
+            n_threads,
+            cb_eval,
+            callback_data,
+            kv_quant,
+            disable_flash_attn,
+        )
     }
 
     fn new_inner(
@@ -258,6 +340,7 @@ impl LlamaContext {
         cb_eval: hypura_sys::ggml_backend_sched_eval_callback,
         callback_data: *mut std::ffi::c_void,
         kv_quant: Option<crate::scheduler::types::KvQuantization>,
+        disable_flash_attn: bool,
     ) -> anyhow::Result<Self> {
         use crate::scheduler::types::KvQuantization;
 
@@ -268,6 +351,10 @@ impl LlamaContext {
         params.n_threads = n_threads;
         params.n_threads_batch = n_threads;
         params.offload_kqv = true;
+        if disable_flash_attn {
+            params.flash_attn_type =
+                hypura_sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
 
         if let Some(kv) = kv_quant {
             let ggml_type = match kv {
@@ -341,7 +428,10 @@ impl LlamaSampler {
         let ptr = unsafe { hypura_sys::llama_sampler_chain_init(chain_params) };
 
         unsafe {
-            hypura_sys::llama_sampler_chain_add(ptr, hypura_sys::llama_sampler_init_top_k(params.top_k));
+            hypura_sys::llama_sampler_chain_add(
+                ptr,
+                hypura_sys::llama_sampler_init_top_k(params.top_k),
+            );
             hypura_sys::llama_sampler_chain_add(
                 ptr,
                 hypura_sys::llama_sampler_init_top_p(params.top_p, 1),

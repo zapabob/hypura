@@ -47,7 +47,10 @@ pub fn profile_storage() -> anyhow::Result<Vec<StorageProfile>> {
         break; // Benchmark only the first matching volume
     }
 
-    anyhow::ensure!(!profiles.is_empty(), "No storage devices found to benchmark");
+    anyhow::ensure!(
+        !profiles.is_empty(),
+        "No storage devices found to benchmark"
+    );
     Ok(profiles)
 }
 
@@ -153,7 +156,10 @@ fn benchmark_sequential(
         }
     }
 
-    Ok(BandwidthCurve { points, peak_sequential })
+    Ok(BandwidthCurve {
+        points,
+        peak_sequential,
+    })
 }
 
 /// Platform-specific sequential read pass.
@@ -186,9 +192,13 @@ fn read_sequential_unix(
 
     // macOS: disable unified buffer cache; Linux: use advisory fadvise
     #[cfg(target_os = "macos")]
-    unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1); }
+    unsafe {
+        libc::fcntl(fd, libc::F_NOCACHE, 1);
+    }
     #[cfg(target_os = "linux")]
-    unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED); }
+    unsafe {
+        libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+    }
 
     let mut buf = AlignedBuffer::new(block_size, 4096)?;
     let mut total_read: usize = 0;
@@ -204,7 +214,9 @@ fn read_sequential_unix(
                 total_read as libc::off_t,
             )
         };
-        if n <= 0 { break; }
+        if n <= 0 {
+            break;
+        }
         total_read += n as usize;
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -222,8 +234,8 @@ fn read_sequential_windows(
     file_size: usize,
     block_size: usize,
 ) -> anyhow::Result<u64> {
-    use std::io::{Read, Seek, SeekFrom};
     use crate::io::aligned_buffer::AlignedBuffer;
+    use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(0))?;
@@ -234,7 +246,9 @@ fn read_sequential_windows(
     while total_read < file_size {
         let to_read = block_size.min(file_size - total_read);
         let n = file.read(&mut buf[..to_read])?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         total_read += n;
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -264,9 +278,13 @@ fn benchmark_random_4k_unix(path: &std::path::Path, file_size: usize) -> anyhow:
     let fd = file.as_raw_fd();
 
     #[cfg(target_os = "macos")]
-    unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1); }
+    unsafe {
+        libc::fcntl(fd, libc::F_NOCACHE, 1);
+    }
     #[cfg(target_os = "linux")]
-    unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM); }
+    unsafe {
+        libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM);
+    }
 
     let mut buf = AlignedBuffer::new(4096, 4096)?;
     let max_offset = (file_size / 4096) as u64;
@@ -274,24 +292,37 @@ fn benchmark_random_4k_unix(path: &std::path::Path, file_size: usize) -> anyhow:
     let mut rng: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
     let start = Instant::now();
     for _ in 0..RANDOM_IOPS_READS {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let block_idx = (rng >> 32) % max_offset;
         let offset = block_idx * 4096;
 
         let n = unsafe {
-            libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, 4096, offset as libc::off_t)
+            libc::pread(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                4096,
+                offset as libc::off_t,
+            )
         };
-        if n <= 0 { break; }
+        if n <= 0 {
+            break;
+        }
     }
     let elapsed = start.elapsed().as_secs_f64();
 
-    Ok(if elapsed > 0.0 { (RANDOM_IOPS_READS as f64 / elapsed) as u64 } else { 0 })
+    Ok(if elapsed > 0.0 {
+        (RANDOM_IOPS_READS as f64 / elapsed) as u64
+    } else {
+        0
+    })
 }
 
 #[cfg(windows)]
 fn benchmark_random_4k_windows(path: &std::path::Path, file_size: usize) -> anyhow::Result<u64> {
-    use std::io::{Read, Seek, SeekFrom};
     use crate::io::aligned_buffer::AlignedBuffer;
+    use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
     let mut buf = AlignedBuffer::new(4096, 4096)?;
@@ -300,7 +331,9 @@ fn benchmark_random_4k_windows(path: &std::path::Path, file_size: usize) -> anyh
     let mut rng: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
     let start = Instant::now();
     for _ in 0..RANDOM_IOPS_READS {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let block_idx = (rng >> 32) % max_offset;
         let offset = block_idx * 4096;
         file.seek(SeekFrom::Start(offset))?;
@@ -308,7 +341,11 @@ fn benchmark_random_4k_windows(path: &std::path::Path, file_size: usize) -> anyh
     }
     let elapsed = start.elapsed().as_secs_f64();
 
-    Ok(if elapsed > 0.0 { (RANDOM_IOPS_READS as f64 / elapsed) as u64 } else { 0 })
+    Ok(if elapsed > 0.0 {
+        (RANDOM_IOPS_READS as f64 / elapsed) as u64
+    } else {
+        0
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -15,6 +15,8 @@ pub fn run(
     context: u32,
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&str>,
+    _rotation_policy: Option<&str>,
+    _rotation_seed: u32,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(

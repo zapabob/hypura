@@ -9,6 +9,7 @@ use axum::{Json, Router};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::compute::inference::{GenerateFromLoadedParams, GenerationResult, LoadedModel};
+use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
 use crate::server::chat::format_chat_prompt;
 use crate::server::ollama_types::*;
 use crate::server::streaming;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub gguf_info: GgufInfo,
     pub load_duration_ns: u64,
     pub telemetry: Arc<TelemetryEmitter>,
+    pub turboquant: ResolvedTurboQuantConfig,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -74,6 +76,13 @@ async fn show_handler(
             "general.architecture": info.architecture,
             "general.context_length": info.context_length,
             "general.parameter_count": info.parameter_count,
+            "hypura.turboquant.mode": state.turboquant.mode.as_str(),
+            "hypura.turboquant.schema": state.turboquant.schema_label(),
+            "hypura.turboquant.config_path": state.turboquant.source_label(),
+            "hypura.turboquant.runtime_status": turboquant_runtime_status(
+                state.turboquant.mode,
+                state.turboquant.config.is_some(),
+            ),
         }),
     })
 }
@@ -115,8 +124,13 @@ async fn generate_handler(
     });
 
     if req.stream {
-        let body =
-            streaming::ndjson_generate_stream(model_name, token_rx, result_rx, request_start, load_duration_ns);
+        let body = streaming::ndjson_generate_stream(
+            model_name,
+            token_rx,
+            result_rx,
+            request_start,
+            load_duration_ns,
+        );
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/x-ndjson")],
@@ -125,7 +139,14 @@ async fn generate_handler(
             .into_response()
     } else {
         // Non-streaming: collect all tokens, return single JSON
-        let result = collect_generate(model_name, token_rx, result_rx, request_start, load_duration_ns).await;
+        let result = collect_generate(
+            model_name,
+            token_rx,
+            result_rx,
+            request_start,
+            load_duration_ns,
+        )
+        .await;
         Json(result).into_response()
     }
 }
@@ -167,8 +188,13 @@ async fn chat_handler(
     });
 
     if req.stream {
-        let body =
-            streaming::ndjson_chat_stream(model_name, token_rx, result_rx, request_start, load_duration_ns);
+        let body = streaming::ndjson_chat_stream(
+            model_name,
+            token_rx,
+            result_rx,
+            request_start,
+            load_duration_ns,
+        );
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/x-ndjson")],
@@ -176,7 +202,14 @@ async fn chat_handler(
         )
             .into_response()
     } else {
-        let result = collect_chat(model_name, token_rx, result_rx, request_start, load_duration_ns).await;
+        let result = collect_chat(
+            model_name,
+            token_rx,
+            result_rx,
+            request_start,
+            load_duration_ns,
+        )
+        .await;
         Json(result).into_response()
     }
 }
@@ -201,6 +234,20 @@ fn build_sampling(opts: &GenerateOptions) -> crate::compute::ffi::SamplingParams
         s.seed = seed;
     }
     s
+}
+
+fn turboquant_runtime_status(mode: TurboQuantMode, has_config: bool) -> &'static str {
+    if mode == TurboQuantMode::Exact {
+        "inactive"
+    } else if !has_config {
+        "unresolved"
+    } else if mode == TurboQuantMode::PaperFullKv {
+        "experimental-full-kv"
+    } else if has_config {
+        "faithful-attached"
+    } else {
+        "unresolved"
+    }
 }
 
 async fn collect_generate(

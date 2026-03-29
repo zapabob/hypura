@@ -51,11 +51,7 @@ pub fn run(model_path: &str, read_gb: f64) -> anyhow::Result<()> {
         if pct.abs() < 0.5 {
             println!("  {label:<42} {:.2} GB/s", bw / 1e9);
         } else {
-            println!(
-                "  {label:<42} {:.2} GB/s  ({sign}{:.1}%)",
-                bw / 1e9,
-                pct
-            );
+            println!("  {label:<42} {:.2} GB/s  ({sign}{:.1}%)", bw / 1e9, pct);
         }
     };
 
@@ -90,7 +86,9 @@ pub fn run(model_path: &str, read_gb: f64) -> anyhow::Result<()> {
         println!("    >> Cache-bypass is a significant bottleneck ({nocache_impact:.0}% throughput loss)");
     }
     if scatter_impact > 30.0 {
-        println!("    >> Per-tensor scattered reads cost {scatter_impact:.0}% throughput vs sequential");
+        println!(
+            "    >> Per-tensor scattered reads cost {scatter_impact:.0}% throughput vs sequential"
+        );
     }
     if mt_gain > 10.0 {
         println!("    >> Multi-threading helps: +{mt_gain:.0}% with 4 threads");
@@ -108,8 +106,15 @@ pub fn run(model_path: &str, read_gb: f64) -> anyhow::Result<()> {
 fn read_full(fd: NativeFd, dst: *mut u8, size: usize, file_offset: u64) {
     let mut done = 0usize;
     while done < size {
-        let n = compat::read_at_fd(fd, unsafe { dst.add(done) }, size - done, file_offset + done as u64);
-        if n <= 0 { break; }
+        let n = compat::read_at_fd(
+            fd,
+            unsafe { dst.add(done) },
+            size - done,
+            file_offset + done as u64,
+        );
+        if n <= 0 {
+            break;
+        }
         done += n as usize;
     }
 }
@@ -131,7 +136,9 @@ fn test_raw_sequential(path: &Path, data_start: u64, test_bytes: usize) -> anyho
     while total < test_bytes {
         let chunk = BLOCK_SIZE.min(test_bytes - total);
         let n = file.read(&mut buf[..chunk])?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         total += n;
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -169,13 +176,21 @@ fn test_nocache_advfree_cycle(
 
     // Allocate a full-size buffer (like Hypura's NVMe buffer)
     let buf_ptr = compat::alloc_pages(test_bytes);
-    anyhow::ensure!(!buf_ptr.is_null(), "alloc_pages failed for {test_bytes} bytes");
+    anyhow::ensure!(
+        !buf_ptr.is_null(),
+        "alloc_pages failed for {test_bytes} bytes"
+    );
 
     // Prime: initial read to commit pages
     let mut off = 0usize;
     while off < test_bytes {
         let chunk = BLOCK_SIZE.min(test_bytes - off);
-        read_full(fd, unsafe { buf_ptr.add(off) }, chunk, data_start + off as u64);
+        read_full(
+            fd,
+            unsafe { buf_ptr.add(off) },
+            chunk,
+            data_start + off as u64,
+        );
         off += chunk;
     }
 
@@ -189,7 +204,12 @@ fn test_nocache_advfree_cycle(
         let mut off2 = 0usize;
         while off2 < test_bytes {
             let chunk = BLOCK_SIZE.min(test_bytes - off2);
-            read_full(fd, unsafe { buf_ptr.add(off2) }, chunk, data_start + off2 as u64);
+            read_full(
+                fd,
+                unsafe { buf_ptr.add(off2) },
+                chunk,
+                data_start + off2 as u64,
+            );
             off2 += chunk;
         }
         let elapsed = start.elapsed().as_secs_f64();
@@ -229,7 +249,12 @@ fn test_mt_nocache(
                 let mut off = 0usize;
                 while off < thread_bytes {
                     let chunk = BLOCK_SIZE.min(thread_bytes - off);
-                    read_full(fd, unsafe { my_buf.add(off) }, chunk, data_start + (start_off + off) as u64);
+                    read_full(
+                        fd,
+                        unsafe { my_buf.add(off) },
+                        chunk,
+                        data_start + (start_off + off) as u64,
+                    );
                     off += chunk;
                 }
                 compat::close_fd(fd);
@@ -239,7 +264,9 @@ fn test_mt_nocache(
 
     barrier.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let elapsed = start.elapsed().as_secs_f64();
 
     compat::free_pages(buf_ptr, test_bytes);
@@ -263,7 +290,12 @@ fn test_mt_nocache_advfree(
         let mut off = 0usize;
         while off < test_bytes {
             let chunk = BLOCK_SIZE.min(test_bytes - off);
-            read_full(fd, unsafe { buf_ptr.add(off) }, chunk, data_start + off as u64);
+            read_full(
+                fd,
+                unsafe { buf_ptr.add(off) },
+                chunk,
+                data_start + off as u64,
+            );
             off += chunk;
         }
         compat::close_fd(fd);
@@ -291,7 +323,12 @@ fn test_mt_nocache_advfree(
                 let mut off = 0usize;
                 while off < thread_bytes {
                     let chunk = BLOCK_SIZE.min(thread_bytes - off);
-                    read_full(fd, unsafe { my_buf.add(off) }, chunk, data_start + (start_off + off) as u64);
+                    read_full(
+                        fd,
+                        unsafe { my_buf.add(off) },
+                        chunk,
+                        data_start + (start_off + off) as u64,
+                    );
                     off += chunk;
                 }
                 compat::close_fd(fd);
@@ -301,7 +338,9 @@ fn test_mt_nocache_advfree(
 
     barrier.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let elapsed = start.elapsed().as_secs_f64();
 
     compat::free_pages(buf_ptr, test_bytes);
@@ -310,11 +349,7 @@ fn test_mt_nocache_advfree(
 
 // ── Variant F: scattered per-tensor reads ────────────────────────────────────
 
-fn test_scattered_reads(
-    path: &Path,
-    gguf: &GgufFile,
-    max_bytes: usize,
-) -> anyhow::Result<f64> {
+fn test_scattered_reads(path: &Path, gguf: &GgufFile, max_bytes: usize) -> anyhow::Result<f64> {
     let fd = compat::open_direct_fd(path)?;
     let mut buf = AlignedBuffer::new(BLOCK_SIZE, PAGE_SIZE)?;
 
@@ -329,7 +364,9 @@ fn test_scattered_reads(
     let mut total = 0usize;
 
     for &(file_off, size) in &regions {
-        if total + size > max_bytes { break; }
+        if total + size > max_bytes {
+            break;
+        }
         let read_size = size.min(BLOCK_SIZE);
         read_full(fd, buf.as_mut_ptr(), read_size, file_off);
         total += read_size;

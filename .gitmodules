@@ -2,3 +2,6 @@
 	path = vendor/llama.cpp
 	url = https://github.com/ggerganov/llama.cpp.git
 	branch = master
+[submodule "vendor/turboquant-cuda"]
+	path = vendor/turboquant-cuda
+	url = https://github.com/zapabob/Turboquant-CUDA

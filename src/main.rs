@@ -1,7 +1,7 @@
 mod cli;
 
 use clap::{Parser, Subcommand};
-use hypura::model::turboquant_sidecar::TurboQuantMode;
+use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +49,12 @@ enum Commands {
         /// Optional TurboQuant sidecar config path
         #[arg(long)]
         turboquant_config: Option<String>,
+        /// Rotation policy for TurboQuant
+        #[arg(long, value_enum)]
+        rotation_policy: Option<RotationPolicy>,
+        /// Rotation seed for deterministic rotation
+        #[arg(long, default_value = "0")]
+        rotation_seed: u32,
     },
     /// Start Ollama-compatible API server
     Serve {
@@ -69,6 +75,12 @@ enum Commands {
         /// Optional TurboQuant sidecar config path
         #[arg(long)]
         turboquant_config: Option<String>,
+        /// Rotation policy for TurboQuant
+        #[arg(long, value_enum)]
+        rotation_policy: Option<RotationPolicy>,
+        /// Rotation seed for deterministic rotation
+        #[arg(long, default_value = "0")]
+        rotation_seed: u32,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -95,6 +107,12 @@ enum Commands {
         /// Optional TurboQuant sidecar config path
         #[arg(long)]
         turboquant_config: Option<String>,
+        /// Rotation policy for TurboQuant
+        #[arg(long, value_enum)]
+        rotation_policy: Option<RotationPolicy>,
+        /// Rotation seed for deterministic rotation
+        #[arg(long, default_value = "0")]
+        rotation_seed: u32,
     },
     /// Print model metadata, tensor list, and placement plan
     Inspect {
@@ -140,6 +158,8 @@ fn main() -> anyhow::Result<()> {
             max_tokens,
             turboquant_mode,
             turboquant_config,
+            rotation_policy,
+            rotation_seed,
         } => cli::run::run(
             &model,
             context,
@@ -148,6 +168,8 @@ fn main() -> anyhow::Result<()> {
             max_tokens,
             turboquant_mode,
             turboquant_config.as_deref(),
+            rotation_policy.map(|p| p.as_str().to_string()).as_deref(),
+            rotation_seed,
         ),
         Commands::Serve {
             model,
@@ -156,6 +178,8 @@ fn main() -> anyhow::Result<()> {
             context,
             turboquant_mode,
             turboquant_config,
+            rotation_policy,
+            rotation_seed,
         } => cli::serve::run(
             &model,
             &host,
@@ -163,6 +187,8 @@ fn main() -> anyhow::Result<()> {
             context,
             turboquant_mode,
             turboquant_config.as_deref(),
+            rotation_policy.map(|p| p.as_str().to_string()).as_deref(),
+            rotation_seed,
         ),
         Commands::Bench {
             model,
@@ -173,6 +199,8 @@ fn main() -> anyhow::Result<()> {
             force,
             turboquant_mode,
             turboquant_config,
+            rotation_policy,
+            rotation_seed,
         } => cli::bench::run(
             &model,
             baseline,
@@ -182,6 +210,8 @@ fn main() -> anyhow::Result<()> {
             force,
             turboquant_mode,
             turboquant_config.as_deref(),
+            rotation_policy.map(|p| p.as_str().to_string()).as_deref(),
+            rotation_seed,
         ),
         Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
         Commands::Iobench { model, read_gb } => cli::iobench::run(&model, read_gb),

@@ -151,7 +151,10 @@ pub fn estimate_performance(
     let kv_per_token = estimate_kv_per_token(metadata);
     let available_for_kv = hardware.memory.total_bytes.saturating_sub(
         model.total_tensor_bytes().min(
-            hardware.memory.total_bytes.saturating_sub(OS_OVERHEAD_BYTES),
+            hardware
+                .memory
+                .total_bytes
+                .saturating_sub(OS_OVERHEAD_BYTES),
         ),
     );
     let max_context = if kv_per_token > 0 {

@@ -83,7 +83,8 @@ pub fn is_profile_stale(profile: &HardwareProfile) -> bool {
 fn data_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Roaming".into());
+        let appdata = std::env::var("APPDATA")
+            .unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Roaming".into());
         std::path::PathBuf::from(appdata).join("Hypura")
     }
     #[cfg(not(target_os = "windows"))]
@@ -148,8 +149,7 @@ fn os_version() -> String {
             }
         }
         // Fallback: kernel version
-        let mut uname = sysinfo::System::kernel_version()
-            .unwrap_or_else(|| "unknown".to_string());
+        let mut uname = sysinfo::System::kernel_version().unwrap_or_else(|| "unknown".to_string());
         uname
     }
     #[cfg(target_os = "windows")]

@@ -8,10 +8,7 @@ pub fn run(model_path: &str, show_tensors: bool) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     anyhow::ensure!(path.exists(), "Model file not found: {model_path}");
 
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
         "gguf" => inspect_gguf(path, show_tensors),
@@ -52,7 +49,10 @@ fn inspect_gguf(path: &Path, show_tensors: bool) -> anyhow::Result<()> {
 
     if show_tensors {
         println!();
-        println!("  {:50} {:>12} {:>8} {:>10}", "Name", "Size", "Type", "Role");
+        println!(
+            "  {:50} {:>12} {:>8} {:>10}",
+            "Name", "Size", "Type", "Role"
+        );
         println!("  {}", "-".repeat(84));
         for t in &gguf.tensors {
             let role = TensorRole::from_name(&t.name);

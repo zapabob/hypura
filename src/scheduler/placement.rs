@@ -66,7 +66,9 @@ pub fn compute_placement_with_context(
             tracing::info!("Sparse MoE mmap: active working set fits in RAM, using OS page cache");
             (assignments, InferenceMode::SparseMoeMmap)
         } else if let Some(es) = try_expert_streaming_assign(&scored, &capacities, &metadata) {
-            tracing::info!("Expert-streaming placement: non-expert tensors on GPU/RAM, experts on NVMe");
+            tracing::info!(
+                "Expert-streaming placement: non-expert tensors on GPU/RAM, experts on NVMe"
+            );
             (es, InferenceMode::ExpertStreaming)
         } else if let Some(ds) = try_dense_ffn_streaming_assign(&scored, &capacities, &metadata) {
             tracing::info!("Dense FFN-streaming placement: attention+norms on GPU, FFN on NVMe");
@@ -98,7 +100,8 @@ pub fn compute_placement_with_context(
         build_prefetch_schedule(&tier_assignments, &model.tensors, &metadata, hardware);
 
     // KV cache plan
-    let kv_cache_plan = compute_kv_cache_plan(&metadata, context_length, &tier_assignments, &capacities);
+    let kv_cache_plan =
+        compute_kv_cache_plan(&metadata, context_length, &tier_assignments, &capacities);
 
     // Quick tok/s estimate for the plan
     let estimated_tok_per_sec = quick_estimate(
@@ -302,7 +305,11 @@ fn try_sparse_moe_mmap(
         experts_total,
         active_bytes as f64 / (1u64 << 30) as f64,
         total_bytes as f64 / (1u64 << 30) as f64,
-        if fits_gpu { "" } else { " (exceeds GPU, will use CPU-only)" },
+        if fits_gpu {
+            ""
+        } else {
+            " (exceeds GPU, will use CPU-only)"
+        },
     );
 
     Some(assignments)
@@ -412,7 +419,11 @@ fn try_dense_ffn_streaming_assign(
         .filter(|t| !is_ffn(&t.role))
         .map(|t| t.size_bytes)
         .sum();
-    let ffn_bytes: u64 = tensors.iter().filter(|t| is_ffn(&t.role)).map(|t| t.size_bytes).sum();
+    let ffn_bytes: u64 = tensors
+        .iter()
+        .filter(|t| is_ffn(&t.role))
+        .map(|t| t.size_bytes)
+        .sum();
 
     let total = non_ffn_bytes + ffn_bytes;
     if non_ffn_bytes > caps.unified_limit || total <= caps.unified_limit {
@@ -972,19 +983,6 @@ mod tests {
     use super::*;
     use crate::model::gguf::{GgmlType, TensorInfo};
 
-    fn make_tensors(count: usize, size: u64) -> Vec<TensorInfo> {
-        (0..count)
-            .map(|i| TensorInfo {
-                name: format!("blk.{i}.attn_q.weight"),
-                dimensions: vec![4096, 4096],
-                dtype: GgmlType::Q4K,
-                offset: 0,
-                size_bytes: size,
-                layer_index: Some(i as u32),
-            })
-            .collect()
-    }
-
     fn make_metadata(layers: u32) -> ModelMetadata {
         ModelMetadata {
             architecture: "llama".into(),
@@ -1066,9 +1064,9 @@ mod tests {
             .collect();
 
         let caps = TierCapacities {
-            gpu_bytes: 3 << 30,       // 3 GB GPU
-            ram_bytes: 4 << 30,       // 4 GB RAM
-            unified_limit: 7 << 30,   // 7 GB unified
+            gpu_bytes: 3 << 30,     // 3 GB GPU
+            ram_bytes: 4 << 30,     // 4 GB RAM
+            unified_limit: 7 << 30, // 7 GB unified
             nvme_peak_bw: 5_000_000_000,
         };
 
@@ -1076,9 +1074,18 @@ mod tests {
         let meta = make_metadata(0);
         let assignments = greedy_assign(&tensors, &caps, &hw, &meta);
 
-        let gpu_count = assignments.values().filter(|t| **t == StorageTier::Gpu).count();
-        let ram_count = assignments.values().filter(|t| **t == StorageTier::Ram).count();
-        let nvme_count = assignments.values().filter(|t| **t == StorageTier::Nvme).count();
+        let gpu_count = assignments
+            .values()
+            .filter(|t| **t == StorageTier::Gpu)
+            .count();
+        let ram_count = assignments
+            .values()
+            .filter(|t| **t == StorageTier::Ram)
+            .count();
+        let nvme_count = assignments
+            .values()
+            .filter(|t| **t == StorageTier::Nvme)
+            .count();
 
         assert_eq!(gpu_count, 3);
         assert_eq!(ram_count, 4);

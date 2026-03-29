@@ -17,6 +17,8 @@ pub fn run(
     max_tokens: u32,
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&str>,
+    rotation_policy: Option<&str>,
+    rotation_seed: u32,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
@@ -27,6 +29,8 @@ pub fn run(
         max_tokens,
         turboquant_mode,
         turboquant_config,
+        rotation_policy,
+        rotation_seed,
     ))
 }
 
@@ -38,6 +42,8 @@ async fn run_async(
     max_tokens: u32,
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&str>,
+    _rotation_policy: Option<&str>,
+    _rotation_seed: u32,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     let runtime = resolve_runtime_setup(

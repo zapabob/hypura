@@ -12,7 +12,9 @@ pub enum TensorRole {
     FfnUp,
     FfnDown,
     MoeRouter,
-    MoeExpert { expert_id: u32 },
+    MoeExpert {
+        expert_id: u32,
+    },
     /// Fused expert tensor containing all experts in one tensor (e.g., Mixtral's
     /// `ffn_gate_exps.weight` with dims [hidden, intermediate, num_experts]).
     /// Each expert's data is a contiguous stride of `total_size / num_experts`.
@@ -109,7 +111,7 @@ impl TensorRole {
 fn is_fused_expert_tensor(name: &str) -> bool {
     if let Some(pos) = name.find("_exps.") {
         let after = &name[pos + 6..]; // skip "_exps."
-        // If the next segment is NOT a number, it's fused
+                                      // If the next segment is NOT a number, it's fused
         !after.starts_with(|c: char| c.is_ascii_digit())
     } else {
         false

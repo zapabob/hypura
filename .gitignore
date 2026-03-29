@@ -33,3 +33,4 @@ dist/
 .cargo/
 .cursor/
 scripts/__pycache__/
+logs/

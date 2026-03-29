@@ -110,9 +110,6 @@ mod tests {
             ExpertTensorType::from_name("blk.0.ffn_down_exps.weight"),
             Some(ExpertTensorType::Down)
         );
-        assert_eq!(
-            ExpertTensorType::from_name("blk.0.ffn_gate.weight"),
-            None
-        );
+        assert_eq!(ExpertTensorType::from_name("blk.0.ffn_gate.weight"), None);
     }
 }

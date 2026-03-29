@@ -1,6 +1,6 @@
+use crate::io::compat::{self, NativeFd};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
-use crate::io::compat::{self, NativeFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -212,7 +212,12 @@ fn pread_region(fd: NativeFd, base: *mut u8, offset: usize, size: usize, file_of
     let mut read = 0usize;
     while read < size {
         let n = {
-            compat::read_at_fd(fd, unsafe { dst.add(read) }, size - read, file_offset + read as u64)
+            compat::read_at_fd(
+                fd,
+                unsafe { dst.add(read) },
+                size - read,
+                file_offset + read as u64,
+            )
         };
         if n <= 0 {
             break;
@@ -284,32 +289,27 @@ pub struct PrefetchState {
     pub sorted_nvme_layers: Vec<u32>,
 
     // --- Expert-level data structures ---
-
     /// Per-layer expert tensor layouts for fused expert tensors.
     pub expert_layouts: HashMap<u32, Vec<ExpertLayout>>,
     /// Per-layer non-expert tensor regions (norms, router weights, etc.).
     pub non_expert_regions: HashMap<u32, Vec<(usize, usize, u64)>>,
 
     // --- Router interception ---
-
     /// Per-layer expert selection from the most recent router output.
     pub selected_experts: Mutex<HashMap<u32, Vec<u32>>>,
     pub num_experts_used: u32,
     pub num_experts_total: u32,
 
     // --- Neuron cache ---
-
     pub neuron_cache: Mutex<NeuronCache>,
     pub debug_logged_tensors: AtomicI32,
 
     // --- Co-activation tracking (Phase 2) ---
-
     pub co_activation: Mutex<CoActivationMatrix>,
     /// Previous layer expert selections for cross-layer tracking.
     pub prev_layer_experts: Mutex<Option<(u32, Vec<u32>)>>,
 
     // --- I/O tracing ---
-
     /// Expert-streaming mode: non-expert tensors GPU-resident, experts loaded on demand.
     pub expert_streaming: AtomicBool,
     /// Dense FFN-streaming mode: attention+norms GPU-resident, FFN streamed from NVMe.
@@ -324,7 +324,6 @@ pub struct PrefetchState {
     pub fused_tensor_ptrs: HashMap<String, *mut hypura_sys::ggml_tensor>,
 
     // --- Hybrid residency (dense FFN) ---
-
     /// Layers whose FFN data is permanently resident in memory (not pool-managed).
     pub resident_ffn_layers: std::collections::HashSet<u32>,
     /// Base pointer of the resident FFN buffer (separate from pool).
@@ -549,9 +548,7 @@ impl PrefetchState {
                     // I/O pool or another thread is loading — wait
                     let wait_start = Instant::now();
                     status = self.layer_notify.wait(status).unwrap();
-                    if tracing
-                        && status.get(&layer_idx).copied() == Some(LayerStatus::Loaded)
-                    {
+                    if tracing && status.get(&layer_idx).copied() == Some(LayerStatus::Loaded) {
                         let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
                         self.trace.record(TraceEvent::LayerStall {
                             layer: layer_idx,
@@ -786,8 +783,10 @@ impl PrefetchState {
 
         if tracing_on {
             let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
-            self.trace
-                .record(TraceEvent::LayerStall { layer: layer_idx, wait_ms });
+            self.trace.record(TraceEvent::LayerStall {
+                layer: layer_idx,
+                wait_ms,
+            });
         }
     }
 
@@ -822,8 +821,7 @@ impl PrefetchState {
                     let pool = self.expert_pool.lock().unwrap();
                     let pool = pool.as_ref().unwrap();
                     unsafe {
-                        (*tensor_ptr).data =
-                            pool.pool_base.add(slot_offsets[i]) as *mut c_void;
+                        (*tensor_ptr).data = pool.pool_base.add(slot_offsets[i]) as *mut c_void;
                     }
                 }
             }
@@ -855,8 +853,7 @@ impl PrefetchState {
                         .as_ref()
                         .and_then(|p| p.get(eid as usize).copied())
                         .unwrap_or(eid);
-                    let pool_dest =
-                        slot_offsets[i] + (mapped_eid as usize) * layout.expert_stride;
+                    let pool_dest = slot_offsets[i] + (mapped_eid as usize) * layout.expert_stride;
                     regions.push((
                         pool_dest,
                         layout.expert_stride,
@@ -933,8 +930,7 @@ impl PrefetchState {
             if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
                 if !tensor_ptr.is_null() {
                     unsafe {
-                        (*tensor_ptr).data =
-                            pool.pool_base.add(slot_offsets[i]) as *mut c_void;
+                        (*tensor_ptr).data = pool.pool_base.add(slot_offsets[i]) as *mut c_void;
                     }
                 }
             }
@@ -1079,8 +1075,7 @@ impl PrefetchState {
             if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
                 if !tensor_ptr.is_null() {
                     unsafe {
-                        (*tensor_ptr).data =
-                            pool_base.add(slot_offsets[i]) as *mut c_void;
+                        (*tensor_ptr).data = pool_base.add(slot_offsets[i]) as *mut c_void;
                     }
                 }
             }
@@ -1126,8 +1121,10 @@ impl PrefetchState {
 
         if tracing_on {
             let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
-            self.trace
-                .record(TraceEvent::LayerStall { layer: layer_idx, wait_ms });
+            self.trace.record(TraceEvent::LayerStall {
+                layer: layer_idx,
+                wait_ms,
+            });
         }
     }
 
@@ -1154,8 +1151,7 @@ impl PrefetchState {
             if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
                 if !tensor_ptr.is_null() {
                     unsafe {
-                        (*tensor_ptr).data =
-                            pool_base.add(slot_offsets[i]) as *mut c_void;
+                        (*tensor_ptr).data = pool_base.add(slot_offsets[i]) as *mut c_void;
                     }
                 }
             }
@@ -1340,8 +1336,7 @@ impl PrefetchState {
                 if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
                     if !tensor_ptr.is_null() {
                         unsafe {
-                            (*tensor_ptr).data =
-                                self.resident_ffn_base.add(offset) as *mut c_void;
+                            (*tensor_ptr).data = self.resident_ffn_base.add(offset) as *mut c_void;
                         }
                     }
                 }
@@ -1374,8 +1369,7 @@ impl PrefetchState {
             if let Some(&tensor_ptr) = self.fused_tensor_ptrs.get(&layout.tensor_name) {
                 if !tensor_ptr.is_null() {
                     unsafe {
-                        (*tensor_ptr).data =
-                            pool.pool_base.add(slot_offsets[i]) as *mut c_void;
+                        (*tensor_ptr).data = pool.pool_base.add(slot_offsets[i]) as *mut c_void;
                     }
                 }
             }
@@ -1515,17 +1509,32 @@ impl PrefetchState {
                 total_stall_ms / stall_count as f64
             );
         }
-        println!("  Total I/O stall:      {:.1} ms ({:.0}%)",
+        println!(
+            "  Total I/O stall:      {:.1} ms ({:.0}%)",
             total_stall_ms,
-            if total_wall_ms > 0.0 { total_stall_ms / total_wall_ms * 100.0 } else { 0.0 }
+            if total_wall_ms > 0.0 {
+                total_stall_ms / total_wall_ms * 100.0
+            } else {
+                0.0
+            }
         );
-        println!("  Total decode (compute):{:.1} ms ({:.0}%)",
+        println!(
+            "  Total decode (compute):{:.1} ms ({:.0}%)",
             total_decode_ms,
-            if total_wall_ms > 0.0 { total_decode_ms / total_wall_ms * 100.0 } else { 0.0 }
+            if total_wall_ms > 0.0 {
+                total_decode_ms / total_wall_ms * 100.0
+            } else {
+                0.0
+            }
         );
-        println!("  Dead time (other):    {:.1} ms ({:.0}%)",
+        println!(
+            "  Dead time (other):    {:.1} ms ({:.0}%)",
             dead_ms,
-            if total_wall_ms > 0.0 { dead_ms / total_wall_ms * 100.0 } else { 0.0 }
+            if total_wall_ms > 0.0 {
+                dead_ms / total_wall_ms * 100.0
+            } else {
+                0.0
+            }
         );
         println!("  Layers released:      {release_count}");
         println!(
@@ -1669,7 +1678,10 @@ impl ExpertPool {
                     .min()
                     .unwrap_or(0);
                 self.release_layer(oldest);
-                let slot = self.free_slots.pop().expect("pool exhausted after eviction");
+                let slot = self
+                    .free_slots
+                    .pop()
+                    .expect("pool exhausted after eviction");
                 slots.push(slot);
             }
         }
@@ -1789,8 +1801,7 @@ impl HypuraBuftController {
         }
 
         *self.loading_scratch.lock().unwrap() = ptr;
-        self.loading_scratch_size
-            .store(aligned, Ordering::Relaxed);
+        self.loading_scratch_size.store(aligned, Ordering::Relaxed);
         tracing::info!(
             "Dense FFN scratch: {:.1} MB (redirects fread away from {:.1} GB loading buffer)",
             aligned as f64 / 1e6,
@@ -1798,7 +1809,10 @@ impl HypuraBuftController {
                 .iter()
                 .filter(|t| {
                     let role = TensorRole::from_name(&t.name);
-                    matches!(role, TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown)
+                    matches!(
+                        role,
+                        TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                    )
                 })
                 .map(|t| t.size_bytes)
                 .sum::<u64>() as f64
@@ -1838,10 +1852,11 @@ impl HypuraBuftController {
         let mut layer_regions: HashMap<u32, Vec<(usize, usize, u64)>> = HashMap::new();
         for loc in map.values() {
             if let Some(layer) = loc.layer_index {
-                layer_regions
-                    .entry(layer)
-                    .or_default()
-                    .push((loc.offset_in_buffer, loc.size, loc.file_offset));
+                layer_regions.entry(layer).or_default().push((
+                    loc.offset_in_buffer,
+                    loc.size,
+                    loc.file_offset,
+                ));
             }
         }
 
@@ -1866,10 +1881,7 @@ impl HypuraBuftController {
                     let forward: HashMap<u32, Vec<u32>> =
                         serde_json::from_str(&json).unwrap_or_default();
                     if !forward.is_empty() {
-                        tracing::info!(
-                            "Loaded expert permutations from {}",
-                            perm_path.display()
-                        );
+                        tracing::info!("Loaded expert permutations from {}", perm_path.display());
                     }
                     // Invert: forward[phys_pos] = logical_id → inverse[logical_id] = phys_pos
                     forward
@@ -1907,16 +1919,19 @@ impl HypuraBuftController {
             match role {
                 TensorRole::MoeFusedExperts if num_experts_total > 0 => {
                     let expert_stride = loc.size / num_experts_total as usize;
-                    expert_layouts.entry(layer_idx).or_default().push(ExpertLayout {
-                        tensor_name: tensor_info.name.clone(),
-                        layer_index: layer_idx,
-                        num_experts: num_experts_total,
-                        expert_stride,
-                        file_offset: loc.file_offset,
-                        buffer_offset: loc.offset_in_buffer,
-                        total_size: loc.size,
-                        expert_permutation: permutations.get(&layer_idx).cloned(),
-                    });
+                    expert_layouts
+                        .entry(layer_idx)
+                        .or_default()
+                        .push(ExpertLayout {
+                            tensor_name: tensor_info.name.clone(),
+                            layer_index: layer_idx,
+                            num_experts: num_experts_total,
+                            expert_stride,
+                            file_offset: loc.file_offset,
+                            buffer_offset: loc.offset_in_buffer,
+                            total_size: loc.size,
+                            expert_permutation: permutations.get(&layer_idx).cloned(),
+                        });
                 }
                 TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
                     if num_experts_total == 0 =>
@@ -1933,10 +1948,11 @@ impl HypuraBuftController {
                         });
                 }
                 _ => {
-                    non_expert_regions
-                        .entry(layer_idx)
-                        .or_default()
-                        .push((loc.offset_in_buffer, loc.size, loc.file_offset));
+                    non_expert_regions.entry(layer_idx).or_default().push((
+                        loc.offset_in_buffer,
+                        loc.size,
+                        loc.file_offset,
+                    ));
                 }
             }
         }
@@ -2071,10 +2087,12 @@ impl HypuraBuftController {
 
         // Initialize pool in C
         let ret = unsafe { hypura_sys::hypura_buffer_init_pool(buffer, pool_size) };
-        anyhow::ensure!(ret == 0, "Failed to allocate expert pool ({pool_size} bytes)");
+        anyhow::ensure!(
+            ret == 0,
+            "Failed to allocate expert pool ({pool_size} bytes)"
+        );
 
-        let pool_base =
-            unsafe { hypura_sys::hypura_buffer_get_pool_base(buffer) } as *mut u8;
+        let pool_base = unsafe { hypura_sys::hypura_buffer_get_pool_base(buffer) } as *mut u8;
         anyhow::ensure!(!pool_base.is_null(), "Pool base is null");
 
         // Rewrite tensor->data for all fused expert tensors to point into the pool.
@@ -2142,8 +2160,7 @@ impl HypuraBuftController {
         let ret = unsafe { hypura_sys::hypura_buffer_init_pool(buffer, pool_size) };
         anyhow::ensure!(ret == 0, "Failed to allocate FFN pool ({pool_size} bytes)");
 
-        let pool_base =
-            unsafe { hypura_sys::hypura_buffer_get_pool_base(buffer) } as *mut u8;
+        let pool_base = unsafe { hypura_sys::hypura_buffer_get_pool_base(buffer) } as *mut u8;
         anyhow::ensure!(!pool_base.is_null(), "Pool base is null");
 
         // Rewrite tensor->data for all FFN tensors to pool base (temporary valid address)
@@ -2189,7 +2206,10 @@ pub fn build_override_patterns(
     gguf: &GgufFile,
     buft_ptr: hypura_sys::ggml_backend_buffer_type_t,
     n_gpu_layers: i32,
-) -> (Vec<CString>, Vec<hypura_sys::llama_model_tensor_buft_override>) {
+) -> (
+    Vec<CString>,
+    Vec<hypura_sys::llama_model_tensor_buft_override>,
+) {
     // Streaming modes: only override tensors explicitly assigned to NVMe.
     // Non-streamed tensors in the same layer stay on Metal.
     // - ExpertStreaming: fused expert tensors on NVMe, attention/norms on Metal
@@ -2293,8 +2313,7 @@ fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
-            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
-            | '\\' => {
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
                 out.push('\\');
                 out.push(c);
             }
@@ -2360,7 +2379,9 @@ pub extern "C" fn eval_callback(
     if ask {
         state.ensure_layer_loaded(layer_idx);
     } else {
-        let prev = state.current_layer.swap(layer_idx as i32, Ordering::Relaxed);
+        let prev = state
+            .current_layer
+            .swap(layer_idx as i32, Ordering::Relaxed);
         let prev_layer = prev as u32;
 
         if prev >= 0 && prev_layer != layer_idx && prev_layer < layer_idx {
@@ -2383,11 +2404,19 @@ pub extern "C" fn eval_callback(
 
                 // Speculative expert prefetch with co-activation predictions
                 if state.expert_layouts.contains_key(&layer_idx) {
-                    if let Some(experts) =
-                        state.selected_experts.lock().unwrap().get(&layer_idx).cloned()
+                    if let Some(experts) = state
+                        .selected_experts
+                        .lock()
+                        .unwrap()
+                        .get(&layer_idx)
+                        .cloned()
                     {
                         // Record in co-activation matrix
-                        state.co_activation.lock().unwrap().record(layer_idx, &experts);
+                        state
+                            .co_activation
+                            .lock()
+                            .unwrap()
+                            .record(layer_idx, &experts);
 
                         // Record cross-layer correlation
                         {
@@ -2600,9 +2629,7 @@ fn eval_callback_expert_streaming(state: &PrefetchState, layer_idx: u32, ask: bo
 
                 for lookahead in 1..4 {
                     let target = layer_idx + lookahead;
-                    if target < state.num_layers
-                        && state.expert_layouts.contains_key(&target)
-                    {
+                    if target < state.num_layers && state.expert_layouts.contains_key(&target) {
                         state.request_prefetch(PrefetchRequest::ExpertSlices {
                             layer_idx: target,
                             expert_ids: prefetch_experts.clone(),
@@ -2750,10 +2777,7 @@ extern "C" fn on_tensor_init_cb(
     let role = TensorRole::from_name(&name_str);
     if matches!(
         role,
-        TensorRole::MoeFusedExperts
-            | TensorRole::FfnGate
-            | TensorRole::FfnUp
-            | TensorRole::FfnDown
+        TensorRole::MoeFusedExperts | TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
     ) {
         controller
             .tensor_ptrs

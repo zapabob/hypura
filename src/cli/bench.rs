@@ -23,6 +23,8 @@ pub fn run(
     force: bool,
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&str>,
+    rotation_policy: Option<&str>,
+    rotation_seed: u32,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
@@ -34,6 +36,8 @@ pub fn run(
         force,
         turboquant_mode,
         turboquant_config,
+        rotation_policy,
+        rotation_seed,
     ))
 }
 
@@ -46,6 +50,8 @@ async fn run_async(
     _force: bool,
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&str>,
+    _rotation_policy: Option<&str>,
+    _rotation_seed: u32,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     let prompt_text = prompt.unwrap_or(DEFAULT_PROMPT);
