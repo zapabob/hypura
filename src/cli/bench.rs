@@ -6,10 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use hypura::compute::ffi::SamplingParams;
 use hypura::compute::inference::*;
-use hypura::model::gguf::GgufFile;
-use hypura::model::metadata::ModelMetadata;
-use hypura::profiler;
-use hypura::scheduler::placement::{compute_placement_with_context, summarize_placement};
+use hypura::model::turboquant_sidecar::TurboQuantMode;
 use hypura::scheduler::types::StorageTier;
 use hypura::telemetry::metrics::TelemetryEmitter;
 
@@ -24,9 +21,20 @@ pub fn run(
     max_tokens: u32,
     prompt: Option<&str>,
     force: bool,
+    turboquant_mode: TurboQuantMode,
+    turboquant_config: Option<&str>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(model_path, baseline, context, max_tokens, prompt, force))
+    rt.block_on(run_async(
+        model_path,
+        baseline,
+        context,
+        max_tokens,
+        prompt,
+        force,
+        turboquant_mode,
+        turboquant_config,
+    ))
 }
 
 async fn run_async(
@@ -35,33 +43,21 @@ async fn run_async(
     context: u32,
     max_tokens: u32,
     prompt: Option<&str>,
-    force: bool,
+    _force: bool,
+    turboquant_mode: TurboQuantMode,
+    turboquant_config: Option<&str>,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
-    anyhow::ensure!(path.exists(), "Model file not found: {model_path}");
-
     let prompt_text = prompt.unwrap_or(DEFAULT_PROMPT);
+    let runtime = resolve_runtime_setup(
+        path,
+        context,
+        turboquant_mode,
+        turboquant_config.map(Path::new),
+    )?;
 
-    // Load hardware profile
-    let hardware = match profiler::load_cached_profile()? {
-        Some(p) if !profiler::is_profile_stale(&p) => p,
-        _ => {
-            println!("Running hardware profiler...");
-            let p = profiler::run_full_profile()?;
-            profiler::save_profile(&p)?;
-            p
-        }
-    };
-
-    // Parse model
-    let gguf = GgufFile::open(path)?;
-    let metadata = ModelMetadata::from_gguf(&gguf)?;
-    let plan = compute_placement_with_context(&gguf, &hardware, context)?;
-    let summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
-    let gpu_budget = compute_gpu_budget(&hardware, &metadata, context);
-    let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf, gpu_budget);
-
-    let has_nvme = plan
+    let has_nvme = runtime
+        .plan
         .tier_assignments
         .values()
         .any(|t| *t == StorageTier::Nvme);
@@ -78,25 +74,36 @@ async fn run_async(
     println!("{}", "─".repeat(56));
     println!(
         "  Model: {} ({} params, {}, {})",
-        metadata.architecture,
-        format_params(metadata.parameter_count),
-        metadata.quantization.as_deref().unwrap_or("unknown"),
-        format_bytes(gguf.total_tensor_bytes()),
+        runtime.metadata.architecture,
+        format_params(runtime.metadata.parameter_count),
+        runtime
+            .metadata
+            .quantization
+            .as_deref()
+            .unwrap_or("unknown"),
+        format_bytes(runtime.gguf.total_tensor_bytes()),
     );
     println!(
         "  Hardware: {}, {} unified",
-        hardware.cpu.model_name,
-        format_bytes(hardware.memory.total_bytes),
+        runtime.hardware.cpu.model_name,
+        format_bytes(runtime.hardware.memory.total_bytes),
     );
     println!(
         "  Placement: {} GPU | {} RAM | {} NVMe",
-        format_bytes(summary.total_gpu_bytes),
-        format_bytes(summary.total_ram_bytes),
-        format_bytes(summary.total_nvme_bytes),
+        format_bytes(runtime.placement_summary.total_gpu_bytes),
+        format_bytes(runtime.placement_summary.total_ram_bytes),
+        format_bytes(runtime.placement_summary.total_nvme_bytes),
     );
     println!(
         "  Config: context={}, max_tokens={}, n_gpu_layers={}",
-        context, max_tokens, n_gpu_layers,
+        context, max_tokens, runtime.n_gpu_layers,
+    );
+    println!(
+        "  TurboQuant: mode={}, schema={}, config={}, runtime_status={}",
+        runtime.turboquant.mode,
+        runtime.turboquant.schema_label(),
+        runtime.turboquant.source_label(),
+        turboquant_runtime_status(runtime.turboquant.mode, runtime.turboquant.config.is_some()),
     );
     println!();
 
@@ -104,8 +111,8 @@ async fn run_async(
     // The Hypura run is designed to handle models larger than RAM via NVMe scheduling —
     // that's the whole point. But the baseline (naive mmap) has no such mechanism and
     // will cause severe swap thrashing if the full model exceeds physical memory.
-    let model_total_bytes = gguf.total_tensor_bytes();
-    let total_ram = hardware.memory.total_bytes;
+    let model_total_bytes = runtime.gguf.total_tensor_bytes();
+    let total_ram = runtime.hardware.memory.total_bytes;
     let min_headroom: u64 = 4 * (1 << 30);
     let baseline_safe = model_total_bytes <= total_ram.saturating_sub(min_headroom);
 
@@ -127,7 +134,7 @@ async fn run_async(
         // This avoids Metal OOM while still providing a valid performance comparison.
         // The baseline will be slow (CPU matmul + swap pressure) but won't crash.
         let baseline_ngl = if baseline_safe {
-            n_gpu_layers
+            runtime.n_gpu_layers
         } else {
             0 // CPU-only: no Metal buffers, just mmap + CPU compute
         };
@@ -154,7 +161,14 @@ async fn run_async(
 
         let wall_start = Instant::now();
         let handle = tokio::task::spawn_blocking(move || {
-            generate_blocking(&path_c, &prompt_c, &config_c, baseline_ngl, token_tx, telemetry)
+            generate_blocking(
+                &path_c,
+                &prompt_c,
+                &config_c,
+                baseline_ngl,
+                token_tx,
+                telemetry,
+            )
         });
 
         // Drain tokens (discard output)
@@ -192,21 +206,34 @@ async fn run_async(
     } else {
         "Hypura (all in GPU+RAM)"
     };
-    println!("  {}: {run_label}", if run_baseline { "Run 2" } else { "Run" });
+    println!(
+        "  {}: {run_label}",
+        if run_baseline { "Run 2" } else { "Run" }
+    );
     println!("    Running...");
 
     let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
     let path_c = path.to_path_buf();
     let prompt_c = prompt_text.to_string();
     let config_c = config.clone();
-    let plan_c = Arc::new(plan.clone());
-    let gguf_c = Arc::new(gguf.clone());
+    let plan_c = Arc::new(runtime.plan.clone());
+    let gguf_c = Arc::new(runtime.gguf.clone());
+    let turboquant_c = Arc::new(runtime.turboquant.clone());
+    let n_gpu_layers = runtime.n_gpu_layers;
     let telemetry = Arc::new(TelemetryEmitter::new(64));
 
     let wall_start = Instant::now();
     let handle = tokio::task::spawn_blocking(move || {
         generate_with_nvme_scheduling(
-            &path_c, &prompt_c, &config_c, n_gpu_layers, &plan_c, &gguf_c, token_tx, telemetry,
+            &path_c,
+            &prompt_c,
+            &config_c,
+            n_gpu_layers,
+            &plan_c,
+            &gguf_c,
+            &turboquant_c,
+            token_tx,
+            telemetry,
         )
     });
 
@@ -230,31 +257,44 @@ async fn run_async(
         timestamp: chrono::Utc::now().to_rfc3339(),
         model: ModelInfo {
             name: filename.trim_end_matches(".gguf").to_string(),
-            architecture: metadata.architecture.clone(),
-            params: format_params(metadata.parameter_count),
-            quant: metadata.quantization.clone().unwrap_or_default(),
-            size_gb: gguf.total_tensor_bytes() as f64 / (1u64 << 30) as f64,
+            architecture: runtime.metadata.architecture.clone(),
+            params: format_params(runtime.metadata.parameter_count),
+            quant: runtime.metadata.quantization.clone().unwrap_or_default(),
+            size_gb: runtime.gguf.total_tensor_bytes() as f64 / (1u64 << 30) as f64,
         },
         hardware: HardwareInfo {
-            cpu: hardware.cpu.model_name.clone(),
-            ram_gb: hardware.memory.total_bytes as f64 / (1u64 << 30) as f64,
-            gpu: hardware.gpu.as_ref().map(|g| g.name.clone()).unwrap_or_default(),
-            nvme_seq_gbps: hardware
+            cpu: runtime.hardware.cpu.model_name.clone(),
+            ram_gb: runtime.hardware.memory.total_bytes as f64 / (1u64 << 30) as f64,
+            gpu: runtime
+                .hardware
+                .gpu
+                .as_ref()
+                .map(|g| g.name.clone())
+                .unwrap_or_default(),
+            nvme_seq_gbps: runtime
+                .hardware
                 .storage
                 .first()
                 .map(|s| s.sequential_read.peak_sequential as f64 / 1e9)
                 .unwrap_or(0.0),
         },
         placement: PlacementInfo {
-            gpu_gb: summary.total_gpu_bytes as f64 / (1u64 << 30) as f64,
-            ram_gb: summary.total_ram_bytes as f64 / (1u64 << 30) as f64,
-            nvme_gb: summary.total_nvme_bytes as f64 / (1u64 << 30) as f64,
+            gpu_gb: runtime.placement_summary.total_gpu_bytes as f64 / (1u64 << 30) as f64,
+            ram_gb: runtime.placement_summary.total_ram_bytes as f64 / (1u64 << 30) as f64,
+            nvme_gb: runtime.placement_summary.total_nvme_bytes as f64 / (1u64 << 30) as f64,
         },
         config: BenchConfig {
             context,
             max_tokens,
             prompt: prompt_text.to_string(),
-            n_gpu_layers,
+            n_gpu_layers: runtime.n_gpu_layers,
+            turboquant_mode: runtime.turboquant.mode.to_string(),
+            turboquant_schema: runtime.turboquant.schema_label().to_string(),
+            turboquant_runtime_status: turboquant_runtime_status(
+                runtime.turboquant.mode,
+                runtime.turboquant.config.is_some(),
+            )
+            .to_string(),
         },
         baseline: baseline_result.as_ref().map(|(r, wall)| RunResult {
             prompt_eval_ms: r.prompt_eval_ms,
@@ -268,15 +308,13 @@ async fn run_async(
             tokens_generated: hypura_result.tokens_generated,
             wall_time_ms: hypura_wall_ms,
         },
-        speedup: baseline_result
-            .as_ref()
-            .and_then(|(b, _)| {
-                if b.tok_per_sec_avg > 0.0 {
-                    Some(hypura_result.tok_per_sec_avg / b.tok_per_sec_avg)
-                } else {
-                    None
-                }
-            }),
+        speedup: baseline_result.as_ref().and_then(|(b, _)| {
+            if b.tok_per_sec_avg > 0.0 {
+                Some(hypura_result.tok_per_sec_avg / b.tok_per_sec_avg)
+            } else {
+                None
+            }
+        }),
     };
 
     save_benchmark_result(&bench_result)?;
@@ -292,8 +330,15 @@ fn print_run_result(_label: &str, result: &GenerationResult, wall_ms: f64) {
     } else {
         0.0
     };
-    println!("    Prompt eval:    {:.1}s ({:.1} tok/s)", result.prompt_eval_ms / 1000.0, prompt_tps);
-    println!("    Generation:     {:.1} tok/s ({} tokens)", result.tok_per_sec_avg, result.tokens_generated);
+    println!(
+        "    Prompt eval:    {:.1}s ({:.1} tok/s)",
+        result.prompt_eval_ms / 1000.0,
+        prompt_tps
+    );
+    println!(
+        "    Generation:     {:.1} tok/s ({} tokens)",
+        result.tok_per_sec_avg, result.tokens_generated
+    );
     println!("    Wall time:      {:.1}s", wall_ms / 1000.0);
     println!();
 }
@@ -342,6 +387,9 @@ struct BenchConfig {
     max_tokens: u32,
     prompt: String,
     n_gpu_layers: i32,
+    turboquant_mode: String,
+    turboquant_schema: String,
+    turboquant_runtime_status: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -410,4 +458,41 @@ fn update_readme(result: &BenchmarkResult) -> anyhow::Result<()> {
     std::fs::write(readme_path, content)?;
 
     Ok(())
+}
+
+fn turboquant_runtime_status(mode: TurboQuantMode, has_config: bool) -> &'static str {
+    if mode == TurboQuantMode::Exact {
+        "inactive"
+    } else if !has_config {
+        "unresolved"
+    } else if mode == TurboQuantMode::PaperFullKv {
+        "experimental-full-kv"
+    } else if has_config {
+        "faithful-attached"
+    } else {
+        "unresolved"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_config_serializes_turboquant_fields() {
+        let json = serde_json::to_value(BenchConfig {
+            context: 2048,
+            max_tokens: 32,
+            prompt: "hello".into(),
+            n_gpu_layers: 8,
+            turboquant_mode: "paper-key-only".into(),
+            turboquant_schema: "paper".into(),
+            turboquant_runtime_status: "faithful-attached".into(),
+        })
+        .unwrap();
+
+        assert_eq!(json["turboquant_mode"], "paper-key-only");
+        assert_eq!(json["turboquant_schema"], "paper");
+        assert_eq!(json["turboquant_runtime_status"], "faithful-attached");
+    }
 }

@@ -3,9 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hypura::compute::inference::*;
-use hypura::model::gguf::GgufFile;
-use hypura::profiler;
-use hypura::scheduler::placement::{compute_placement_with_context, summarize_placement};
+use hypura::model::turboquant_sidecar::TurboQuantMode;
 use hypura::scheduler::types::{PlacementSummary, StorageTier};
 use hypura::telemetry::metrics::TelemetryEmitter;
 
@@ -17,9 +15,19 @@ pub fn run(
     prompt: Option<&str>,
     interactive: bool,
     max_tokens: u32,
+    turboquant_mode: TurboQuantMode,
+    turboquant_config: Option<&str>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(model_path, context, prompt, interactive, max_tokens))
+    rt.block_on(run_async(
+        model_path,
+        context,
+        prompt,
+        interactive,
+        max_tokens,
+        turboquant_mode,
+        turboquant_config,
+    ))
 }
 
 async fn run_async(
@@ -28,36 +36,55 @@ async fn run_async(
     prompt: Option<&str>,
     interactive: bool,
     max_tokens: u32,
+    turboquant_mode: TurboQuantMode,
+    turboquant_config: Option<&str>,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
-    anyhow::ensure!(path.exists(), "Model file not found: {model_path}");
+    let runtime = resolve_runtime_setup(
+        path,
+        context,
+        turboquant_mode,
+        turboquant_config.map(Path::new),
+    )?;
 
-    // Load or create hardware profile
-    let hardware = match profiler::load_cached_profile()? {
-        Some(p) if !profiler::is_profile_stale(&p) => p,
-        _ => {
-            println!("No hardware profile found. Running profiler...");
-            let p = profiler::run_full_profile()?;
-            profiler::save_profile(&p)?;
-            p
-        }
-    };
-
-    // Parse GGUF header for placement
-    let gguf = GgufFile::open(path)?;
-    let plan = compute_placement_with_context(&gguf, &hardware, context)?;
-    let summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
-    let metadata = hypura::model::metadata::ModelMetadata::from_gguf(&gguf)?;
-    let gpu_budget = compute_gpu_budget(&hardware, &metadata, context);
-    let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf, gpu_budget);
-
-    let has_nvme = plan.tier_assignments.values().any(|t| *t == StorageTier::Nvme);
+    let has_nvme = runtime
+        .plan
+        .tier_assignments
+        .values()
+        .any(|t| *t == StorageTier::Nvme);
     if has_nvme {
-        println!("  NVMe scheduling: ENABLED ({} tensors on SSD)",
-            plan.tier_assignments.values().filter(|t| **t == StorageTier::Nvme).count());
+        println!(
+            "  NVMe scheduling: ENABLED ({} tensors on SSD)",
+            runtime
+                .plan
+                .tier_assignments
+                .values()
+                .filter(|t| **t == StorageTier::Nvme)
+                .count()
+        );
     }
 
-    print_placement_header(&summary, &plan, n_gpu_layers);
+    println!(
+        "  TurboQuant:    mode={}, schema={}, config={}, runtime_status={}",
+        runtime.turboquant.mode,
+        runtime.turboquant.schema_label(),
+        runtime.turboquant.source_label(),
+        if runtime.turboquant.mode == hypura::model::turboquant_sidecar::TurboQuantMode::Exact {
+            "inactive"
+        } else if runtime.turboquant.mode
+            == hypura::model::turboquant_sidecar::TurboQuantMode::PaperFullKv
+        {
+            "experimental-full-kv"
+        } else {
+            "faithful-attached"
+        }
+    );
+
+    print_placement_header(
+        &runtime.placement_summary,
+        &runtime.plan,
+        runtime.n_gpu_layers,
+    );
 
     let telemetry = Arc::new(TelemetryEmitter::new(256));
     let mut config = InferenceConfig {
@@ -67,15 +94,44 @@ async fn run_async(
     config.sampling.max_tokens = max_tokens;
 
     // Clone what we need for the blocking thread
-    let plan = Arc::new(plan);
-    let gguf = Arc::new(gguf);
+    let plan = Arc::new(runtime.plan.clone());
+    let gguf = Arc::new(runtime.gguf.clone());
+    let turboquant = Arc::new(runtime.turboquant.clone());
 
     if interactive {
-        run_interactive(path, &config, n_gpu_layers, &plan, &gguf, telemetry).await
+        run_interactive(
+            path,
+            &config,
+            runtime.n_gpu_layers,
+            &plan,
+            &gguf,
+            &turboquant,
+            telemetry,
+        )
+        .await
     } else if let Some(prompt_text) = prompt {
-        run_single_prompt(path, prompt_text, &config, n_gpu_layers, &plan, &gguf, telemetry).await
+        run_single_prompt(
+            path,
+            prompt_text,
+            &config,
+            runtime.n_gpu_layers,
+            &plan,
+            &gguf,
+            &turboquant,
+            telemetry,
+        )
+        .await
     } else {
-        run_interactive(path, &config, n_gpu_layers, &plan, &gguf, telemetry).await
+        run_interactive(
+            path,
+            &config,
+            runtime.n_gpu_layers,
+            &plan,
+            &gguf,
+            &turboquant,
+            telemetry,
+        )
+        .await
     }
 }
 
@@ -85,7 +141,8 @@ async fn run_single_prompt(
     config: &InferenceConfig,
     n_gpu_layers: i32,
     plan: &Arc<hypura::scheduler::types::PlacementPlan>,
-    gguf: &Arc<GgufFile>,
+    gguf: &Arc<hypura::model::gguf::GgufFile>,
+    turboquant: &Arc<hypura::model::turboquant_sidecar::ResolvedTurboQuantConfig>,
     telemetry: Arc<TelemetryEmitter>,
 ) -> anyhow::Result<()> {
     let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -95,6 +152,7 @@ async fn run_single_prompt(
     let config_clone = config.clone();
     let plan_clone = plan.clone();
     let gguf_clone = gguf.clone();
+    let turboquant_clone = turboquant.clone();
 
     println!("Loading model...");
     let handle = tokio::task::spawn_blocking(move || {
@@ -105,6 +163,7 @@ async fn run_single_prompt(
             n_gpu_layers,
             &plan_clone,
             &gguf_clone,
+            &turboquant_clone,
             token_tx,
             telemetry,
         )
@@ -131,7 +190,8 @@ async fn run_interactive(
     config: &InferenceConfig,
     n_gpu_layers: i32,
     plan: &Arc<hypura::scheduler::types::PlacementPlan>,
-    gguf: &Arc<GgufFile>,
+    gguf: &Arc<hypura::model::gguf::GgufFile>,
+    turboquant: &Arc<hypura::model::turboquant_sidecar::ResolvedTurboQuantConfig>,
     telemetry: Arc<TelemetryEmitter>,
 ) -> anyhow::Result<()> {
     println!("Hypura Interactive Mode");
@@ -167,10 +227,19 @@ async fn run_interactive(
         let telem = telemetry.clone();
         let plan_c = plan.clone();
         let gguf_c = gguf.clone();
+        let turboquant_c = turboquant.clone();
 
         let handle = tokio::task::spawn_blocking(move || {
             generate_with_nvme_scheduling(
-                &path, &prompt, &cfg, n_gpu_layers, &plan_c, &gguf_c, token_tx, telem,
+                &path,
+                &prompt,
+                &cfg,
+                n_gpu_layers,
+                &plan_c,
+                &gguf_c,
+                &turboquant_c,
+                token_tx,
+                telem,
             )
         });
 

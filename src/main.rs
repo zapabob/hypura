@@ -1,9 +1,14 @@
 mod cli;
 
 use clap::{Parser, Subcommand};
+use hypura::model::turboquant_sidecar::TurboQuantMode;
 
 #[derive(Parser)]
-#[command(name = "hypura", version, about = "Storage-tier-aware LLM inference scheduler")]
+#[command(
+    name = "hypura",
+    version,
+    about = "Storage-tier-aware LLM inference scheduler"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -38,6 +43,12 @@ enum Commands {
         /// Maximum tokens to generate
         #[arg(long, default_value = "512")]
         max_tokens: u32,
+        /// TurboQuant runtime mode
+        #[arg(long, value_enum, default_value_t = TurboQuantMode::Exact)]
+        turboquant_mode: TurboQuantMode,
+        /// Optional TurboQuant sidecar config path
+        #[arg(long)]
+        turboquant_config: Option<String>,
     },
     /// Start Ollama-compatible API server
     Serve {
@@ -52,6 +63,12 @@ enum Commands {
         /// Maximum context length
         #[arg(long, default_value = "4096")]
         context: u32,
+        /// TurboQuant runtime mode
+        #[arg(long, value_enum, default_value_t = TurboQuantMode::Exact)]
+        turboquant_mode: TurboQuantMode,
+        /// Optional TurboQuant sidecar config path
+        #[arg(long)]
+        turboquant_config: Option<String>,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -72,6 +89,12 @@ enum Commands {
         /// Force unsafe operations (e.g. baseline with model larger than RAM)
         #[arg(long)]
         force: bool,
+        /// TurboQuant runtime mode for the Hypura run
+        #[arg(long, value_enum, default_value_t = TurboQuantMode::Exact)]
+        turboquant_mode: TurboQuantMode,
+        /// Optional TurboQuant sidecar config path
+        #[arg(long)]
+        turboquant_config: Option<String>,
     },
     /// Print model metadata, tensor list, and placement plan
     Inspect {
@@ -115,8 +138,32 @@ fn main() -> anyhow::Result<()> {
             prompt,
             interactive,
             max_tokens,
-        } => cli::run::run(&model, context, prompt.as_deref(), interactive, max_tokens),
-        Commands::Serve { model, host, port, context } => cli::serve::run(&model, &host, port, context),
+            turboquant_mode,
+            turboquant_config,
+        } => cli::run::run(
+            &model,
+            context,
+            prompt.as_deref(),
+            interactive,
+            max_tokens,
+            turboquant_mode,
+            turboquant_config.as_deref(),
+        ),
+        Commands::Serve {
+            model,
+            host,
+            port,
+            context,
+            turboquant_mode,
+            turboquant_config,
+        } => cli::serve::run(
+            &model,
+            &host,
+            port,
+            context,
+            turboquant_mode,
+            turboquant_config.as_deref(),
+        ),
         Commands::Bench {
             model,
             baseline,
@@ -124,7 +171,18 @@ fn main() -> anyhow::Result<()> {
             max_tokens,
             prompt,
             force,
-        } => cli::bench::run(&model, baseline, context, max_tokens, prompt.as_deref(), force),
+            turboquant_mode,
+            turboquant_config,
+        } => cli::bench::run(
+            &model,
+            baseline,
+            context,
+            max_tokens,
+            prompt.as_deref(),
+            force,
+            turboquant_mode,
+            turboquant_config.as_deref(),
+        ),
         Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
         Commands::Iobench { model, read_gb } => cli::iobench::run(&model, read_gb),
         Commands::Optimize { model } => cli::optimize::run(&model),
