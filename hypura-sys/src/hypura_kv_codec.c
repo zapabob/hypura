@@ -249,6 +249,27 @@ int hypura_kv_codec_compress_k_vec(
     );
 }
 
+int hypura_kv_codec_compress_v_vec(
+    hypura_kv_codec_runtime_t *runtime,
+    uint32_t layer,
+    uint32_t head,
+    uint32_t token_pos,
+    const float *v_data,
+    float *output
+) {
+    if (!runtime || !runtime->config.compress_v) return -1;
+
+    return runtime->config.compress_v(
+        runtime->config.rust_ctx,
+        layer,
+        head,
+        token_pos,
+        v_data,
+        runtime->config.head_dim,
+        output
+    );
+}
+
 int hypura_kv_codec_score_k_vec(
     const hypura_kv_codec_runtime_t *runtime,
     uint32_t layer,
@@ -269,5 +290,26 @@ int hypura_kv_codec_score_k_vec(
         token_start,
         token_end,
         scores
+    );
+}
+
+int hypura_kv_codec_read_v_vec(
+    const hypura_kv_codec_runtime_t *runtime,
+    uint32_t layer,
+    uint32_t head,
+    uint32_t token_start,
+    uint32_t token_end,
+    float *v_buffer
+) {
+    if (!runtime || !runtime->config.read_v) return -1;
+
+    return runtime->config.read_v(
+        runtime->config.rust_ctx,
+        layer,
+        head,
+        runtime->config.head_dim,
+        token_start,
+        token_end,
+        v_buffer
     );
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::ffi::{c_void, CStr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::cache::kv_codec::{build_kv_codec, KvCodec};
+use crate::cache::kv_codec_ffi::KvCodecRuntimeBridge;
 use crate::compute::ffi::*;
 use crate::compute::nvme_backend::{
     build_override_patterns, eval_callback, HypuraBuftController, LayerStatus, PrefetchState,
@@ -124,7 +126,8 @@ pub struct TurboQuantRuntimeLayout {
 pub struct TurboQuantRuntimeSession {
     mode: TurboQuantMode,
     layout: TurboQuantRuntimeLayout,
-    codec: Mutex<Box<dyn KvCodec + Send>>,
+    runtime_path: TurboQuantRuntimePath,
+    codec: RuntimeCodecEngine,
     query_vectors: Mutex<HashMap<(u32, u32, u32), Vec<f32>>>,
     softmax_weights: Mutex<HashMap<(u32, u32, u32), Vec<f32>>>,
     next_token_index: AtomicU32,
@@ -137,6 +140,68 @@ pub struct TurboQuantRuntimeSession {
     kqv_callback_hits: AtomicU32,
     kq_overwrites: AtomicU32,
     kqv_overwrites: AtomicU32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TurboQuantRuntimePath {
+    RustDirectCallback,
+    CCodecFfi,
+}
+
+impl TurboQuantRuntimePath {
+    fn as_str(self) -> &'static str {
+        match self {
+            TurboQuantRuntimePath::RustDirectCallback => "RustDirectCallback",
+            TurboQuantRuntimePath::CCodecFfi => "CCodecFfi",
+        }
+    }
+}
+
+enum RuntimeCodecEngine {
+    Rust(Mutex<Box<dyn KvCodec + Send>>),
+    Cffi(Mutex<KvCodecRuntimeBridge>),
+}
+
+impl RuntimeCodecEngine {
+    fn ingest_k(&self, layer: u32, head: u32, token: u32, data: &[f32]) -> anyhow::Result<Vec<f32>> {
+        match self {
+            RuntimeCodecEngine::Rust(codec) => codec.lock().unwrap().ingest_k(layer, head, token, data),
+            RuntimeCodecEngine::Cffi(codec) => codec.lock().unwrap().compress_k(layer, head, token, data),
+        }
+    }
+
+    fn ingest_v(&self, layer: u32, head: u32, token: u32, data: &[f32]) -> anyhow::Result<Vec<f32>> {
+        match self {
+            RuntimeCodecEngine::Rust(codec) => codec.lock().unwrap().ingest_v(layer, head, token, data),
+            RuntimeCodecEngine::Cffi(codec) => codec.lock().unwrap().compress_v(layer, head, token, data),
+        }
+    }
+
+    fn score_k(
+        &self,
+        layer: u32,
+        head: u32,
+        query: &[f32],
+        token_range: std::ops::Range<u32>,
+    ) -> anyhow::Result<Vec<f32>> {
+        match self {
+            RuntimeCodecEngine::Rust(codec) => codec.lock().unwrap().score_k(layer, head, query, token_range),
+            RuntimeCodecEngine::Cffi(codec) => codec.lock().unwrap().score_k(layer, head, query, token_range),
+        }
+    }
+
+    fn read_v(
+        &self,
+        layer: u32,
+        head: u32,
+        token_range: std::ops::Range<u32>,
+        head_dim: usize,
+    ) -> anyhow::Result<Vec<f32>> {
+        match self {
+            RuntimeCodecEngine::Rust(codec) => codec.lock().unwrap().read_v(layer, head, token_range),
+            RuntimeCodecEngine::Cffi(codec) => codec.lock().unwrap().read_v(layer, head, token_range, head_dim),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -243,12 +308,14 @@ impl TurboQuantRuntimeSession {
     fn new(
         mode: TurboQuantMode,
         layout: TurboQuantRuntimeLayout,
-        codec: Box<dyn KvCodec + Send>,
+        runtime_path: TurboQuantRuntimePath,
+        codec: RuntimeCodecEngine,
     ) -> Self {
         Self {
             mode,
             layout,
-            codec: Mutex::new(codec),
+            runtime_path,
+            codec,
             query_vectors: Mutex::new(HashMap::new()),
             softmax_weights: Mutex::new(HashMap::new()),
             next_token_index: AtomicU32::new(0),
@@ -280,6 +347,10 @@ impl TurboQuantRuntimeSession {
 
     fn uses_full_kv(&self) -> bool {
         self.mode == TurboQuantMode::PaperFullKv
+    }
+
+    fn runtime_path(&self) -> TurboQuantRuntimePath {
+        self.runtime_path
     }
 
     fn observe_eval_callback(&self, tensor: *mut hypura_sys::ggml_tensor, ask: bool) {
@@ -361,7 +432,6 @@ impl TurboQuantRuntimeSession {
         if component == RuntimeTensorComponent::Score {
             let mut values = read_tensor_f32(tensor, shape.total_elements())?;
             let mut queries = self.query_vectors.lock().unwrap();
-            let codec = self.codec.lock().unwrap();
             let tracked_scores = shape.width();
 
             for token_offset in 0..tracked_tokens {
@@ -372,7 +442,8 @@ impl TurboQuantRuntimeSession {
                         continue;
                     };
                     let scores =
-                        codec.score_k(layer, head as u32, &query, 0..tracked_scores as u32)?;
+                        self.codec
+                            .score_k(layer, head as u32, &query, 0..tracked_scores as u32)?;
                     let range = tensor_vector_range(shape, token_in_stream, head, stream);
                     for (dst, src) in values[range].iter_mut().zip(scores.iter()) {
                         *dst = *src;
@@ -410,7 +481,6 @@ impl TurboQuantRuntimeSession {
 
             let mut values = read_tensor_f32(tensor, shape.total_elements())?;
             let mut weights = self.softmax_weights.lock().unwrap();
-            let codec = self.codec.lock().unwrap();
 
             for token_offset in 0..tracked_tokens {
                 let token = pending.start_token + token_offset as u32;
@@ -419,7 +489,12 @@ impl TurboQuantRuntimeSession {
                     let Some(attn) = weights.remove(&(layer, head as u32, token)) else {
                         continue;
                     };
-                    let read_back = codec.read_v(layer, head as u32, 0..attn.len() as u32)?;
+                    let read_back = self.codec.read_v(
+                        layer,
+                        head as u32,
+                        0..attn.len() as u32,
+                        tracked_dim,
+                    )?;
                     if read_back.is_empty() {
                         continue;
                     }
@@ -446,7 +521,6 @@ impl TurboQuantRuntimeSession {
         }
 
         let mut values = read_tensor_f32(tensor, shape.total_elements())?;
-        let mut codec = self.codec.lock().unwrap();
 
         for token_offset in 0..tracked_tokens {
             let token = pending.start_token + token_offset as u32;
@@ -458,10 +532,10 @@ impl TurboQuantRuntimeSession {
 
                 let transformed = match component {
                     RuntimeTensorComponent::Key => {
-                        codec.ingest_k(layer, head as u32, token, &vector)?
+                        self.codec.ingest_k(layer, head as u32, token, &vector)?
                     }
                     RuntimeTensorComponent::Value => {
-                        codec.ingest_v(layer, head as u32, token, &vector)?
+                        self.codec.ingest_v(layer, head as u32, token, &vector)?
                     }
                     RuntimeTensorComponent::Query
                     | RuntimeTensorComponent::Score
@@ -529,10 +603,34 @@ fn build_turboquant_runtime_session(
         return Ok(None);
     };
 
-    let codec = build_kv_codec(turboquant)?;
+    let runtime_path = match env::var("HYPURA_TURBOQUANT_RUNTIME")
+        .unwrap_or_else(|_| "rust".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cffi" | "ffi" | "c" => TurboQuantRuntimePath::CCodecFfi,
+        _ => TurboQuantRuntimePath::RustDirectCallback,
+    };
+
+    let codec = match runtime_path {
+        TurboQuantRuntimePath::RustDirectCallback => {
+            RuntimeCodecEngine::Rust(Mutex::new(build_kv_codec(turboquant)?))
+        }
+        TurboQuantRuntimePath::CCodecFfi => {
+            RuntimeCodecEngine::Cffi(Mutex::new(KvCodecRuntimeBridge::new(turboquant)?))
+        }
+    };
+
+    tracing::info!(
+        "TurboQuant runtime path selected: {} (mode={})",
+        runtime_path.as_str(),
+        turboquant.mode
+    );
+
     Ok(Some(Arc::new(TurboQuantRuntimeSession::new(
         turboquant.mode,
         layout,
+        runtime_path,
         codec,
     ))))
 }
@@ -741,7 +839,7 @@ pub fn load_model(
 
     let model =
         LlamaModel::load_with_overrides(model_path, n_gpu_layers, true, overrides.as_ptr())?;
-
+        
     let num_layers = model.n_layers() as u32;
 
     let nvme_layers: std::collections::HashSet<u32> = gguf
@@ -970,8 +1068,9 @@ pub fn generate_from_loaded(
 
     if let Some(ref session) = turboquant_session {
         let stats = session.callback_hits();
-        tracing::debug!(
-            "TurboQuant request session complete: mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+        tracing::info!(
+            "TurboQuant request session complete: path={}, mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+            session.runtime_path().as_str(),
             session.mode(),
             stats.q_hits,
             stats.k_hits,
@@ -1265,8 +1364,9 @@ fn generate_blocking_internal(
 
     if let Some(ref session) = turboquant_session {
         let stats = session.callback_hits();
-        tracing::debug!(
-            "TurboQuant blocking session complete: mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+        tracing::info!(
+            "TurboQuant blocking session complete: path={}, mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+            session.runtime_path().as_str(),
             session.mode(),
             stats.q_hits,
             stats.k_hits,
@@ -1828,8 +1928,9 @@ pub fn generate_with_nvme_scheduling(
 
     if let Some(ref session) = turboquant_session {
         let stats = session.callback_hits();
-        tracing::debug!(
-            "TurboQuant NVMe session complete: mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+        tracing::info!(
+            "TurboQuant NVMe session complete: path={}, mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+            session.runtime_path().as_str(),
             session.mode(),
             stats.q_hits,
             stats.k_hits,

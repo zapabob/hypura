@@ -3,7 +3,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::cache::kv_codec::{build_kv_codec, KvCodec};
-use crate::model::turboquant_sidecar::ResolvedTurboQuantConfig;
+use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
 
 /// FFI bridge that connects Rust KvCodec to C callbacks for llama.cpp integration.
 ///
@@ -14,6 +14,16 @@ pub struct KvCodecFfi {
     num_layers: u32,
     num_kv_heads: u32,
     head_dim: u32,
+    compress_values: i32,
+}
+
+/// Owned C runtime wrapper for hypura_kv_codec.
+///
+/// Keeps the Rust callback state alive (`KvCodecFfi`) and exposes safe-ish
+/// methods for invoking the C shim entrypoints from Rust inference code.
+pub struct KvCodecRuntimeBridge {
+    ffi: KvCodecFfi,
+    runtime: *mut hypura_sys::hypura_kv_codec_runtime_t,
 }
 
 impl KvCodecFfi {
@@ -31,6 +41,11 @@ impl KvCodecFfi {
             num_layers,
             num_kv_heads,
             head_dim,
+            compress_values: if resolved.mode == TurboQuantMode::PaperFullKv {
+                1
+            } else {
+                0
+            },
         })
     }
 
@@ -43,6 +58,7 @@ impl KvCodecFfi {
             num_layers,
             num_kv_heads,
             head_dim,
+            compress_values: 0,
         }
     }
 
@@ -59,6 +75,7 @@ impl KvCodecFfi {
             num_layers: self.num_layers,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
+            compress_values: self.compress_values,
         }
     }
 
@@ -81,8 +98,122 @@ impl KvCodecFfi {
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
             compress_keys: 1,
-            compress_values: 0, // paper-key-only default
+            compress_values: self.compress_values,
             use_exact_score: 0,
+        }
+    }
+}
+
+impl KvCodecRuntimeBridge {
+    pub fn new(resolved: &ResolvedTurboQuantConfig) -> anyhow::Result<Self> {
+        let ffi = KvCodecFfi::new(resolved)?;
+        let cfg = unsafe { ffi.to_c_config() };
+        let runtime = unsafe { hypura_sys::hypura_kv_codec_runtime_create(&cfg) };
+        anyhow::ensure!(!runtime.is_null(), "failed to create hypura_kv_codec runtime");
+        Ok(Self { ffi, runtime })
+    }
+
+    pub fn mode_name(&self) -> &'static str {
+        self.ffi.codec_name()
+    }
+
+    pub fn compress_k(
+        &mut self,
+        layer: u32,
+        head: u32,
+        token: u32,
+        vector: &[f32],
+    ) -> anyhow::Result<Vec<f32>> {
+        let mut out = vec![0.0f32; vector.len()];
+        let rc = unsafe {
+            hypura_sys::hypura_kv_codec_compress_k_vec(
+                self.runtime,
+                layer,
+                head,
+                token,
+                vector.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        anyhow::ensure!(rc >= 0, "hypura_kv_codec_compress_k_vec failed");
+        Ok(out)
+    }
+
+    pub fn score_k(
+        &self,
+        layer: u32,
+        head: u32,
+        query: &[f32],
+        token_range: Range<u32>,
+    ) -> anyhow::Result<Vec<f32>> {
+        let n_tokens = token_range.end.saturating_sub(token_range.start) as usize;
+        let mut scores = vec![0.0f32; n_tokens];
+        let rc = unsafe {
+            hypura_sys::hypura_kv_codec_score_k_vec(
+                self.runtime,
+                layer,
+                head,
+                query.as_ptr(),
+                token_range.start,
+                token_range.end,
+                scores.as_mut_ptr(),
+            )
+        };
+        anyhow::ensure!(rc >= 0, "hypura_kv_codec_score_k_vec failed");
+        Ok(scores)
+    }
+
+    pub fn compress_v(
+        &mut self,
+        layer: u32,
+        head: u32,
+        token: u32,
+        vector: &[f32],
+    ) -> anyhow::Result<Vec<f32>> {
+        let mut out = vec![0.0f32; vector.len()];
+        let rc = unsafe {
+            hypura_sys::hypura_kv_codec_compress_v_vec(
+                self.runtime,
+                layer,
+                head,
+                token,
+                vector.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        anyhow::ensure!(rc >= 0, "hypura_kv_codec_compress_v_vec failed");
+        Ok(out)
+    }
+
+    pub fn read_v(
+        &self,
+        layer: u32,
+        head: u32,
+        token_range: Range<u32>,
+        head_dim: usize,
+    ) -> anyhow::Result<Vec<f32>> {
+        let n_tokens = token_range.end.saturating_sub(token_range.start) as usize;
+        let mut v_buffer = vec![0.0f32; n_tokens.saturating_mul(head_dim)];
+        let rc = unsafe {
+            hypura_sys::hypura_kv_codec_read_v_vec(
+                self.runtime,
+                layer,
+                head,
+                token_range.start,
+                token_range.end,
+                v_buffer.as_mut_ptr(),
+            )
+        };
+        anyhow::ensure!(rc >= 0, "hypura_kv_codec_read_v_vec failed");
+        Ok(v_buffer)
+    }
+}
+
+impl Drop for KvCodecRuntimeBridge {
+    fn drop(&mut self) {
+        if !self.runtime.is_null() {
+            unsafe { hypura_sys::hypura_kv_codec_runtime_free(self.runtime) };
+            self.runtime = std::ptr::null_mut();
         }
     }
 }

@@ -155,6 +155,17 @@ int hypura_kv_codec_compress_k_vec(
     float *output
 );
 
+/* Compress a single V vector using the runtime codec.
+ * Returns 0 on success, -1 on error. */
+int hypura_kv_codec_compress_v_vec(
+    hypura_kv_codec_runtime_t *runtime,
+    uint32_t layer,
+    uint32_t head,
+    uint32_t token_pos,
+    const float *v_data,
+    float *output
+);
+
 /* Score query against compressed K vectors.
  * Returns 0 on success, -1 on error. */
 int hypura_kv_codec_score_k_vec(
@@ -165,6 +176,17 @@ int hypura_kv_codec_score_k_vec(
     uint32_t token_start,
     uint32_t token_end,
     float *scores
+);
+
+/* Read V vectors from runtime codec state.
+ * Returns 0 on success, -1 on error. */
+int hypura_kv_codec_read_v_vec(
+    const hypura_kv_codec_runtime_t *runtime,
+    uint32_t layer,
+    uint32_t head,
+    uint32_t token_start,
+    uint32_t token_end,
+    float *v_buffer
 );
 
 #ifdef __cplusplus
