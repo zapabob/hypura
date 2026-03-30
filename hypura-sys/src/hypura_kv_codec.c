@@ -43,7 +43,7 @@ struct ggml_tensor *hypura_op_compress_k(
     op_ctx->is_value = 0;
 
     /* Create custom op with same shape as input */
-    struct ggml_tensor *result = ggml_map_custom(
+    struct ggml_tensor *result = ggml_map_custom1(
         ctx,
         a,
         hypura_compress_k_compute,
@@ -66,7 +66,7 @@ struct ggml_tensor *hypura_op_compress_v(
     op_ctx->layer_idx = layer_idx;
     op_ctx->is_value = 1;
 
-    struct ggml_tensor *result = ggml_map_custom(
+    struct ggml_tensor *result = ggml_map_custom1(
         ctx,
         a,
         hypura_compress_v_compute,

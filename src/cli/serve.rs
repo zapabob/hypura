@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use std::sync::atomic::AtomicBool;
 
 use hypura::compute::inference;
 use hypura::model::turboquant_sidecar::TurboQuantMode;
@@ -17,7 +18,21 @@ pub fn run(
     turboquant_config: Option<&str>,
     _rotation_policy: Option<&str>,
     _rotation_seed: u32,
+    tq_so8_off: bool,
+    tq_so8_learned: bool,
+    tq_triality_off: bool,
+    tq_triality_mix: f32,
+    tq_rotation_seed: u32,
+    tq_artifact: Option<&str>,
 ) -> anyhow::Result<()> {
+    apply_turboquant_env(
+        tq_so8_off,
+        tq_so8_learned,
+        tq_triality_off,
+        tq_triality_mix,
+        tq_rotation_seed,
+        tq_artifact,
+    );
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
         model_path,
@@ -27,6 +42,35 @@ pub fn run(
         turboquant_mode,
         turboquant_config,
     ))
+}
+
+fn apply_turboquant_env(
+    tq_so8_off: bool,
+    tq_so8_learned: bool,
+    tq_triality_off: bool,
+    tq_triality_mix: f32,
+    tq_rotation_seed: u32,
+    tq_artifact: Option<&str>,
+) {
+    std::env::set_var("LLAMA_TURBOQUANT_SO8", if tq_so8_off { "0" } else { "1" });
+    std::env::set_var(
+        "LLAMA_TURBOQUANT_SO8_LEARNED",
+        if tq_so8_learned { "1" } else { "0" },
+    );
+    std::env::set_var(
+        "LLAMA_TURBOQUANT_TRIALITY",
+        if tq_triality_off { "0" } else { "1" },
+    );
+    std::env::set_var(
+        "LLAMA_TURBOQUANT_TRIALITY_MIX",
+        format!("{:.3}", tq_triality_mix.clamp(0.0, 1.0)),
+    );
+    std::env::set_var("LLAMA_TURBOQUANT_ROTATION_SEED", tq_rotation_seed.to_string());
+    if let Some(path) = tq_artifact {
+        if !path.trim().is_empty() {
+            std::env::set_var("LLAMA_TURBOQUANT_ARTIFACT", path.trim());
+        }
+    }
 }
 
 async fn run_async(
@@ -106,6 +150,8 @@ async fn run_async(
         load_duration_ns,
         telemetry,
         turboquant: runtime.turboquant,
+        active_cancel: Arc::new(std::sync::Mutex::new(None)),
+        generation_in_progress: Arc::new(AtomicBool::new(false)),
     });
 
     let app = routes::router(state.clone());

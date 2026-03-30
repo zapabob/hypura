@@ -7,3 +7,4 @@
 #include "gguf.h"
 #include "hypura_buft.h"
 #include "hypura_kv_codec.h"
+#include "hypura_sampler_ext.h"

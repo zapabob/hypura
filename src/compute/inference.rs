@@ -101,6 +101,9 @@ impl Drop for LoadedModel {
 pub struct GenerateFromLoadedParams<'a> {
     pub prompt: &'a str,
     pub sampling: &'a SamplingParams,
+    pub sampler_order: Option<&'a [i32]>,
+    pub stop_sequences: &'a [String],
+    pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub token_tx: mpsc::UnboundedSender<GeneratedToken>,
     pub telemetry: Arc<TelemetryEmitter>,
 }
@@ -945,6 +948,9 @@ pub fn generate_from_loaded(
     let GenerateFromLoadedParams {
         prompt,
         sampling,
+        sampler_order,
+        stop_sequences,
+        cancel_flag,
         token_tx,
         telemetry,
     } = params;
@@ -985,7 +991,7 @@ pub fn generate_from_loaded(
         )?
     };
 
-    let mut sampler = LlamaSampler::new(sampling);
+    let mut sampler = LlamaSampler::new_with_order(sampling, sampler_order);
 
     let tokens = loaded.model.tokenize(prompt, true);
     let prompt_len = tokens.len() as u32;
@@ -1016,6 +1022,11 @@ pub fn generate_from_loaded(
     let gen_start = Instant::now();
 
     for _ in 0..sampling.max_tokens {
+        if let Some(flag) = &cancel_flag {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+        }
         let token_id = sampler.sample(&mut ctx, -1);
         let is_eog = loaded.model.is_eog(token_id);
         let piece = loaded.model.token_to_piece(token_id);
@@ -1048,6 +1059,15 @@ pub fn generate_from_loaded(
         }
 
         if is_eog {
+            break;
+        }
+
+        if let Some(matched) = stop_sequences
+            .iter()
+            .find(|seq| !seq.is_empty() && generated_text.ends_with(seq.as_str()))
+        {
+            let trim_len = generated_text.len().saturating_sub(matched.len());
+            generated_text.truncate(trim_len);
             break;
         }
 

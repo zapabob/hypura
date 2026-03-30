@@ -9,8 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: i32,
+    pub top_a: f32,
     pub top_p: f32,
+    pub tfs: f32,
+    pub typical: f32,
     pub min_p: f32,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: i32,
     pub seed: u32,
     pub max_tokens: u32,
 }
@@ -20,8 +25,13 @@ impl Default for SamplingParams {
         Self {
             temperature: 0.8,
             top_k: 40,
+            top_a: 0.0,
             top_p: 0.9,
+            tfs: 1.0,
+            typical: 1.0,
             min_p: 0.05,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
             seed: 42,
             max_tokens: 512,
         }
@@ -424,25 +434,203 @@ pub struct LlamaSampler {
 impl LlamaSampler {
     /// Build a sampler chain from parameters.
     pub fn new(params: &SamplingParams) -> Self {
+        Self::new_with_order(params, None)
+    }
+
+    /// Build a sampler chain from parameters with optional Kobold sampler order.
+    /// Supported Kobold IDs:
+    /// 0=top_k, 1=top_a, 2=top_p, 3=tfs, 4=typical, 5=temperature, 6=repetition_penalty, 7=min_p.
+    pub fn new_with_order(params: &SamplingParams, sampler_order: Option<&[i32]>) -> Self {
         let chain_params = hypura_sys::llama_sampler_chain_params { no_perf: false };
         let ptr = unsafe { hypura_sys::llama_sampler_chain_init(chain_params) };
 
+        let mut added_top_k = false;
+        let mut added_top_a = false;
+        let mut added_top_p = false;
+        let mut added_tfs = false;
+        let mut added_typical = false;
+        let mut added_min_p = false;
+        let mut added_temp = false;
+        let mut added_pen = false;
+
         unsafe {
-            hypura_sys::llama_sampler_chain_add(
-                ptr,
-                hypura_sys::llama_sampler_init_top_k(params.top_k),
+            let apply_id = |id: i32,
+                                added_top_k: &mut bool,
+                                added_top_a: &mut bool,
+                                added_top_p: &mut bool,
+                                added_tfs: &mut bool,
+                                added_typical: &mut bool,
+                                added_min_p: &mut bool,
+                                added_temp: &mut bool,
+                                added_pen: &mut bool| {
+                match id {
+                    0 if !*added_top_k => {
+                        hypura_sys::llama_sampler_chain_add(
+                            ptr,
+                            hypura_sys::llama_sampler_init_top_k(params.top_k),
+                        );
+                        *added_top_k = true;
+                    }
+                    1 if !*added_top_a => {
+                        hypura_sys::llama_sampler_chain_add(
+                            ptr,
+                            hypura_sys::hypura_sampler_init_top_a(params.top_a, 1),
+                        );
+                        *added_top_a = true;
+                    }
+                    2 if !*added_top_p => {
+                        hypura_sys::llama_sampler_chain_add(
+                            ptr,
+                            hypura_sys::llama_sampler_init_top_p(params.top_p, 1),
+                        );
+                        *added_top_p = true;
+                    }
+                    3 if !*added_tfs => {
+                        hypura_sys::llama_sampler_chain_add(
+                            ptr,
+                            hypura_sys::hypura_sampler_init_tfs_z(params.tfs, 1),
+                        );
+                        *added_tfs = true;
+                    }
+                    4 if !*added_typical => {
+                        hypura_sys::llama_sampler_chain_add(
+                            ptr,
+                            hypura_sys::llama_sampler_init_typical(params.typical, 1),
+                        );
+                        *added_typical = true;
+                    }
+                    5 if !*added_temp => {
+                        hypura_sys::llama_sampler_chain_add(
+                            ptr,
+                            hypura_sys::llama_sampler_init_temp(params.temperature),
+                        );
+                        *added_temp = true;
+                    }
+                    6 if !*added_pen => {
+                        hypura_sys::llama_sampler_chain_add(
+                            ptr,
+                            hypura_sys::llama_sampler_init_penalties(
+                                params.repeat_last_n,
+                                params.repeat_penalty,
+                                0.0,
+                                0.0,
+                            ),
+                        );
+                        *added_pen = true;
+                    }
+                    7 if !*added_min_p => {
+                        hypura_sys::llama_sampler_chain_add(
+                            ptr,
+                            hypura_sys::llama_sampler_init_min_p(params.min_p, 1),
+                        );
+                        *added_min_p = true;
+                    }
+                    _ => {}
+                }
+            };
+
+            if let Some(order) = sampler_order {
+                for id in order {
+                    apply_id(
+                        *id,
+                        &mut added_top_k,
+                        &mut added_top_a,
+                        &mut added_top_p,
+                        &mut added_tfs,
+                        &mut added_typical,
+                        &mut added_min_p,
+                        &mut added_temp,
+                        &mut added_pen,
+                    );
+                }
+            }
+            apply_id(
+                0,
+                &mut added_top_k,
+                &mut added_top_a,
+                &mut added_top_p,
+                &mut added_tfs,
+                &mut added_typical,
+                &mut added_min_p,
+                &mut added_temp,
+                &mut added_pen,
             );
-            hypura_sys::llama_sampler_chain_add(
-                ptr,
-                hypura_sys::llama_sampler_init_top_p(params.top_p, 1),
+            apply_id(
+                1,
+                &mut added_top_k,
+                &mut added_top_a,
+                &mut added_top_p,
+                &mut added_tfs,
+                &mut added_typical,
+                &mut added_min_p,
+                &mut added_temp,
+                &mut added_pen,
             );
-            hypura_sys::llama_sampler_chain_add(
-                ptr,
-                hypura_sys::llama_sampler_init_min_p(params.min_p, 1),
+            apply_id(
+                3,
+                &mut added_top_k,
+                &mut added_top_a,
+                &mut added_top_p,
+                &mut added_tfs,
+                &mut added_typical,
+                &mut added_min_p,
+                &mut added_temp,
+                &mut added_pen,
             );
-            hypura_sys::llama_sampler_chain_add(
-                ptr,
-                hypura_sys::llama_sampler_init_temp(params.temperature),
+            apply_id(
+                4,
+                &mut added_top_k,
+                &mut added_top_a,
+                &mut added_top_p,
+                &mut added_tfs,
+                &mut added_typical,
+                &mut added_min_p,
+                &mut added_temp,
+                &mut added_pen,
+            );
+            apply_id(
+                2,
+                &mut added_top_k,
+                &mut added_top_a,
+                &mut added_top_p,
+                &mut added_tfs,
+                &mut added_typical,
+                &mut added_min_p,
+                &mut added_temp,
+                &mut added_pen,
+            );
+            apply_id(
+                7,
+                &mut added_top_k,
+                &mut added_top_a,
+                &mut added_top_p,
+                &mut added_tfs,
+                &mut added_typical,
+                &mut added_min_p,
+                &mut added_temp,
+                &mut added_pen,
+            );
+            apply_id(
+                6,
+                &mut added_top_k,
+                &mut added_top_a,
+                &mut added_top_p,
+                &mut added_tfs,
+                &mut added_typical,
+                &mut added_min_p,
+                &mut added_temp,
+                &mut added_pen,
+            );
+            apply_id(
+                5,
+                &mut added_top_k,
+                &mut added_top_a,
+                &mut added_top_p,
+                &mut added_tfs,
+                &mut added_typical,
+                &mut added_min_p,
+                &mut added_temp,
+                &mut added_pen,
             );
             hypura_sys::llama_sampler_chain_add(
                 ptr,

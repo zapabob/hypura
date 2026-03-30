@@ -108,6 +108,7 @@ fn main() {
     cc_build
         .file(src_dir.join("hypura_buft.c"))
         .file(src_dir.join("hypura_kv_codec.c"))
+        .file(src_dir.join("hypura_sampler_ext.c"))
         .include(llama_dir.join("include"))
         .include(llama_dir.join("ggml/include"))
         .include(&include_ggml_internal)
@@ -123,6 +124,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/hypura_buft.h");
     println!("cargo:rerun-if-changed=src/hypura_kv_codec.c");
     println!("cargo:rerun-if-changed=src/hypura_kv_codec.h");
+    println!("cargo:rerun-if-changed=src/hypura_sampler_ext.c");
+    println!("cargo:rerun-if-changed=src/hypura_sampler_ext.h");
 
     // ── Generate Rust bindings via bindgen ───────────────────────────────────
     let include_llama = llama_dir.join("include");

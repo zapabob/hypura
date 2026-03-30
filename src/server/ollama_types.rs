@@ -23,6 +23,9 @@ pub struct ChatRequest {
     /// Accepted but ignored for MVP.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
+    /// Ollama/OpenClaw compatibility flag (currently accepted and ignored).
+    #[serde(default)]
+    pub think: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,14 +38,77 @@ pub struct ChatMessage {
 pub struct GenerateOptions {
     pub temperature: Option<f32>,
     pub top_k: Option<i32>,
+    pub top_a: Option<f32>,
     pub top_p: Option<f32>,
+    pub tfs: Option<f32>,
+    pub typical: Option<f32>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub repeat_last_n: Option<i32>,
     pub num_predict: Option<u32>,
+    pub num_ctx: Option<u32>,
     pub seed: Option<u32>,
+    pub stop: Option<Vec<String>>,
+    pub sampler_order: Option<Vec<i32>>,
+    pub tq_so8_off: Option<bool>,
+    pub tq_so8_learned: Option<bool>,
+    pub tq_triality_off: Option<bool>,
+    pub tq_triality_mix: Option<f32>,
+    pub tq_rotation_seed: Option<u32>,
+    pub tq_artifact: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ShowRequest {
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+// ── KoboldCpp-compatible request/response types ──
+
+#[derive(Debug, Deserialize)]
+pub struct KoboldGenerateRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub max_length: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<i32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub rep_pen: Option<f32>,
+    #[serde(default)]
+    pub rep_pen_range: Option<i32>,
+    #[serde(default)]
+    pub stop_sequence: Option<Vec<String>>,
+    #[serde(default)]
+    pub sampler_order: Option<Vec<i32>>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub top_a: Option<f32>,
+    #[serde(default)]
+    pub tfs: Option<f32>,
+    #[serde(default)]
+    pub typical: Option<f32>,
+    #[serde(default)]
+    pub tq_so8_off: Option<bool>,
+    #[serde(default)]
+    pub tq_so8_learned: Option<bool>,
+    #[serde(default)]
+    pub tq_triality_off: Option<bool>,
+    #[serde(default)]
+    pub tq_triality_mix: Option<f32>,
+    #[serde(default)]
+    pub tq_rotation_seed: Option<u32>,
+    #[serde(default)]
+    pub tq_artifact: Option<String>,
 }
 
 // ── Response types ──
@@ -116,6 +182,31 @@ pub struct ModelDetails {
 pub struct ShowResponse {
     pub details: ModelDetails,
     pub model_info: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KoboldModelResponse {
+    pub result: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KoboldGenerateResponse {
+    pub results: Vec<KoboldGenerateResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KoboldGenerateResult {
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KoboldAbortResponse {
+    pub success: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KoboldTrueMaxContextLengthResponse {
+    pub value: u32,
 }
 
 fn default_true() -> bool {

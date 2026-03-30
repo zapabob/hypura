@@ -81,6 +81,24 @@ enum Commands {
         /// Rotation seed for deterministic rotation
         #[arg(long, default_value = "0")]
         rotation_seed: u32,
+        /// Disable SO8 runtime path for TurboQuant env bridge
+        #[arg(long)]
+        tq_so8_off: bool,
+        /// Enable learned SO8 runtime path for TurboQuant env bridge
+        #[arg(long)]
+        tq_so8_learned: bool,
+        /// Disable Triality runtime path for TurboQuant env bridge
+        #[arg(long)]
+        tq_triality_off: bool,
+        /// Triality mix coefficient for TurboQuant env bridge [0,1]
+        #[arg(long, default_value = "0.5")]
+        tq_triality_mix: f32,
+        /// Rotation seed for TurboQuant runtime env bridge
+        #[arg(long, default_value = "0")]
+        tq_rotation_seed: u32,
+        /// Optional TurboQuant artifact path for runtime env bridge
+        #[arg(long)]
+        tq_artifact: Option<String>,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -180,6 +198,12 @@ fn main() -> anyhow::Result<()> {
             turboquant_config,
             rotation_policy,
             rotation_seed,
+            tq_so8_off,
+            tq_so8_learned,
+            tq_triality_off,
+            tq_triality_mix,
+            tq_rotation_seed,
+            tq_artifact,
         } => cli::serve::run(
             &model,
             &host,
@@ -189,6 +213,12 @@ fn main() -> anyhow::Result<()> {
             turboquant_config.as_deref(),
             rotation_policy.map(|p| p.as_str().to_string()).as_deref(),
             rotation_seed,
+            tq_so8_off,
+            tq_so8_learned,
+            tq_triality_off,
+            tq_triality_mix,
+            tq_rotation_seed,
+            tq_artifact.as_deref(),
         ),
         Commands::Bench {
             model,
