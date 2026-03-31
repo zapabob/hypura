@@ -333,7 +333,7 @@ MIT
 
 ### 日本語
 
-- SemVer 更新: `hypura` / `hypura-sys` を `0.1.4` へ更新。
+- SemVer 更新: `hypura` を `0.1.4` へ更新（`hypura-sys` は `0.1.3` 維持）。
 - 互換継続: OpenClaw / EasyNovelAssistant 向け API 契約（`/api/show` `name` 受理、Kobold 互換導線）を維持。
 - GUI 強化: Kobold-lite に GGUF モデル切替 UI を追加（一覧取得、選択切替、現在モデル表示）。
 - 運用改善: 生成中はモデル切替を抑止し、切替事故を防止。
@@ -341,7 +341,7 @@ MIT
 
 ### English
 
-- SemVer bump: `hypura` / `hypura-sys` updated to `0.1.4`.
+- SemVer bump: `hypura` updated to `0.1.4` (`hypura-sys` remains `0.1.3`).
 - Compatibility continuity: OpenClaw / EasyNovelAssistant contracts preserved (`/api/show` with `name`, Kobold-compatible routes).
 - GUI uplift: Kobold-lite now supports GGUF model switching (list models, select/switch, active model status).
 - Operational safety: model switching is blocked while generation is in progress.
