@@ -237,7 +237,7 @@ Windows + RTX 3060 の安定化手順です。
 - 生成長だけを `64 -> 256 -> 512` へ段階的に上げる
 - どこかで不安定化したら直前の成功値へロールバックする
 
-### 実測（latest session, Windows 11 + RTX 3060）
+### 実測（latest session, Windows 11 + RTX 3060, v0.1.3）
 
 - `hypura run --context 4096 --max-tokens 32`:
   - Prompt eval: `6145.7 ms (1.1 tok/s)`
@@ -245,9 +245,9 @@ Windows + RTX 3060 の安定化手順です。
 - `hypura run --context 8192 --max-tokens 512`:
   - モデルロードと生成開始を確認（長文では処理時間が増加）
 - `hypura serve --context 4096` + proxy (`:5001`) の3連続疎通:
-  - `iter=1 gen_chars=28`
-  - `iter=2 gen_chars=26`
-  - `iter=3 gen_chars=40`
+  - `iter=1 gen_chars=89`
+  - `iter=2 gen_chars=35`
+  - `iter=3 gen_chars=56`
   - `/api/tags` と `/api/v1/model` は全試行で成功
 
 ### Kobold-lite / EasyNovelAssistant Staged Presets (safe 4096 -> 8192)
@@ -329,21 +329,21 @@ MIT
 このリポジトリのコードは私が自分で書いたものではありません。このプロジェクトは LLM を使って私の指示に基づいてタスクを実行するという探求です。NVMe を活用した推論はメモリの一形態として（低速ではあるが）十分に有効であるにもかかわらず、未活用であるという直感から始まりました。
 
 ---
-## Release 0.1.2 (Stable for RTX 3060/3080) / リリース 0.1.2（RTX 3060/3080 安定版）
+## Release 0.1.3 (Stable for RTX 3060/3080) / リリース 0.1.3（RTX 3060/3080 安定版）
 
 ### 日本語
 
-- 互換強化: OpenClaw / EasyNovelAssistant 向け API 互換を拡張（`/api/show` の `name` 受理、Kobold 互換系の実運用改善）。
-- GUI/CLI 同等化: Kobold GUI のパラメータと CLI 変換導線を整理。
-- 運用強化: ストリーミング終端メトリクス（`tok_per_sec_avg`, `prompt_eval_ms`）を追加。
-- 本リリースは Windows + RTX 3060/3080 の運用安定性を優先してパッケージ化。
+- SemVer 更新: `hypura` / `hypura-sys` を `0.1.3` へ更新。
+- 互換継続: OpenClaw / EasyNovelAssistant 向け API 契約（`/api/show` `name` 受理、Kobold 互換導線）を維持。
+- GUI 強化: Kobold-lite を Parity++ 化（段階プリセット、接続状態表示、生成中ロック、メトリクスカード）。
+- 実測更新: 4096/8192 段階運用で run と serve+proxy の安定性を再確認（3連続成功）。
 
 ### English
 
-- Compatibility: expanded API behavior for OpenClaw / EasyNovelAssistant (`name` accepted on `/api/show`, Kobold-compat improvements).
-- GUI/CLI parity: improved parameter parity and CLI bridge in Kobold-like GUI.
-- Operations: added stream-final metrics (`tok_per_sec_avg`, `prompt_eval_ms`) for observability.
-- This release artifact is packaged as a stability-focused build for Windows + RTX 3060/3080 workflows.
+- SemVer bump: `hypura` / `hypura-sys` updated to `0.1.3`.
+- Compatibility continuity: OpenClaw / EasyNovelAssistant contracts preserved (`/api/show` with `name`, Kobold-compatible routes).
+- GUI uplift: Kobold-lite upgraded to Parity++ (staged presets, connection state, generation lock, metrics cards).
+- Operational validation: staged 4096/8192 run/serve checks reconfirmed stable with 3 consecutive proxy passes.
 
 ---
 
