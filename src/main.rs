@@ -99,6 +99,12 @@ enum Commands {
         /// Optional TurboQuant artifact path for runtime env bridge
         #[arg(long)]
         tq_artifact: Option<String>,
+        /// Optional model directory used by Kobold-lite model selector
+        #[arg(long)]
+        model_dir: Option<String>,
+        /// Optional Kobold-lite theme hint (stored in env for UI)
+        #[arg(long, default_value = "classic")]
+        ui_theme: String,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -204,6 +210,8 @@ fn main() -> anyhow::Result<()> {
             tq_triality_mix,
             tq_rotation_seed,
             tq_artifact,
+            model_dir,
+            ui_theme,
         } => cli::serve::run(
             &model,
             &host,
@@ -219,6 +227,8 @@ fn main() -> anyhow::Result<()> {
             tq_triality_mix,
             tq_rotation_seed,
             tq_artifact.as_deref(),
+            model_dir.as_deref(),
+            &ui_theme,
         ),
         Commands::Bench {
             model,

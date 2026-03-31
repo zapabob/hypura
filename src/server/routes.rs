@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf};
+use std::collections::{HashMap, VecDeque};
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};
@@ -30,6 +31,10 @@ pub struct AppState {
     pub turboquant: ResolvedTurboQuantConfig,
     pub active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub generation_in_progress: Arc<AtomicBool>,
+    pub gui_presets: Arc<Mutex<HashMap<String, GuiPresetItem>>>,
+    pub gui_history: Arc<Mutex<VecDeque<GuiHistoryItem>>>,
+    pub gui_events: Arc<Mutex<VecDeque<GuiEventItem>>>,
+    pub ui_theme: Arc<Mutex<String>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -41,6 +46,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/kobold-lite", get(kobold_lite_gui_handler))
         .route("/api/extra/models", get(models_handler))
         .route("/api/extra/model/switch", post(model_switch_handler))
+        .route("/api/extra/presets/list", get(gui_presets_list_handler))
+        .route("/api/extra/presets/save", post(gui_presets_save_handler))
+        .route("/api/extra/presets/delete", post(gui_presets_delete_handler))
+        .route("/api/extra/history", get(gui_history_handler))
+        .route("/api/extra/events", get(gui_events_handler))
+        .route("/api/extra/ui-theme", get(ui_theme_get_handler))
+        .route("/api/extra/ui-theme", post(ui_theme_set_handler))
         .route("/api/generate", post(generate_handler))
         .route("/api/chat", post(chat_handler))
         .route("/api/v1/model", get(kobold_model_handler))
@@ -72,26 +84,99 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Hypura Kobold GUI</title>
   <style>
-    body { font-family: sans-serif; max-width: 1200px; margin: 1rem auto; padding: 0 1rem; }
-    textarea, input, select { width: 100%; box-sizing: border-box; margin-top: .3rem; margin-bottom: .7rem; }
+    :root {
+      --bg: #f1f2f5;
+      --panel: #ffffff;
+      --panel-soft: #fafafa;
+      --text: #1c1f23;
+      --muted: #5f6670;
+      --border: #d4d9e1;
+      --accent: #3254ff;
+      --ok: #1b8f3b;
+      --err: #b3261e;
+      --kbd: #eceff7;
+    }
+    body[data-theme="dark"] {
+      --bg: #101319;
+      --panel: #181d26;
+      --panel-soft: #202736;
+      --text: #e8edf6;
+      --muted: #a9b4c6;
+      --border: #2d3648;
+      --accent: #7ea2ff;
+      --ok: #61d889;
+      --err: #ff8f87;
+      --kbd: #252d3d;
+    }
+    body[data-theme="classic"] {
+      --bg: #efe7d2;
+      --panel: #f6f0e1;
+      --panel-soft: #ece2c8;
+      --text: #3f2f1f;
+      --muted: #685741;
+      --border: #b7a37f;
+      --accent: #7e4f2b;
+      --ok: #3d7a42;
+      --err: #9d3a2d;
+      --kbd: #e6d7b5;
+    }
+    body {
+      font-family: "Segoe UI", "Noto Sans JP", sans-serif;
+      max-width: 1380px;
+      margin: 1rem auto;
+      padding: 0 1rem;
+      color: var(--text);
+      background: var(--bg);
+    }
+    textarea, input, select {
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: .3rem;
+      margin-bottom: .7rem;
+      background: var(--panel-soft);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: .45rem .55rem;
+    }
     .row { display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap: .7rem; }
     .toolbar { display:flex; gap:.6rem; margin:.8rem 0; flex-wrap: wrap; }
-    .panel { border:1px solid #ddd; border-radius:8px; padding:.8rem; margin:.8rem 0; background:#fff; }
+    .panel { border:1px solid var(--border); border-radius:8px; padding:.8rem; margin:.8rem 0; background:var(--panel); }
     .layout { display:grid; grid-template-columns: 1.1fr 0.9fr; gap: .9rem; }
     .metrics-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:.5rem; }
-    .metric { border:1px solid #ddd; border-radius:8px; padding:.6rem; background:#fafafa; }
-    .metric .k { font-size:.78rem; color:#555; }
+    .metric { border:1px solid var(--border); border-radius:8px; padding:.6rem; background:var(--panel-soft); }
+    .metric .k { font-size:.78rem; color:var(--muted); }
     .metric .v { font-size:1.05rem; font-weight:600; }
-    .status { border-left:4px solid #999; padding:.5rem .7rem; background:#f7f7f7; margin:.6rem 0; }
-    .status.ok { border-left-color:#1b8f3b; background:#eefaf1; }
-    .status.err { border-left-color:#b3261e; background:#fdeeee; }
-    button { padding:.55rem .95rem; cursor:pointer; }
+    .status { border-left:4px solid var(--muted); padding:.5rem .7rem; background:var(--panel-soft); margin:.6rem 0; }
+    .status.ok { border-left-color:var(--ok); }
+    .status.err { border-left-color:var(--err); }
+    button {
+      padding:.55rem .95rem;
+      cursor:pointer;
+      border-radius:8px;
+      border:1px solid var(--border);
+      background: var(--panel-soft);
+      color: var(--text);
+    }
+    button:hover { border-color: var(--accent); }
     button[disabled] { opacity:.55; cursor:not-allowed; }
-    pre { white-space: pre-wrap; border:1px solid #ddd; padding:1rem; border-radius:6px; min-height:220px; background:#fff; }
+    pre { white-space: pre-wrap; border:1px solid var(--border); padding:1rem; border-radius:6px; min-height:220px; background:var(--panel); }
   </style>
 </head>
-<body>
+<body data-theme="classic">
   <h2>Hypura Kobold GUI (Parity++)</h2>
+  <div class="panel">
+    <div class="toolbar">
+      <label style="min-width:220px;">Theme
+        <select id="themeSelect" onchange="changeThemeFromSelect()">
+          <option value="light">light</option>
+          <option value="dark">dark</option>
+          <option value="classic">classic</option>
+        </select>
+      </label>
+      <span id="themeStatus">Theme source: initializing</span>
+    </div>
+  </div>
   <div id="connStatus" class="status">Connection: checking...</div>
   <div class="panel">
     <strong>GGUF Model Switcher</strong>
@@ -161,6 +246,18 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
       <label>sampler_order<input id="samplerOrder" type="text" value="6,0,1,3,4,2,5"></label>
     </div>
     <div class="row">
+      <label>mirostat<input id="mirostat" type="number" value="0"></label>
+      <label>mirostat_tau<input id="mirostatTau" type="number" step="0.01" value="5"></label>
+      <label>mirostat_eta<input id="mirostatEta" type="number" step="0.01" value="0.1"></label>
+      <label>dynatemp_range<input id="dynatempRange" type="number" step="0.01" value="0"></label>
+    </div>
+    <div class="row">
+      <label>dynatemp_exponent<input id="dynatempExponent" type="number" step="0.01" value="1"></label>
+      <label>smoothing_factor<input id="smoothingFactor" type="number" step="0.01" value="0"></label>
+      <label>presence_penalty<input id="presencePenalty" type="number" step="0.01" value="0"></label>
+      <label>frequency_penalty<input id="frequencyPenalty" type="number" step="0.01" value="0"></label>
+    </div>
+    <div class="row">
       <label>tq_so8_off<select id="tqSo8Off"><option value="">(default)</option><option value="1">true</option><option value="0">false</option></select></label>
       <label>tq_so8_learned<select id="tqSo8Learned"><option value="">(default)</option><option value="1">true</option><option value="0">false</option></select></label>
       <label>tq_triality_off<select id="tqTrialityOff"><option value="">(default)</option><option value="1">true</option><option value="0">false</option></select></label>
@@ -186,12 +283,30 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
   <pre id="out"></pre>
   </div>
   <div>
+  <div class="panel">
+  <strong>UI Mode</strong>
+  <div class="toolbar">
+    <button onclick="switchMode('chat')">Chat</button>
+    <button onclick="switchMode('instruct')">Instruct</button>
+    <button onclick="switchMode('story')">Storywriter</button>
+    <button onclick="switchMode('adventure')">Adventure</button>
+  </div>
+  <div id="uiMode">Mode: chat</div>
+  </div>
   <h3>Preset Diff</h3>
   <pre id="presetDiff"></pre>
+  <h3>Server Presets</h3>
+  <pre id="serverPresets"></pre>
+  <h3>Generation History</h3>
+  <pre id="genHistory"></pre>
+  <h3>Event Log</h3>
+  <pre id="eventLog"></pre>
   </div>
   </div>
   <script>
     const KEY = 'hypura_kobold_presets_v2';
+    const MODE_KEY = 'hypura_kobold_ui_mode';
+    const THEME_KEY = 'hypura_kobold_ui_theme';
     let lastRequest = null;
     let generationBusy = false;
     let latestError = '';
@@ -221,6 +336,14 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
         top_a: Number(document.getElementById('topa').value),
         tfs: Number(document.getElementById('tfs').value),
         typical: Number(document.getElementById('typical').value),
+        mirostat: Number(document.getElementById('mirostat').value),
+        mirostat_tau: Number(document.getElementById('mirostatTau').value),
+        mirostat_eta: Number(document.getElementById('mirostatEta').value),
+        dynatemp_range: Number(document.getElementById('dynatempRange').value),
+        dynatemp_exponent: Number(document.getElementById('dynatempExponent').value),
+        smoothing_factor: Number(document.getElementById('smoothingFactor').value),
+        presence_penalty: Number(document.getElementById('presencePenalty').value),
+        frequency_penalty: Number(document.getElementById('frequencyPenalty').value),
         sampler_order: parseSamplerOrder(document.getElementById('samplerOrder').value),
         stop_sequence: stop
       };
@@ -246,6 +369,14 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
       document.getElementById('topa').value = v.top_a ?? 0;
       document.getElementById('tfs').value = v.tfs ?? 1;
       document.getElementById('typical').value = v.typical ?? 1;
+      document.getElementById('mirostat').value = v.mirostat ?? 0;
+      document.getElementById('mirostatTau').value = v.mirostat_tau ?? 5;
+      document.getElementById('mirostatEta').value = v.mirostat_eta ?? 0.1;
+      document.getElementById('dynatempRange').value = v.dynatemp_range ?? 0;
+      document.getElementById('dynatempExponent').value = v.dynatemp_exponent ?? 1;
+      document.getElementById('smoothingFactor').value = v.smoothing_factor ?? 0;
+      document.getElementById('presencePenalty').value = v.presence_penalty ?? 0;
+      document.getElementById('frequencyPenalty').value = v.frequency_penalty ?? 0;
       document.getElementById('samplerOrder').value = (v.sampler_order ?? [6,0,1,3,4,2,5]).join(',');
       document.getElementById('stop').value = (v.stop_sequence ?? []).join('\n');
       document.getElementById('tqSo8Off').value = v.tq_so8_off === undefined ? '' : (v.tq_so8_off ? '1' : '0');
@@ -284,6 +415,57 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
         b.disabled = busy;
       }
       document.querySelector('button[onclick="abortGen()"]').disabled = !busy;
+    }
+
+    function switchMode(mode) {
+      localStorage.setItem(MODE_KEY, mode);
+      document.getElementById('uiMode').textContent = `Mode: ${mode}`;
+      const presets = {
+        chat: { temperature: 0.8, top_p: 0.92, max_length: 256 },
+        instruct: { temperature: 0.6, top_p: 0.9, max_length: 320 },
+        story: { temperature: 0.95, top_p: 0.96, max_length: 512 },
+        adventure: { temperature: 0.85, top_p: 0.94, max_length: 384 }
+      };
+      writeForm({ ...readForm(), ...(presets[mode] || presets.chat) });
+    }
+
+    function applyTheme(theme, source = 'local') {
+      const t = ['light', 'dark', 'classic'].includes(theme) ? theme : 'classic';
+      document.body.setAttribute('data-theme', t);
+      document.getElementById('themeSelect').value = t;
+      document.getElementById('themeStatus').textContent = `Theme source: ${source} (${t})`;
+      localStorage.setItem(THEME_KEY, t);
+    }
+
+    async function syncThemeFromServer() {
+      try {
+        const r = await fetch('/api/extra/ui-theme');
+        const j = await r.json();
+        const localTheme = localStorage.getItem(THEME_KEY);
+        if (localTheme) {
+          applyTheme(localTheme, 'local');
+        } else {
+          applyTheme(j.theme || 'classic', 'server');
+        }
+      } catch {
+        applyTheme(localStorage.getItem(THEME_KEY) || 'classic', 'fallback');
+      }
+    }
+
+    async function setThemeServer(theme) {
+      try {
+        await fetch('/api/extra/ui-theme', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ theme })
+        });
+      } catch {}
+    }
+
+    function changeThemeFromSelect() {
+      const theme = document.getElementById('themeSelect').value;
+      applyTheme(theme, 'ui');
+      setThemeServer(theme);
     }
 
     async function checkConnection() {
@@ -352,6 +534,14 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
       if (v.top_a !== undefined) args.push('--top-a', String(v.top_a));
       if (v.tfs !== undefined) args.push('--tfs', String(v.tfs));
       if (v.typical !== undefined) args.push('--typical', String(v.typical));
+      if (v.mirostat !== undefined) args.push('--mirostat', String(v.mirostat));
+      if (v.mirostat_tau !== undefined) args.push('--mirostat-tau', String(v.mirostat_tau));
+      if (v.mirostat_eta !== undefined) args.push('--mirostat-eta', String(v.mirostat_eta));
+      if (v.dynatemp_range !== undefined) args.push('--dynatemp-range', String(v.dynatemp_range));
+      if (v.dynatemp_exponent !== undefined) args.push('--dynatemp-exp', String(v.dynatemp_exponent));
+      if (v.smoothing_factor !== undefined) args.push('--smoothing-factor', String(v.smoothing_factor));
+      if (v.presence_penalty !== undefined) args.push('--presence-penalty', String(v.presence_penalty));
+      if (v.frequency_penalty !== undefined) args.push('--frequency-penalty', String(v.frequency_penalty));
       if (Array.isArray(v.sampler_order) && v.sampler_order.length > 0) args.push('--sampler-order', `"${v.sampler_order.join(',')}"`);
       if (Array.isArray(v.stop_sequence)) for (const s of v.stop_sequence) args.push('--stop', `"${s}"`);
       if (typeof v.tq_so8_off === 'boolean') args.push('--tq-so8-off', v.tq_so8_off ? 'true' : 'false');
@@ -383,6 +573,14 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
       out.top_a = asNum(read('--top-a'));
       out.tfs = asNum(read('--tfs'));
       out.typical = asNum(read('--typical'));
+      out.mirostat = asNum(read('--mirostat'));
+      out.mirostat_tau = asNum(read('--mirostat-tau'));
+      out.mirostat_eta = asNum(read('--mirostat-eta'));
+      out.dynatemp_range = asNum(read('--dynatemp-range'));
+      out.dynatemp_exponent = asNum(read('--dynatemp-exp'));
+      out.smoothing_factor = asNum(read('--smoothing-factor'));
+      out.presence_penalty = asNum(read('--presence-penalty'));
+      out.frequency_penalty = asNum(read('--frequency-penalty'));
       const order = read('--sampler-order');
       if (order) out.sampler_order = parseSamplerOrder(order);
       const tqSo8Off = read('--tq-so8-off');
@@ -429,6 +627,7 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
       const p = presets();
       p[name] = { ...readForm(), _meta: { version: 2, saved_at: new Date().toISOString() } };
       persist(p);
+      savePresetServer(name, p[name]);
     }
 
     function loadPreset() {
@@ -443,6 +642,47 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
       if (name && p[name]) {
         delete p[name];
         persist(p);
+        deletePresetServer(name);
+      }
+    }
+
+    async function savePresetServer(name, payload) {
+      try {
+        await fetch('/api/extra/presets/save', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ name, payload })
+        });
+        await refreshServerPanels();
+      } catch {}
+    }
+
+    async function deletePresetServer(name) {
+      try {
+        await fetch('/api/extra/presets/delete', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ name })
+        });
+        await refreshServerPanels();
+      } catch {}
+    }
+
+    async function refreshServerPanels() {
+      try {
+        const [presetRes, historyRes, eventRes] = await Promise.all([
+          fetch('/api/extra/presets/list'),
+          fetch('/api/extra/history'),
+          fetch('/api/extra/events')
+        ]);
+        const presetJson = await presetRes.json();
+        const historyJson = await historyRes.json();
+        const eventJson = await eventRes.json();
+        document.getElementById('serverPresets').textContent = JSON.stringify(presetJson, null, 2);
+        document.getElementById('genHistory').textContent = JSON.stringify(historyJson, null, 2);
+        document.getElementById('eventLog').textContent = JSON.stringify(eventJson, null, 2);
+      } catch (e) {
+        document.getElementById('eventLog').textContent = `[panel refresh error] ${String(e)}`;
       }
     }
 
@@ -483,6 +723,7 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
         document.getElementById('out').textContent = `[error] ${String(e)}`;
         setStatus(`Generate ERROR: ${String(e)}`, true);
       } finally {
+        await refreshServerPanels();
         setBusy(false);
       }
     }
@@ -534,6 +775,7 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
         document.getElementById('out').textContent += `\n\n[error] ${String(e)}`;
         setStatus(`Stream ERROR: ${String(e)}`, true);
       } finally {
+        await refreshServerPanels();
         setBusy(false);
       }
     }
@@ -559,8 +801,12 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
 
     refreshPresetList();
     setBusy(false);
+    syncThemeFromServer();
+    switchMode(localStorage.getItem(MODE_KEY) || 'chat');
     refreshModelList();
     checkConnection();
+    refreshServerPanels();
+    setInterval(refreshServerPanels, 5000);
   </script>
 </body>
 </html>"#,
@@ -679,6 +925,7 @@ async fn model_switch_handler(
     Json(req): Json<ModelSwitchRequest>,
 ) -> Response {
     if state.generation_in_progress.load(Ordering::Relaxed) {
+        push_gui_event(&state, "warn", "model switch rejected: generation in progress");
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "generation in progress; abort first" })),
@@ -688,6 +935,7 @@ async fn model_switch_handler(
 
     let next_model_path = PathBuf::from(req.path.trim());
     if !next_model_path.exists() {
+        push_gui_event(&state, "error", "model switch failed: model path does not exist");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "model path does not exist" })),
@@ -709,6 +957,7 @@ async fn model_switch_handler(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
+            push_gui_event(&state, "error", format!("model inspect failed: {e}"));
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("failed to inspect model: {e}") })),
@@ -716,6 +965,7 @@ async fn model_switch_handler(
                 .into_response();
         }
         Err(e) => {
+            push_gui_event(&state, "error", format!("model inspect task failed: {e}"));
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("runtime task failed: {e}") })),
@@ -727,6 +977,7 @@ async fn model_switch_handler(
     let file_size = match fs::metadata(&next_model_path) {
         Ok(m) => m.len(),
         Err(e) => {
+            push_gui_event(&state, "error", format!("model metadata read failed: {e}"));
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("failed to read model metadata: {e}") })),
@@ -771,6 +1022,7 @@ async fn model_switch_handler(
     {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
+            push_gui_event(&state, "error", format!("model load failed: {e}"));
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": format!("failed to load model: {e}") })),
@@ -778,6 +1030,7 @@ async fn model_switch_handler(
                 .into_response();
         }
         Err(e) => {
+            push_gui_event(&state, "error", format!("model load task failed: {e}"));
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("load task failed: {e}") })),
@@ -796,12 +1049,133 @@ async fn model_switch_handler(
     *state.gguf_info.lock().unwrap() = gguf_info;
 
     let model_name = state.model_name.lock().unwrap().clone();
+    push_gui_event(&state, "info", format!("model switched: {model_name} (ctx={context})"));
     Json(ModelSwitchResponse {
         success: true,
         model: model_name,
         context,
     })
     .into_response()
+}
+
+fn push_gui_event(state: &Arc<AppState>, level: &str, message: impl Into<String>) {
+    let mut events = state.gui_events.lock().unwrap();
+    events.push_front(GuiEventItem {
+        ts: now_rfc3339(),
+        level: level.to_string(),
+        message: message.into(),
+    });
+    while events.len() > 200 {
+        events.pop_back();
+    }
+}
+
+fn push_gui_history(
+    state: &Arc<AppState>,
+    mode: &str,
+    model: String,
+    prompt_chars: usize,
+    output_chars: usize,
+    tok_per_sec_avg: Option<f64>,
+    total_ms: u64,
+) {
+    let mut history = state.gui_history.lock().unwrap();
+    history.push_front(GuiHistoryItem {
+        ts: now_rfc3339(),
+        mode: mode.to_string(),
+        model,
+        prompt_chars,
+        output_chars,
+        tok_per_sec_avg,
+        total_ms,
+    });
+    while history.len() > 200 {
+        history.pop_back();
+    }
+}
+
+async fn gui_presets_list_handler(State(state): State<Arc<AppState>>) -> Json<GuiPresetListResponse> {
+    let mut presets: Vec<GuiPresetItem> = state.gui_presets.lock().unwrap().values().cloned().collect();
+    presets.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(GuiPresetListResponse { presets })
+}
+
+async fn gui_presets_save_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GuiPresetSaveRequest>,
+) -> Response {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "name is required" })),
+        )
+            .into_response();
+    }
+    state.gui_presets.lock().unwrap().insert(
+        name.to_string(),
+        GuiPresetItem {
+            name: name.to_string(),
+            payload: req.payload,
+            updated_at: now_rfc3339(),
+        },
+    );
+    push_gui_event(&state, "info", format!("preset saved: {name}"));
+    Json(serde_json::json!({ "success": true })).into_response()
+}
+
+async fn gui_presets_delete_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GuiPresetDeleteRequest>,
+) -> Response {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "name is required" })),
+        )
+            .into_response();
+    }
+    state.gui_presets.lock().unwrap().remove(name);
+    push_gui_event(&state, "info", format!("preset deleted: {name}"));
+    Json(serde_json::json!({ "success": true })).into_response()
+}
+
+async fn gui_history_handler(State(state): State<Arc<AppState>>) -> Json<GuiHistoryResponse> {
+    let items = state.gui_history.lock().unwrap().iter().cloned().collect();
+    Json(GuiHistoryResponse { items })
+}
+
+async fn gui_events_handler(State(state): State<Arc<AppState>>) -> Json<GuiEventsResponse> {
+    let items = state.gui_events.lock().unwrap().iter().cloned().collect();
+    Json(GuiEventsResponse { items })
+}
+
+async fn ui_theme_get_handler(State(state): State<Arc<AppState>>) -> Json<UiThemeResponse> {
+    Json(UiThemeResponse {
+        theme: state.ui_theme.lock().unwrap().clone(),
+    })
+}
+
+async fn ui_theme_set_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UiThemeUpdateRequest>,
+) -> Response {
+    let t = req.theme.trim().to_ascii_lowercase();
+    let next = match t.as_str() {
+        "light" | "dark" | "classic" => t,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "theme must be light|dark|classic" })),
+            )
+                .into_response()
+        }
+    };
+    *state.ui_theme.lock().unwrap() = next.clone();
+    std::env::set_var("HYPURA_UI_THEME", &next);
+    push_gui_event(&state, "info", format!("ui theme changed: {next}"));
+    Json(serde_json::json!({ "success": true, "theme": next })).into_response()
 }
 
 fn begin_generation(state: &Arc<AppState>) -> Arc<AtomicBool> {
@@ -843,6 +1217,7 @@ async fn generate_handler(
     let sampler_order = req.options.sampler_order.clone();
 
     tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
         let mut model = loaded.lock().unwrap();
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
@@ -857,10 +1232,21 @@ async fn generate_handler(
         end_generation(&state_for_task);
         match result {
             Ok(gen_result) => {
+                let model_name = state_for_task.model_name.lock().unwrap().clone();
+                push_gui_history(
+                    &state_for_task,
+                    "generate",
+                    model_name,
+                    prompt.chars().count(),
+                    gen_result.text.chars().count(),
+                    Some(gen_result.tok_per_sec_avg),
+                    started.elapsed().as_millis() as u64,
+                );
                 let _ = result_tx.send(gen_result);
             }
             Err(e) => {
                 tracing::error!("Generation error: {e}");
+                push_gui_event(&state_for_task, "error", format!("generate failed: {e}"));
             }
         }
     });
@@ -941,6 +1327,7 @@ async fn kobold_generate_handler(
     let state_for_task = state.clone();
 
     tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
         let mut model = loaded.lock().unwrap();
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
@@ -954,7 +1341,19 @@ async fn kobold_generate_handler(
         let result = crate::compute::inference::generate_from_loaded(&mut model, params);
         end_generation(&state_for_task);
         if let Ok(gen_result) = result {
+            let model_name = state_for_task.model_name.lock().unwrap().clone();
+            push_gui_history(
+                &state_for_task,
+                "kobold-generate",
+                model_name,
+                prompt.chars().count(),
+                gen_result.text.chars().count(),
+                Some(gen_result.tok_per_sec_avg),
+                started.elapsed().as_millis() as u64,
+            );
             let _ = result_tx.send(gen_result);
+        } else if let Err(e) = result {
+            push_gui_event(&state_for_task, "error", format!("kobold generate failed: {e}"));
         }
     });
 
@@ -1021,6 +1420,7 @@ async fn kobold_generate_stream_handler(
     let load_duration_ns = state.load_duration_ns;
 
     tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
         let mut model = loaded.lock().unwrap();
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
@@ -1034,7 +1434,19 @@ async fn kobold_generate_stream_handler(
         let result = crate::compute::inference::generate_from_loaded(&mut model, params);
         end_generation(&state_for_task);
         if let Ok(gen_result) = result {
+            let model_name_inner = state_for_task.model_name.lock().unwrap().clone();
+            push_gui_history(
+                &state_for_task,
+                "kobold-stream",
+                model_name_inner,
+                prompt.chars().count(),
+                gen_result.text.chars().count(),
+                Some(gen_result.tok_per_sec_avg),
+                started.elapsed().as_millis() as u64,
+            );
             let _ = result_tx.send(gen_result);
+        } else if let Err(e) = result {
+            push_gui_event(&state_for_task, "error", format!("kobold stream failed: {e}"));
         }
     });
 
@@ -1130,6 +1542,7 @@ async fn chat_handler(
     let sampler_order = req.options.sampler_order.clone();
 
     tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
         let mut model = loaded.lock().unwrap();
         let params = GenerateFromLoadedParams {
             prompt: &prompt,
@@ -1144,10 +1557,21 @@ async fn chat_handler(
         end_generation(&state_for_task);
         match result {
             Ok(gen_result) => {
+                let model_name = state_for_task.model_name.lock().unwrap().clone();
+                push_gui_history(
+                    &state_for_task,
+                    "chat",
+                    model_name,
+                    prompt.chars().count(),
+                    gen_result.text.chars().count(),
+                    Some(gen_result.tok_per_sec_avg),
+                    started.elapsed().as_millis() as u64,
+                );
                 let _ = result_tx.send(gen_result);
             }
             Err(e) => {
                 tracing::error!("Chat generation error: {e}");
+                push_gui_event(&state_for_task, "error", format!("chat failed: {e}"));
             }
         }
     });

@@ -50,6 +50,14 @@ pub struct GenerateOptions {
     pub seed: Option<u32>,
     pub stop: Option<Vec<String>>,
     pub sampler_order: Option<Vec<i32>>,
+    pub mirostat: Option<i32>,
+    pub mirostat_tau: Option<f32>,
+    pub mirostat_eta: Option<f32>,
+    pub dynatemp_range: Option<f32>,
+    pub dynatemp_exponent: Option<f32>,
+    pub smoothing_factor: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
     pub tq_so8_off: Option<bool>,
     pub tq_so8_learned: Option<bool>,
     pub tq_triality_off: Option<bool>,
@@ -97,6 +105,22 @@ pub struct KoboldGenerateRequest {
     pub tfs: Option<f32>,
     #[serde(default)]
     pub typical: Option<f32>,
+    #[serde(default)]
+    pub mirostat: Option<i32>,
+    #[serde(default)]
+    pub mirostat_tau: Option<f32>,
+    #[serde(default)]
+    pub mirostat_eta: Option<f32>,
+    #[serde(default)]
+    pub dynatemp_range: Option<f32>,
+    #[serde(default)]
+    pub dynatemp_exponent: Option<f32>,
+    #[serde(default)]
+    pub smoothing_factor: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub tq_so8_off: Option<bool>,
     #[serde(default)]
@@ -234,6 +258,67 @@ pub struct ModelSwitchResponse {
     pub success: bool,
     pub model: String,
     pub context: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuiPresetItem {
+    pub name: String,
+    pub payload: serde_json::Value,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GuiPresetListResponse {
+    pub presets: Vec<GuiPresetItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GuiPresetSaveRequest {
+    pub name: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GuiPresetDeleteRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GuiHistoryItem {
+    pub ts: String,
+    pub mode: String,
+    pub model: String,
+    pub prompt_chars: usize,
+    pub output_chars: usize,
+    pub tok_per_sec_avg: Option<f64>,
+    pub total_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GuiHistoryResponse {
+    pub items: Vec<GuiHistoryItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GuiEventItem {
+    pub ts: String,
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GuiEventsResponse {
+    pub items: Vec<GuiEventItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UiThemeResponse {
+    pub theme: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UiThemeUpdateRequest {
+    pub theme: String,
 }
 
 fn default_true() -> bool {

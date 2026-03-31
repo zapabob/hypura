@@ -329,23 +329,44 @@ MIT
 このリポジトリのコードは私が自分で書いたものではありません。このプロジェクトは LLM を使って私の指示に基づいてタスクを実行するという探求です。NVMe を活用した推論はメモリの一形態として（低速ではあるが）十分に有効であるにもかかわらず、未活用であるという直感から始まりました。
 
 ---
-## Release 0.1.4 (Stable for RTX 3060/3080) / リリース 0.1.4（RTX 3060/3080 安定版）
+## Release 0.2.0 (Theme-linked Kobold Parity) / リリース 0.2.0（テーマ連動Kobold同等化）
 
 ### 日本語
 
-- SemVer 更新: `hypura` を `0.1.4` へ更新（`hypura-sys` は `0.1.3` 維持）。
+- SemVer 更新: `hypura` を `0.2.0` へ更新（`hypura-sys` は `0.1.3` 維持）。
 - 互換継続: OpenClaw / EasyNovelAssistant 向け API 契約（`/api/show` `name` 受理、Kobold 互換導線）を維持。
-- GUI 強化: Kobold-lite に GGUF モデル切替 UI を追加（一覧取得、選択切替、現在モデル表示）。
-- 運用改善: 生成中はモデル切替を抑止し、切替事故を防止。
-- 実測更新: 4096/8192 段階運用で run と serve+proxy の安定性を継続確認（3連続成功）。
+- GUI 強化: `--ui-theme` と GUI テーマ切替（light/dark/classic）を完全連動。
+- Kobold風UI: モード切替・モデル選択・履歴/イベント監視をテーマ別に視認性最適化。
+- 運用改善: 生成中モデル切替抑止、サーバー側プリセット/履歴/イベントAPIで運用追跡を強化。
 
 ### English
 
-- SemVer bump: `hypura` updated to `0.1.4` (`hypura-sys` remains `0.1.3`).
+- SemVer bump: `hypura` updated to `0.2.0` (`hypura-sys` remains `0.1.3`).
 - Compatibility continuity: OpenClaw / EasyNovelAssistant contracts preserved (`/api/show` with `name`, Kobold-compatible routes).
-- GUI uplift: Kobold-lite now supports GGUF model switching (list models, select/switch, active model status).
-- Operational safety: model switching is blocked while generation is in progress.
-- Operational validation: staged 4096/8192 run/serve checks reconfirmed stable with 3 consecutive proxy passes.
+- GUI uplift: full theme linkage between CLI `--ui-theme` and GUI theme switcher (light/dark/classic).
+- Kobold-style UX: themed dashboard cards for mode switching, model switching, history, and event logs.
+- Operational safety: model switching remains blocked while generation is active.
+
+---
+
+## Kobold-lite Parity++ (v0.2.0)
+
+### 日本語
+
+- UIモード導線: `Chat` / `Instruct` / `Storywriter` / `Adventure` をワンクリック切替。
+- モデル運用: `/api/extra/models` + `/api/extra/model/switch` でGGUF一覧とライブ切替。
+- プリセット運用: ブラウザ保存に加えてサーバー側プリセットAPI（`/api/extra/presets/*`）を追加。
+- 可観測性: 生成履歴（`/api/extra/history`）とイベントログ（`/api/extra/events`）をGUIへ常時表示。
+- CLI追従: `serve` に `--model-dir` と `--ui-theme` を追加し、GUI運用と起動設定の整合を強化。
+
+### English
+
+- UI mode workflow: one-click switching for `Chat` / `Instruct` / `Storywriter` / `Adventure`.
+- Model operations: GGUF listing and live switching via `/api/extra/models` and `/api/extra/model/switch`.
+- Preset operations: server-side preset APIs (`/api/extra/presets/*`) in addition to browser-local presets.
+- Observability: generation history (`/api/extra/history`) and event logs (`/api/extra/events`) rendered directly in GUI.
+- CLI follow-up: `serve` supports `--model-dir` and `--ui-theme` for GUI/runtime alignment.
+- Theme linkage: GUI theme selector syncs with server theme APIs (`GET/POST /api/extra/ui-theme`) and CLI startup defaults.
 
 ---
 

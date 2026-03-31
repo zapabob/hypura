@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use std::sync::atomic::AtomicBool;
+use std::collections::{HashMap, VecDeque};
 
 use hypura::compute::inference;
 use hypura::model::turboquant_sidecar::TurboQuantMode;
@@ -24,6 +25,8 @@ pub fn run(
     tq_triality_mix: f32,
     tq_rotation_seed: u32,
     tq_artifact: Option<&str>,
+    model_dir: Option<&str>,
+    ui_theme: &str,
 ) -> anyhow::Result<()> {
     apply_turboquant_env(
         tq_so8_off,
@@ -33,6 +36,9 @@ pub fn run(
         tq_rotation_seed,
         tq_artifact,
     );
+    if !ui_theme.trim().is_empty() {
+        std::env::set_var("HYPURA_UI_THEME", ui_theme.trim());
+    }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
         model_path,
@@ -41,6 +47,7 @@ pub fn run(
         context,
         turboquant_mode,
         turboquant_config,
+        model_dir,
     ))
 }
 
@@ -80,6 +87,7 @@ async fn run_async(
     context: u32,
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&str>,
+    model_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     let runtime = inference::resolve_runtime_setup(
@@ -142,21 +150,31 @@ async fn run_async(
         .unwrap_or_else(|| loaded.model_name.clone());
 
     let telemetry = Arc::new(TelemetryEmitter::new(256));
+    let init_theme = std::env::var("HYPURA_UI_THEME")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| matches!(s.as_str(), "light" | "dark" | "classic"))
+        .unwrap_or_else(|| "classic".to_string());
 
     let state = Arc::new(AppState {
         loaded_model: Arc::new(std::sync::Mutex::new(loaded)),
         model_name: Arc::new(std::sync::Mutex::new(model_name.clone())),
         model_path: Arc::new(std::sync::Mutex::new(path.to_path_buf())),
         gguf_info: Arc::new(std::sync::Mutex::new(gguf_info)),
-        model_dir: path
-            .parent()
-            .map_or_else(|| std::path::PathBuf::from("."), |p| p.to_path_buf()),
+        model_dir: model_dir
+            .map(std::path::PathBuf::from)
+            .or_else(|| path.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
         default_context: context,
         load_duration_ns,
         telemetry,
         turboquant: runtime.turboquant,
         active_cancel: Arc::new(std::sync::Mutex::new(None)),
         generation_in_progress: Arc::new(AtomicBool::new(false)),
+        gui_presets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        gui_history: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+        gui_events: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+        ui_theme: Arc::new(std::sync::Mutex::new(init_theme)),
     });
 
     let app = routes::router(state.clone());
