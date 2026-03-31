@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use std::{fs, path::PathBuf};
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};
@@ -19,8 +20,11 @@ use crate::telemetry::metrics::TelemetryEmitter;
 
 pub struct AppState {
     pub loaded_model: Arc<std::sync::Mutex<LoadedModel>>,
-    pub model_name: String,
-    pub gguf_info: GgufInfo,
+    pub model_name: Arc<Mutex<String>>,
+    pub model_path: Arc<Mutex<PathBuf>>,
+    pub gguf_info: Arc<Mutex<GgufInfo>>,
+    pub model_dir: PathBuf,
+    pub default_context: u32,
     pub load_duration_ns: u64,
     pub telemetry: Arc<TelemetryEmitter>,
     pub turboquant: ResolvedTurboQuantConfig,
@@ -35,6 +39,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/tags", get(tags_handler))
         .route("/api/show", post(show_handler))
         .route("/kobold-lite", get(kobold_lite_gui_handler))
+        .route("/api/extra/models", get(models_handler))
+        .route("/api/extra/model/switch", post(model_switch_handler))
         .route("/api/generate", post(generate_handler))
         .route("/api/chat", post(chat_handler))
         .route("/api/v1/model", get(kobold_model_handler))
@@ -87,6 +93,15 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
 <body>
   <h2>Hypura Kobold GUI (Parity++)</h2>
   <div id="connStatus" class="status">Connection: checking...</div>
+  <div class="panel">
+    <strong>GGUF Model Switcher</strong>
+    <div class="toolbar">
+      <select id="modelList"></select>
+      <button onclick="refreshModelList()">Refresh Models</button>
+      <button onclick="switchModel()">Switch Model</button>
+    </div>
+    <div id="modelStatus">Model: -</div>
+  </div>
   <div class="toolbar">
     <button onclick="applyStage('short')">Stage: Short (4096/64)</button>
     <button onclick="applyStage('medium')">Stage: Medium (4096/256)</button>
@@ -265,7 +280,7 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
       generationBusy = busy;
       document.getElementById('busyState').textContent = `State: ${busy ? 'generating' : 'idle'}`;
       for (const b of document.querySelectorAll('button')) {
-        if (['Abort', 'Recheck Connection'].includes(b.textContent.trim())) continue;
+        if (['Abort', 'Recheck Connection', 'Refresh Models', 'Switch Model'].includes(b.textContent.trim())) continue;
         b.disabled = busy;
       }
       document.querySelector('button[onclick="abortGen()"]').disabled = !busy;
@@ -276,8 +291,51 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
         const r = await fetch('/api/v1/model');
         const j = await r.json();
         setStatus(`Connection OK: ${j.result || 'unknown model'}`, false);
+        document.getElementById('modelStatus').textContent = `Model: ${j.result || '-'}`;
       } catch (e) {
         setStatus(`Connection ERROR: ${String(e)}`, true);
+      }
+    }
+
+    async function refreshModelList() {
+      try {
+        const r = await fetch('/api/extra/models');
+        const j = await r.json();
+        const list = document.getElementById('modelList');
+        list.innerHTML = '';
+        for (const m of (j.models || [])) {
+          const opt = document.createElement('option');
+          opt.value = m.path;
+          opt.textContent = `${m.name}${m.selected ? ' (active)' : ''}`;
+          if (m.selected) opt.selected = true;
+          list.appendChild(opt);
+        }
+      } catch (e) {
+        setStatus(`Model list ERROR: ${String(e)}`, true);
+      }
+    }
+
+    async function switchModel() {
+      if (generationBusy) return;
+      const path = document.getElementById('modelList').value;
+      if (!path) return;
+      setBusy(true);
+      setStatus('Switching model...', false);
+      try {
+        const r = await fetch('/api/extra/model/switch', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ path })
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        setStatus(`Model switched: ${j.model} (context=${j.context})`, false);
+        document.getElementById('modelStatus').textContent = `Model: ${j.model}`;
+        await refreshModelList();
+      } catch (e) {
+        setStatus(`Switch ERROR: ${String(e)}`, true);
+      } finally {
+        setBusy(false);
       }
     }
 
@@ -501,6 +559,7 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
 
     refreshPresetList();
     setBusy(false);
+    refreshModelList();
     checkConnection();
   </script>
 </body>
@@ -509,17 +568,18 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
 }
 
 async fn tags_handler(State(state): State<Arc<AppState>>) -> Json<TagsResponse> {
-    let info = &state.gguf_info;
+    let info = state.gguf_info.lock().unwrap().clone();
+    let model_name = state.model_name.lock().unwrap().clone();
     Json(TagsResponse {
         models: vec![ModelTag {
-            name: state.model_name.clone(),
-            model: state.model_name.clone(),
+            name: model_name.clone(),
+            model: model_name,
             size: info.file_size,
             details: ModelDetails {
                 format: "gguf".into(),
-                family: info.architecture.clone(),
+                family: info.architecture,
                 parameter_size: format_parameter_size(info.parameter_count),
-                quantization_level: info.quantization.clone(),
+                quantization_level: info.quantization,
             },
         }],
     })
@@ -529,12 +589,13 @@ async fn show_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShowRequest>,
 ) -> Json<ShowResponse> {
-    let info = &state.gguf_info;
+    let info = state.gguf_info.lock().unwrap().clone();
+    let model_name = state.model_name.lock().unwrap().clone();
     let requested_model = req
         .name
         .as_deref()
         .or(req.model.as_deref())
-        .unwrap_or(state.model_name.as_str())
+        .unwrap_or(model_name.as_str())
         .to_string();
     Json(ShowResponse {
         details: ModelDetails {
@@ -560,9 +621,187 @@ async fn show_handler(
 }
 
 async fn kobold_model_handler(State(state): State<Arc<AppState>>) -> Json<KoboldModelResponse> {
+    let model_name = state.model_name.lock().unwrap().clone();
     Json(KoboldModelResponse {
-        result: state.model_name.clone(),
+        result: model_name,
     })
+}
+
+fn collect_gguf_models(model_dir: &PathBuf, active_path: &str) -> anyhow::Result<Vec<AvailableModelItem>> {
+    let mut models = Vec::new();
+    for entry in fs::read_dir(model_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_gguf = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+        if !is_gguf {
+            continue;
+        }
+        let full = path.to_string_lossy().to_string();
+        let name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| full.clone());
+        models.push(AvailableModelItem {
+            name,
+            selected: full.eq_ignore_ascii_case(active_path),
+            path: full,
+        });
+    }
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(models)
+}
+
+async fn models_handler(State(state): State<Arc<AppState>>) -> Response {
+    let active_path = state.model_path.lock().unwrap().to_string_lossy().to_string();
+    match collect_gguf_models(&state.model_dir, &active_path) {
+        Ok(models) => Json(AvailableModelsResponse {
+            models,
+            active_model_path: active_path,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to scan models: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn model_switch_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ModelSwitchRequest>,
+) -> Response {
+    if state.generation_in_progress.load(Ordering::Relaxed) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "generation in progress; abort first" })),
+        )
+            .into_response();
+    }
+
+    let next_model_path = PathBuf::from(req.path.trim());
+    if !next_model_path.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "model path does not exist" })),
+        )
+            .into_response();
+    }
+
+    let context = req.context.unwrap_or(state.default_context).max(256);
+    let path_for_setup = next_model_path.clone();
+    let setup = match tokio::task::spawn_blocking(move || {
+        crate::compute::inference::resolve_runtime_setup(
+            &path_for_setup,
+            context,
+            TurboQuantMode::Exact,
+            None,
+        )
+    })
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("failed to inspect model: {e}") })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("runtime task failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let file_size = match fs::metadata(&next_model_path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("failed to read model metadata: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let gguf_info = GgufInfo {
+        file_size,
+        architecture: setup.metadata.architecture.clone(),
+        parameter_count: setup.metadata.parameter_count,
+        quantization: setup
+            .metadata
+            .quantization
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
+        context_length: setup.metadata.context_length,
+    };
+
+    let config = crate::compute::inference::InferenceConfig {
+        n_ctx: context,
+        ..crate::compute::inference::InferenceConfig::default()
+    };
+    let n_gpu_layers = setup.n_gpu_layers;
+    let plan = setup.plan.clone();
+    let gguf = setup.gguf.clone();
+    let turboquant = setup.turboquant.clone();
+    let path_for_load = next_model_path.clone();
+
+    let loaded_next = match tokio::task::spawn_blocking(move || {
+        crate::compute::inference::load_model(
+            &path_for_load,
+            &config,
+            n_gpu_layers,
+            &plan,
+            &gguf,
+            &turboquant,
+        )
+    })
+    .await
+    {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("failed to load model: {e}") })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("load task failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut loaded_guard = state.loaded_model.lock().unwrap();
+    *loaded_guard = loaded_next;
+    drop(loaded_guard);
+
+    let next_model_name = state.loaded_model.lock().unwrap().model_name.clone();
+    *state.model_name.lock().unwrap() = next_model_name;
+    *state.model_path.lock().unwrap() = next_model_path;
+    *state.gguf_info.lock().unwrap() = gguf_info;
+
+    let model_name = state.model_name.lock().unwrap().clone();
+    Json(ModelSwitchResponse {
+        success: true,
+        model: model_name,
+        context,
+    })
+    .into_response()
 }
 
 fn begin_generation(state: &Arc<AppState>) -> Arc<AtomicBool> {
@@ -592,7 +831,7 @@ async fn generate_handler(
     let sampling = build_sampling(&req.options);
     let stop_sequences = req.options.stop.clone().unwrap_or_default();
     let prompt = req.prompt;
-    let model_name = state.model_name.clone();
+    let model_name = state.model_name.lock().unwrap().clone();
 
     let (token_tx, token_rx) = mpsc::unbounded_channel();
     let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
@@ -777,7 +1016,7 @@ async fn kobold_generate_stream_handler(
     let telemetry = state.telemetry.clone();
     let cancel_flag = begin_generation(&state);
     let state_for_task = state.clone();
-    let model_name = state.model_name.clone();
+    let model_name = state.model_name.lock().unwrap().clone();
     let request_start = Instant::now();
     let load_duration_ns = state.load_duration_ns;
 
@@ -864,7 +1103,7 @@ async fn kobold_true_max_context_length_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<KoboldTrueMaxContextLengthResponse> {
     Json(KoboldTrueMaxContextLengthResponse {
-        value: state.gguf_info.context_length,
+        value: state.gguf_info.lock().unwrap().context_length,
     })
 }
 
@@ -879,7 +1118,7 @@ async fn chat_handler(
     let sampling = build_sampling(&req.options);
     let stop_sequences = req.options.stop.clone().unwrap_or_default();
     let prompt = format_chat_prompt(&req.messages);
-    let model_name = state.model_name.clone();
+    let model_name = state.model_name.lock().unwrap().clone();
 
     let (token_tx, token_rx) = mpsc::unbounded_channel();
     let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();

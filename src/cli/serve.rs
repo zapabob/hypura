@@ -145,8 +145,13 @@ async fn run_async(
 
     let state = Arc::new(AppState {
         loaded_model: Arc::new(std::sync::Mutex::new(loaded)),
-        model_name: model_name.clone(),
-        gguf_info,
+        model_name: Arc::new(std::sync::Mutex::new(model_name.clone())),
+        model_path: Arc::new(std::sync::Mutex::new(path.to_path_buf())),
+        gguf_info: Arc::new(std::sync::Mutex::new(gguf_info)),
+        model_dir: path
+            .parent()
+            .map_or_else(|| std::path::PathBuf::from("."), |p| p.to_path_buf()),
+        default_context: context,
         load_duration_ns,
         telemetry,
         turboquant: runtime.turboquant,

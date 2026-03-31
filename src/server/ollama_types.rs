@@ -209,6 +209,33 @@ pub struct KoboldTrueMaxContextLengthResponse {
     pub value: u32,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AvailableModelItem {
+    pub name: String,
+    pub path: String,
+    pub selected: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AvailableModelsResponse {
+    pub models: Vec<AvailableModelItem>,
+    pub active_model_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelSwitchRequest {
+    pub path: String,
+    #[serde(default)]
+    pub context: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelSwitchResponse {
+    pub success: bool,
+    pub model: String,
+    pub context: u32,
+}
+
 fn default_true() -> bool {
     true
 }
