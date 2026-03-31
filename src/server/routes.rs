@@ -66,17 +66,49 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Hypura Kobold GUI</title>
   <style>
-    body { font-family: sans-serif; max-width: 1080px; margin: 1rem auto; padding: 0 1rem; }
+    body { font-family: sans-serif; max-width: 1200px; margin: 1rem auto; padding: 0 1rem; }
     textarea, input, select { width: 100%; box-sizing: border-box; margin-top: .3rem; margin-bottom: .7rem; }
     .row { display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap: .7rem; }
     .toolbar { display:flex; gap:.6rem; margin:.8rem 0; flex-wrap: wrap; }
-    .panel { border:1px solid #ddd; border-radius:8px; padding:.8rem; margin:.8rem 0; }
+    .panel { border:1px solid #ddd; border-radius:8px; padding:.8rem; margin:.8rem 0; background:#fff; }
+    .layout { display:grid; grid-template-columns: 1.1fr 0.9fr; gap: .9rem; }
+    .metrics-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:.5rem; }
+    .metric { border:1px solid #ddd; border-radius:8px; padding:.6rem; background:#fafafa; }
+    .metric .k { font-size:.78rem; color:#555; }
+    .metric .v { font-size:1.05rem; font-weight:600; }
+    .status { border-left:4px solid #999; padding:.5rem .7rem; background:#f7f7f7; margin:.6rem 0; }
+    .status.ok { border-left-color:#1b8f3b; background:#eefaf1; }
+    .status.err { border-left-color:#b3261e; background:#fdeeee; }
     button { padding:.55rem .95rem; cursor:pointer; }
-    pre { white-space: pre-wrap; border:1px solid #ddd; padding:1rem; border-radius:6px; min-height:220px; }
+    button[disabled] { opacity:.55; cursor:not-allowed; }
+    pre { white-space: pre-wrap; border:1px solid #ddd; padding:1rem; border-radius:6px; min-height:220px; background:#fff; }
   </style>
 </head>
 <body>
-  <h2>Hypura Kobold GUI (Parity+)</h2>
+  <h2>Hypura Kobold GUI (Parity++)</h2>
+  <div id="connStatus" class="status">Connection: checking...</div>
+  <div class="toolbar">
+    <button onclick="applyStage('short')">Stage: Short (4096/64)</button>
+    <button onclick="applyStage('medium')">Stage: Medium (4096/256)</button>
+    <button onclick="applyStage('long')">Stage: Long (8192/512)</button>
+    <button onclick="checkConnection()">Recheck Connection</button>
+  </div>
+  <div class="panel">
+    <strong>Runtime Metrics</strong>
+    <div class="metrics-grid">
+      <div class="metric"><div class="k">tok/s</div><div class="v" id="mTok">-</div></div>
+      <div class="metric"><div class="k">prompt ms</div><div class="v" id="mPrompt">-</div></div>
+      <div class="metric"><div class="k">eval count</div><div class="v" id="mEval">-</div></div>
+      <div class="metric"><div class="k">total ms</div><div class="v" id="mTotal">-</div></div>
+    </div>
+    <div class="toolbar">
+      <span id="busyState">State: idle</span>
+      <span id="lastSuccess">Last success: -</span>
+      <span id="tokenProgress">Progress: 0 token / 0 ms</span>
+    </div>
+  </div>
+  <div class="layout">
+  <div>
   <div class="panel">
     <label>Preset Name</label>
     <input id="presetName" type="text" placeholder="my-preset">
@@ -128,10 +160,6 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
     <label>stop_sequence (1行1個)</label>
     <textarea id="stop" rows="3"></textarea>
   </div>
-  <div class="panel">
-    <strong>Runtime Metrics</strong>
-    <div id="metrics">tok/s: -, eval_count: -, total_ms: -, prompt_ms: -</div>
-  </div>
   <div class="toolbar">
     <button onclick="generateOnce()">Generate</button>
     <button onclick="generateStream()">Generate Stream</button>
@@ -141,11 +169,17 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
   </div>
   <h3>Output</h3>
   <pre id="out"></pre>
+  </div>
+  <div>
   <h3>Preset Diff</h3>
   <pre id="presetDiff"></pre>
+  </div>
+  </div>
   <script>
     const KEY = 'hypura_kobold_presets_v2';
     let lastRequest = null;
+    let generationBusy = false;
+    let latestError = '';
 
     function parseSamplerOrder(v) {
       return v.split(',').map(x => Number(x.trim())).filter(x => Number.isInteger(x));
@@ -205,6 +239,46 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
       document.getElementById('tqTrialityMix').value = v.tq_triality_mix ?? '';
       document.getElementById('tqRotationSeed').value = v.tq_rotation_seed ?? '';
       document.getElementById('tqArtifact').value = v.tq_artifact ?? '';
+    }
+
+    function applyStage(stage) {
+      const stageMap = {
+        short: { max_length: 64, prompt: '短く挨拶して。' },
+        medium: { max_length: 256, prompt: '数段落で説明して。' },
+        long: { max_length: 512, prompt: '長めに説明して。' }
+      };
+      const cur = readForm();
+      const patch = stageMap[stage] || stageMap.short;
+      const contextHint = stage === 'long' ? '8192' : '4096';
+      writeForm({ ...cur, ...patch });
+      setStatus(`Preset applied: ${stage} (recommended context ${contextHint})`, false);
+    }
+
+    function setStatus(message, isError = false) {
+      const el = document.getElementById('connStatus');
+      el.textContent = message;
+      el.className = isError ? 'status err' : 'status ok';
+      if (isError) latestError = message;
+    }
+
+    function setBusy(busy) {
+      generationBusy = busy;
+      document.getElementById('busyState').textContent = `State: ${busy ? 'generating' : 'idle'}`;
+      for (const b of document.querySelectorAll('button')) {
+        if (['Abort', 'Recheck Connection'].includes(b.textContent.trim())) continue;
+        b.disabled = busy;
+      }
+      document.querySelector('button[onclick="abortGen()"]').disabled = !busy;
+    }
+
+    async function checkConnection() {
+      try {
+        const r = await fetch('/api/v1/model');
+        const j = await r.json();
+        setStatus(`Connection OK: ${j.result || 'unknown model'}`, false);
+      } catch (e) {
+        setStatus(`Connection ERROR: ${String(e)}`, true);
+      }
     }
 
     function toCliArgs(v) {
@@ -332,48 +406,77 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
     }
 
     async function generateOnce() {
+      if (generationBusy) return;
       const body = readForm();
       lastRequest = body;
       document.getElementById('out').textContent = 'Generating...';
-      const r = await fetch('/api/v1/generate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-      const j = await r.json();
-      document.getElementById('out').textContent = (j.results && j.results[0] ? j.results[0].text : JSON.stringify(j, null, 2));
+      setBusy(true);
+      const startedAt = performance.now();
+      try {
+        const r = await fetch('/api/v1/generate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        const j = await r.json();
+        const text = (j.results && j.results[0] ? j.results[0].text : JSON.stringify(j, null, 2));
+        document.getElementById('out').textContent = text;
+        document.getElementById('lastSuccess').textContent = `Last success: ${new Date().toLocaleTimeString()}`;
+        document.getElementById('mEval').textContent = String(text.length);
+        document.getElementById('mTotal').textContent = (performance.now() - startedAt).toFixed(1);
+        document.getElementById('tokenProgress').textContent = `Progress: ${text.length} chars / ${(performance.now() - startedAt).toFixed(0)} ms`;
+      } catch (e) {
+        document.getElementById('out').textContent = `[error] ${String(e)}`;
+        setStatus(`Generate ERROR: ${String(e)}`, true);
+      } finally {
+        setBusy(false);
+      }
     }
 
     async function generateStream() {
+      if (generationBusy) return;
       const body = { ...readForm(), stream: true };
       lastRequest = body;
       document.getElementById('out').textContent = '';
       const startedAt = performance.now();
-      const r = await fetch('/api/extra/generate/stream', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-      const reader = r.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      let tokenCount = 0;
-      let latestTokPerSec = null;
-      while (true) {
-        const {value, done} = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, {stream: true});
-        const lines = buf.split('\n');
-        buf = lines.pop();
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const obj = JSON.parse(line);
-            if (obj.token) {
-              tokenCount += 1;
-              latestTokPerSec = obj.tok_per_sec ?? latestTokPerSec;
-              document.getElementById('out').textContent += obj.token;
-            }
-            if (obj.done) {
-              const elapsedMs = Math.max(1, performance.now() - startedAt);
-              const tps = latestTokPerSec ?? ((tokenCount * 1000.0) / elapsedMs);
-              document.getElementById('metrics').textContent = `tok/s: ${tps.toFixed(2)}, eval_count: ${obj.eval_count ?? '-'}, total_ms: ${(obj.total_duration ? obj.total_duration / 1e6 : elapsedMs).toFixed(1)}, prompt_ms: ${obj.prompt_eval_ms ?? '-'}`;
-              document.getElementById('out').textContent += '\n\n[done]';
-            }
-          } catch {}
+      setBusy(true);
+      try {
+        const r = await fetch('/api/extra/generate/stream', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        let tokenCount = 0;
+        let latestTokPerSec = null;
+        while (true) {
+          const {value, done} = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, {stream: true});
+          const lines = buf.split('\n');
+          buf = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const obj = JSON.parse(line);
+              if (obj.token) {
+                tokenCount += 1;
+                latestTokPerSec = obj.tok_per_sec ?? latestTokPerSec;
+                document.getElementById('out').textContent += obj.token;
+                document.getElementById('tokenProgress').textContent = `Progress: ${tokenCount} token / ${(performance.now() - startedAt).toFixed(0)} ms`;
+              }
+              if (obj.done) {
+                const elapsedMs = Math.max(1, performance.now() - startedAt);
+                const tps = latestTokPerSec ?? ((tokenCount * 1000.0) / elapsedMs);
+                document.getElementById('mTok').textContent = tps.toFixed(2);
+                document.getElementById('mEval').textContent = String(obj.eval_count ?? '-');
+                document.getElementById('mTotal').textContent = (obj.total_duration ? obj.total_duration / 1e6 : elapsedMs).toFixed(1);
+                document.getElementById('mPrompt').textContent = String(obj.prompt_eval_ms ?? '-');
+                document.getElementById('lastSuccess').textContent = `Last success: ${new Date().toLocaleTimeString()}`;
+                document.getElementById('out').textContent += '\n\n[done]';
+              }
+            } catch {}
+          }
         }
+      } catch (e) {
+        document.getElementById('out').textContent += `\n\n[error] ${String(e)}`;
+        setStatus(`Stream ERROR: ${String(e)}`, true);
+      } finally {
+        setBusy(false);
       }
     }
 
@@ -386,6 +489,7 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
 
     async function abortGen() {
       await fetch('/api/extra/abort', { method: 'POST' });
+      setBusy(false);
     }
 
     async function checkStatus() {
@@ -396,6 +500,8 @@ async fn kobold_lite_gui_handler() -> Html<&'static str> {
     }
 
     refreshPresetList();
+    setBusy(false);
+    checkConnection();
   </script>
 </body>
 </html>"#,

@@ -220,6 +220,54 @@ hypura serve ./model.gguf
 openclaw config set models.providers.ollama.baseUrl "http://127.0.0.1:8080"
 ```
 
+### Kobold-lite / EasyNovelAssistant 運用プリセット（段階昇格）
+
+以下は `Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf` を使った
+Windows + RTX 3060 の安定化手順です。
+
+| 段階 | context | max_tokens | 用途 | 昇格条件 |
+|---|---:|---:|---|---|
+| **短文** | 4096 | 64 (必要なら 128) | 疎通確認、短い往復 | 3連続成功 |
+| **中文** | 4096 | 256 | 通常の執筆補助 | 3連続成功 |
+| **長文** | 8192 | 512 | 長めの連続生成 | 中文段階が安定 |
+
+推奨運用:
+
+- `serve` の常用は `--context 4096` を基準にする
+- 生成長だけを `64 -> 256 -> 512` へ段階的に上げる
+- どこかで不安定化したら直前の成功値へロールバックする
+
+### 実測（latest session, Windows 11 + RTX 3060）
+
+- `hypura run --context 4096 --max-tokens 32`:
+  - Prompt eval: `6145.7 ms (1.1 tok/s)`
+  - Generation: `2.5 tok/s (avg)`, generated tokens: `14`
+- `hypura run --context 8192 --max-tokens 512`:
+  - モデルロードと生成開始を確認（長文では処理時間が増加）
+- `hypura serve --context 4096` + proxy (`:5001`) の3連続疎通:
+  - `iter=1 gen_chars=28`
+  - `iter=2 gen_chars=26`
+  - `iter=3 gen_chars=40`
+  - `/api/tags` と `/api/v1/model` は全試行で成功
+
+### Kobold-lite / EasyNovelAssistant Staged Presets (safe 4096 -> 8192)
+
+These staged values are validated with
+`Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`
+on Windows + RTX 3060:
+
+| Stage | context | max_tokens | Primary use | Promotion rule |
+|---|---:|---:|---|---|
+| **Short** | 4096 | 64 (or 128) | Health check and short replies | 3 consecutive passes |
+| **Medium** | 4096 | 256 | Daily drafting | 3 consecutive passes |
+| **Long** | 8192 | 512 | Longer generation | Promote only after Medium stability |
+
+Operational baseline:
+
+- Keep `serve --context 4096` as the default baseline
+- Increase generation budget incrementally: `64 -> 256 -> 512`
+- Roll back to the previous successful stage immediately on instability
+
 ---
 
 ## アーキテクチャ

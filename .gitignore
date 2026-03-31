@@ -1,4 +1,6 @@
 /target/
+target_release_*/
+target_semver_*/
 vendor/llama.cpp/build/
 vendor/llama.cpp/build-*/
 benchmarks/results/*.json
