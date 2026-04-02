@@ -1,6 +1,5 @@
 use std::path::PathBuf;
-use std::process::Stdio;
-use tokio::process::Command;
+use std::process::{Command, Stdio};
 
 const TURBOQUANT_PYTHON_PATH: &str = "vendor/turboquant-cuda";
 
@@ -54,7 +53,7 @@ impl TurboQuantCodec {
         })
     }
 
-    pub async fn compress_k(&self, layer: u32, head: u32, data: &[f32]) -> anyhow::Result<Vec<f32>> {
+    pub fn compress_k(&self, layer: u32, head: u32, data: &[f32]) -> anyhow::Result<Vec<f32>> {
         let input_file = self.cachedir.join(format!("k_{}_{}_{}.json", layer, head, data.len()));
         let output_file = self.cachedir.join(format!("k_out_{}_{}_{}.json", layer, head, data.len()));
         
@@ -123,8 +122,7 @@ with open(sys.argv[2], 'w') as f:
             .current_dir(std::env::current_dir()?.join(".."))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await?;
+            .output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -135,7 +133,7 @@ with open(sys.argv[2], 'w') as f:
         Ok(result_json)
     }
 
-    pub async fn compress_v(&self, layer: u32, head: u32, data: &[f32]) -> anyhow::Result<Vec<f32>> {
+    pub fn compress_v(&self, layer: u32, head: u32, data: &[f32]) -> anyhow::Result<Vec<f32>> {
         let input_file = self.cachedir.join(format!("v_{}_{}_{}.json", layer, head, data.len()));
         let output_file = self.cachedir.join(format!("v_out_{}_{}_{}.json", layer, head, data.len()));
         
@@ -176,8 +174,7 @@ with open(sys.argv[2], 'w') as f:
             .current_dir(std::env::current_dir()?.join(".."))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await?;
+            .output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -188,7 +185,7 @@ with open(sys.argv[2], 'w') as f:
         Ok(result_json)
     }
 
-    pub async fn score_k(&self, layer: u32, head: u32, query: &[f32], token_start: u32, token_end: u32) -> anyhow::Result<Vec<f32>> {
+    pub fn score_k(&self, layer: u32, head: u32, query: &[f32], token_start: u32, token_end: u32) -> anyhow::Result<Vec<f32>> {
         let input_file = self.cachedir.join(format!("score_{}_{}.json", layer, head));
         let output_file = self.cachedir.join(format!("score_out_{}_{}.json", layer, head));
         
@@ -229,8 +226,7 @@ with open(sys.argv[2], 'w') as f:
             .current_dir(std::env::current_dir()?.join(".."))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await?;
+            .output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -241,7 +237,7 @@ with open(sys.argv[2], 'w') as f:
         Ok(result_json)
     }
 
-    pub async fn read_v(&self, layer: u32, head: u32, token_start: u32, token_end: u32) -> anyhow::Result<Vec<f32>> {
+    pub fn read_v(&self, layer: u32, head: u32, token_start: u32, token_end: u32) -> anyhow::Result<Vec<f32>> {
         let input_file = self.cachedir.join(format!("read_v_{}_{}.json", layer, head));
         let output_file = self.cachedir.join(format!("read_v_out_{}_{}.json", layer, head));
         
@@ -280,8 +276,7 @@ with open(sys.argv[2], 'w') as f:
             .current_dir(std::env::current_dir()?.join(".."))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await?;
+            .output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

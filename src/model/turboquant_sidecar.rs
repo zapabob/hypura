@@ -6,6 +6,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -215,6 +216,7 @@ pub struct ResolvedTurboQuantConfig {
     pub schema_kind: Option<TurboQuantSchemaKind>,
     pub source_path: Option<PathBuf>,
     pub config: Option<TurboQuantSidecarConfig>,
+    pub gguf_metadata: Option<GgufTurboQuantConfig>,
 }
 
 impl ResolvedTurboQuantConfig {
@@ -224,6 +226,7 @@ impl ResolvedTurboQuantConfig {
             schema_kind: None,
             source_path: None,
             config: None,
+            gguf_metadata: None,
         }
     }
 
@@ -237,6 +240,7 @@ impl ResolvedTurboQuantConfig {
         self.source_path
             .as_ref()
             .map(|p| p.display().to_string())
+            .or_else(|| self.gguf_metadata.as_ref().map(|cfg| cfg.source_label().to_string()))
             .unwrap_or_else(|| "none".to_string())
     }
 
@@ -245,25 +249,65 @@ impl ResolvedTurboQuantConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GgufTurboQuantConfig {
+    pub enabled: bool,
+    pub mode: TurboQuantMode,
+    pub rotation_policy: Option<RotationPolicy>,
+    pub triality_view: Option<String>,
+    pub triality_mix: Option<f32>,
+    pub rotation_seed: u32,
+    pub artifact_path: Option<String>,
+    pub head_dim: u32,
+    pub num_layers: u32,
+    pub num_kv_heads: u32,
+}
+
+impl GgufTurboQuantConfig {
+    pub fn source_label(&self) -> &'static str {
+        "gguf-metadata"
+    }
+}
+
 pub fn resolve_turboquant_config(
     model_path: &Path,
     metadata: &ModelMetadata,
+    gguf: &GgufFile,
     mode: TurboQuantMode,
     explicit_config: Option<&Path>,
 ) -> anyhow::Result<ResolvedTurboQuantConfig> {
     if mode == TurboQuantMode::Exact {
-        return Ok(ResolvedTurboQuantConfig::exact());
+        let mut resolved = ResolvedTurboQuantConfig::exact();
+        resolved.gguf_metadata = read_gguf_turboquant_config(gguf, metadata);
+        return Ok(resolved);
     }
 
     let config_path = match explicit_config {
         Some(path) => path.to_path_buf(),
-        None => auto_discover_sidecar_path(model_path, mode).ok_or_else(|| {
-            anyhow::anyhow!(
-                "No TurboQuant sidecar found for mode `{mode}` next to {}. \
-                 Pass `--turboquant-config <path>` or place a matching sidecar beside the model.",
-                model_path.display()
-            )
-        })?,
+        None => match auto_discover_sidecar_path(model_path, mode) {
+            Some(path) => path,
+            None => {
+                if let Some(gguf_metadata) = read_gguf_turboquant_config(gguf, metadata) {
+                    anyhow::ensure!(
+                        gguf_metadata.mode == mode,
+                        "GGUF TurboQuant metadata requests mode `{}`, but CLI requested `{mode}`",
+                        gguf_metadata.mode
+                    );
+                    return Ok(ResolvedTurboQuantConfig {
+                        mode,
+                        schema_kind: None,
+                        source_path: None,
+                        config: None,
+                        gguf_metadata: Some(gguf_metadata),
+                    });
+                }
+                return Err(anyhow::anyhow!(
+                    "No TurboQuant sidecar found for mode `{mode}` next to {}. \
+                     Pass `--turboquant-config <path>` or place a matching sidecar beside the model.",
+                    model_path.display()
+                ));
+            }
+        },
     };
 
     anyhow::ensure!(
@@ -294,6 +338,61 @@ pub fn resolve_turboquant_config(
         schema_kind: Some(schema_kind),
         source_path: Some(config_path),
         config: Some(config),
+        gguf_metadata: read_gguf_turboquant_config(gguf, metadata),
+    })
+}
+
+pub fn read_gguf_turboquant_config(
+    gguf: &GgufFile,
+    metadata: &ModelMetadata,
+) -> Option<GgufTurboQuantConfig> {
+    let enabled = gguf.get_bool("hypura.turboquant.enabled")?;
+    if !enabled {
+        return None;
+    }
+
+    let mode = match gguf.get_string("hypura.turboquant.mode")? {
+        "exact" => TurboQuantMode::Exact,
+        "paper-key-only" => TurboQuantMode::PaperKeyOnly,
+        "paper-full-kv" => TurboQuantMode::PaperFullKv,
+        "research-kv-split" => TurboQuantMode::ResearchKvSplit,
+        _ => return None,
+    };
+
+    let rotation_policy = gguf
+        .get_string("hypura.turboquant.rotation_policy")
+        .and_then(|value| match value {
+            "random_haar" => Some(RotationPolicy::RandomHaar),
+            "block_so8_static" => Some(RotationPolicy::BlockSo8Static),
+            "block_so8_learned" => Some(RotationPolicy::BlockSo8Learned),
+            "triality_vector" => Some(RotationPolicy::TrialityVector),
+            "triality_spinor_plus" => Some(RotationPolicy::TrialitySpinorPlus),
+            "triality_spinor_minus" => Some(RotationPolicy::TrialitySpinorMinus),
+            _ => None,
+        });
+    let triality_view = gguf
+        .get_string("hypura.turboquant.triality_view")
+        .map(ToOwned::to_owned)
+        .or_else(|| rotation_policy.and_then(|policy| policy.triality_view().map(str::to_string)));
+    let head_dim = if metadata.num_heads == 0 {
+        0
+    } else {
+        metadata.embedding_dim / metadata.num_heads
+    };
+
+    Some(GgufTurboQuantConfig {
+        enabled,
+        mode,
+        rotation_policy,
+        triality_view,
+        triality_mix: gguf.get_f32("hypura.turboquant.triality_mix"),
+        rotation_seed: gguf.get_u32("hypura.turboquant.rotation_seed").unwrap_or(0),
+        artifact_path: gguf
+            .get_string("hypura.turboquant.artifact")
+            .map(ToOwned::to_owned),
+        head_dim,
+        num_layers: metadata.num_layers,
+        num_kv_heads: metadata.num_kv_heads,
     })
 }
 
@@ -504,7 +603,10 @@ fn validate_config_against_metadata(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::model::gguf::GgufValue;
 
     fn sample_metadata() -> ModelMetadata {
         ModelMetadata {
@@ -563,6 +665,15 @@ mod tests {
         .to_string()
     }
 
+    fn sample_gguf() -> GgufFile {
+        GgufFile {
+            version: 3,
+            metadata: BTreeMap::new(),
+            tensors: Vec::new(),
+            data_offset: 0,
+        }
+    }
+
     #[test]
     fn paper_config_parse_and_validate() {
         let path = Path::new("model.turboquant_config.paper.json");
@@ -591,11 +702,52 @@ mod tests {
         let resolved = resolve_turboquant_config(
             Path::new("model.gguf"),
             &sample_metadata(),
+            &sample_gguf(),
             TurboQuantMode::Exact,
             None,
         )
         .unwrap();
         assert_eq!(resolved.mode, TurboQuantMode::Exact);
         assert!(resolved.config.is_none());
+    }
+
+    #[test]
+    fn gguf_triality_metadata_resolves_without_sidecar() {
+        let mut gguf = sample_gguf();
+        gguf.metadata.insert(
+            "hypura.turboquant.enabled".into(),
+            GgufValue::Bool(true),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.mode".into(),
+            GgufValue::String("research-kv-split".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.rotation_policy".into(),
+            GgufValue::String("triality_spinor_plus".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.rotation_seed".into(),
+            GgufValue::Uint32(17),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.triality_mix".into(),
+            GgufValue::Float32(0.75),
+        );
+
+        let resolved = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &sample_metadata(),
+            &gguf,
+            TurboQuantMode::ResearchKvSplit,
+            None,
+        )
+        .unwrap();
+
+        let gguf_cfg = resolved.gguf_metadata.expect("gguf metadata should be attached");
+        assert_eq!(gguf_cfg.mode, TurboQuantMode::ResearchKvSplit);
+        assert_eq!(gguf_cfg.rotation_policy, Some(RotationPolicy::TrialitySpinorPlus));
+        assert_eq!(gguf_cfg.triality_view.as_deref(), Some("spinor_plus_proxy"));
+        assert_eq!(gguf_cfg.rotation_seed, 17);
     }
 }

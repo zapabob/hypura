@@ -60,6 +60,21 @@ impl GgufValue {
         }
     }
 
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Self::Float32(v) => Some(*v),
+            Self::Float64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::Uint32(v) => Some(*v),
@@ -305,6 +320,24 @@ impl GgufFile {
             self.metadata
                 .get(&format!("{arch}.{key}"))
                 .and_then(|v| v.as_u32())
+        })
+    }
+
+    /// Get a bool metadata value, trying both `general.X` and `X` keys.
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.metadata.get(key).and_then(|v| v.as_bool()).or_else(|| {
+            self.metadata
+                .get(&format!("general.{key}"))
+                .and_then(|v| v.as_bool())
+        })
+    }
+
+    /// Get a float metadata value, trying both `general.X` and `X` keys.
+    pub fn get_f32(&self, key: &str) -> Option<f32> {
+        self.metadata.get(key).and_then(|v| v.as_f32()).or_else(|| {
+            self.metadata
+                .get(&format!("general.{key}"))
+                .and_then(|v| v.as_f32())
         })
     }
 }

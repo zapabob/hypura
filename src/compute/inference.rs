@@ -19,7 +19,7 @@ use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 use crate::model::tensor_role::TensorRole;
 use crate::model::turboquant_sidecar::{
-    resolve_turboquant_config, ResolvedTurboQuantConfig, TurboQuantMode,
+    resolve_turboquant_config, GgufTurboQuantConfig, ResolvedTurboQuantConfig, TurboQuantMode,
 };
 use crate::profiler;
 use crate::profiler::types::HardwareProfile;
@@ -290,7 +290,8 @@ pub fn resolve_runtime_setup(
     let gguf = GgufFile::open(model_path)?;
     let metadata = ModelMetadata::from_gguf(&gguf)?;
     let turboquant =
-        resolve_turboquant_config(model_path, &metadata, turboquant_mode, turboquant_config)?;
+        resolve_turboquant_config(model_path, &metadata, &gguf, turboquant_mode, turboquant_config)?;
+    apply_gguf_turboquant_env(turboquant.gguf_metadata.as_ref());
     let plan = compute_placement_with_context(&gguf, &hardware, context)?;
     let placement_summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
     let gpu_budget = compute_gpu_budget(&hardware, &metadata, context);
@@ -305,6 +306,33 @@ pub fn resolve_runtime_setup(
         n_gpu_layers,
         turboquant,
     })
+}
+
+fn apply_gguf_turboquant_env(gguf_turboquant: Option<&GgufTurboQuantConfig>) {
+    let Some(cfg) = gguf_turboquant else {
+        return;
+    };
+
+    std::env::set_var("LLAMA_TURBOQUANT", if cfg.enabled { "1" } else { "0" });
+    if let Some(rotation_policy) = cfg.rotation_policy {
+        let so8_enabled = !matches!(rotation_policy, crate::model::turboquant_sidecar::RotationPolicy::RandomHaar);
+        let so8_learned = matches!(rotation_policy, crate::model::turboquant_sidecar::RotationPolicy::BlockSo8Learned);
+        std::env::set_var("LLAMA_TURBOQUANT_SO8", if so8_enabled { "1" } else { "0" });
+        std::env::set_var("LLAMA_TURBOQUANT_SO8_LEARNED", if so8_learned { "1" } else { "0" });
+        std::env::set_var(
+            "LLAMA_TURBOQUANT_TRIALITY",
+            if rotation_policy.is_triality() { "1" } else { "0" },
+        );
+    }
+    if let Some(mix) = cfg.triality_mix {
+        std::env::set_var("LLAMA_TURBOQUANT_TRIALITY_MIX", format!("{mix:.3}"));
+    }
+    std::env::set_var("LLAMA_TURBOQUANT_ROTATION_SEED", cfg.rotation_seed.to_string());
+    if let Some(path) = &cfg.artifact_path {
+        if !path.trim().is_empty() {
+            std::env::set_var("LLAMA_TURBOQUANT_ARTIFACT", path.trim());
+        }
+    }
 }
 
 impl TurboQuantRuntimeSession {

@@ -75,7 +75,9 @@ async fn run_async(
         runtime.turboquant.mode,
         runtime.turboquant.schema_label(),
         runtime.turboquant.source_label(),
-        if runtime.turboquant.mode == hypura::model::turboquant_sidecar::TurboQuantMode::Exact {
+        if runtime.turboquant.gguf_metadata.is_some() {
+            "gguf-metadata-bridge"
+        } else if runtime.turboquant.mode == hypura::model::turboquant_sidecar::TurboQuantMode::Exact {
             "inactive"
         } else if runtime.turboquant.mode
             == hypura::model::turboquant_sidecar::TurboQuantMode::PaperFullKv

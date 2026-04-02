@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use crate::cache::kv_codec_python::TurboQuantCodec;
 use crate::model::turboquant_sidecar::{
     PaperTurboQuantConfig, ResolvedTurboQuantConfig, TurboQuantMode,
 };
@@ -53,9 +54,7 @@ pub fn build_kv_codec(
                 anyhow::anyhow!("paper-full-kv requires a parsed paper TurboQuant config")
             })?,
         )?)),
-        TurboQuantMode::ResearchKvSplit => Err(anyhow::anyhow!(
-            "TurboQuant mode `research-kv-split` is experimental and not implemented yet"
-        )),
+        TurboQuantMode::ResearchKvSplit => Ok(Box::new(ResearchKvSplitCodec::new(resolved)?)),
     }
 }
 
@@ -391,6 +390,97 @@ pub struct PaperFullKvCodec {
     artifacts: PaperArtifacts,
     key_vectors: HashMap<KvStoreKey, EncodedTurboVector>,
     value_vectors: HashMap<KvStoreKey, EncodedTurboVector>,
+}
+
+#[derive(Clone)]
+pub struct ResearchKvSplitCodec {
+    python: TurboQuantCodec,
+    value_vectors: HashMap<KvStoreKey, Vec<f32>>,
+}
+
+impl ResearchKvSplitCodec {
+    pub fn new(resolved: &ResolvedTurboQuantConfig) -> anyhow::Result<Self> {
+        let gguf_cfg = resolved.gguf_metadata.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "research-kv-split currently requires GGUF TurboQuant metadata or an explicit runtime bridge"
+            )
+        })?;
+
+        let rotation_policy = gguf_cfg
+            .rotation_policy
+            .map(|policy| policy.as_str().to_string());
+
+        Ok(Self {
+            python: TurboQuantCodec::new(
+                "research-kv-split".to_string(),
+                resolved
+                    .source_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .as_deref(),
+                gguf_cfg.num_layers,
+                gguf_cfg.num_kv_heads,
+                gguf_cfg.head_dim,
+                rotation_policy.as_deref(),
+                Some(gguf_cfg.rotation_seed),
+            )?,
+            value_vectors: HashMap::new(),
+        })
+    }
+}
+
+impl KvCodec for ResearchKvSplitCodec {
+    fn name(&self) -> &'static str {
+        "research-kv-split"
+    }
+
+    fn fork_session(&self) -> Box<dyn KvCodec + Send> {
+        Box::new(self.clone())
+    }
+
+    fn ingest_k(
+        &mut self,
+        layer: u32,
+        head: u32,
+        token: u32,
+        data: &[f32],
+    ) -> anyhow::Result<Vec<f32>> {
+        let _ = token;
+        self.python.compress_k(layer, head, data)
+    }
+
+    fn ingest_v(
+        &mut self,
+        layer: u32,
+        head: u32,
+        token: u32,
+        data: &[f32],
+    ) -> anyhow::Result<Vec<f32>> {
+        self.value_vectors
+            .insert((layer, head, token), data.to_vec());
+        Ok(data.to_vec())
+    }
+
+    fn score_k(
+        &self,
+        layer: u32,
+        head: u32,
+        query: &[f32],
+        token_range: Range<u32>,
+    ) -> anyhow::Result<Vec<f32>> {
+        self.python
+            .score_k(layer, head, query, token_range.start, token_range.end)
+    }
+
+    fn read_v(&self, layer: u32, head: u32, token_range: Range<u32>) -> anyhow::Result<Vec<f32>> {
+        let mut out = Vec::new();
+        for token in token_range {
+            if let Some(value) = self.value_vectors.get(&(layer, head, token)) {
+                out.extend_from_slice(value);
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl PaperFullKvCodec {

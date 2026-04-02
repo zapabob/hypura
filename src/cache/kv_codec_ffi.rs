@@ -32,9 +32,19 @@ impl KvCodecFfi {
         let codec = build_kv_codec(resolved)?;
 
         let paper_config = resolved.paper_config();
-        let num_layers = paper_config.map(|c| c.num_layers as u32).unwrap_or(0);
-        let num_kv_heads = paper_config.map(|c| c.num_kv_heads as u32).unwrap_or(0);
-        let head_dim = paper_config.map(|c| c.head_dim as u32).unwrap_or(0);
+        let gguf_cfg = resolved.gguf_metadata.as_ref();
+        let num_layers = paper_config
+            .map(|c| c.num_layers as u32)
+            .or_else(|| gguf_cfg.map(|cfg| cfg.num_layers))
+            .unwrap_or(0);
+        let num_kv_heads = paper_config
+            .map(|c| c.num_kv_heads as u32)
+            .or_else(|| gguf_cfg.map(|cfg| cfg.num_kv_heads))
+            .unwrap_or(0);
+        let head_dim = paper_config
+            .map(|c| c.head_dim as u32)
+            .or_else(|| gguf_cfg.map(|cfg| cfg.head_dim))
+            .unwrap_or(0);
 
         Ok(Self {
             codec: Arc::new(Mutex::new(codec)),
