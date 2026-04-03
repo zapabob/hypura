@@ -668,12 +668,12 @@ fn build_turboquant_runtime_session(
 
 fn validate_turboquant_runtime_mode(turboquant: &ResolvedTurboQuantConfig) -> anyhow::Result<()> {
     match turboquant.mode {
-        TurboQuantMode::Exact | TurboQuantMode::PaperKeyOnly | TurboQuantMode::PaperFullKv => {
+        TurboQuantMode::Exact
+        | TurboQuantMode::PaperKeyOnly
+        | TurboQuantMode::PaperFullKv
+        | TurboQuantMode::ResearchKvSplit => {
             Ok(())
         }
-        TurboQuantMode::ResearchKvSplit => Err(anyhow::anyhow!(
-            "TurboQuant mode `research-kv-split` is experimental and not implemented yet"
-        )),
     }
 }
 

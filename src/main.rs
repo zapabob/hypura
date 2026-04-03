@@ -44,7 +44,7 @@ enum Commands {
         #[arg(long, default_value = "512")]
         max_tokens: u32,
         /// TurboQuant runtime mode
-        #[arg(long, value_enum, default_value_t = TurboQuantMode::Exact)]
+        #[arg(long, value_enum, default_value_t = TurboQuantMode::ResearchKvSplit)]
         turboquant_mode: TurboQuantMode,
         /// Optional TurboQuant sidecar config path
         #[arg(long)]
@@ -70,7 +70,7 @@ enum Commands {
         #[arg(long, default_value = "4096")]
         context: u32,
         /// TurboQuant runtime mode
-        #[arg(long, value_enum, default_value_t = TurboQuantMode::Exact)]
+        #[arg(long, value_enum, default_value_t = TurboQuantMode::ResearchKvSplit)]
         turboquant_mode: TurboQuantMode,
         /// Optional TurboQuant sidecar config path
         #[arg(long)]
@@ -126,7 +126,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
         /// TurboQuant runtime mode for the Hypura run
-        #[arg(long, value_enum, default_value_t = TurboQuantMode::Exact)]
+        #[arg(long, value_enum, default_value_t = TurboQuantMode::ResearchKvSplit)]
         turboquant_mode: TurboQuantMode,
         /// Optional TurboQuant sidecar config path
         #[arg(long)]

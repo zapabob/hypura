@@ -301,6 +301,13 @@ pub fn resolve_turboquant_config(
                         gguf_metadata: Some(gguf_metadata),
                     });
                 }
+                if mode == TurboQuantMode::ResearchKvSplit {
+                    tracing::warn!(
+                        "No TurboQuant research sidecar or GGUF metadata found next to {}. Falling back to exact runtime.",
+                        model_path.display()
+                    );
+                    return Ok(ResolvedTurboQuantConfig::exact());
+                }
                 return Err(anyhow::anyhow!(
                     "No TurboQuant sidecar found for mode `{mode}` next to {}. \
                      Pass `--turboquant-config <path>` or place a matching sidecar beside the model.",
