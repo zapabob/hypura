@@ -1,4 +1,6 @@
 /target/
+# Alternate CARGO_TARGET_DIR (e.g. Windows PC / CUDA12 builds)
+/target-pc-*/
 target_release_*/
 target_semver_*/
 vendor/llama.cpp/build/
