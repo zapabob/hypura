@@ -34,7 +34,6 @@ dist/
 
 # Local assistant/session metadata
 .specstory/
-.cargo/
 .cursor/
 scripts/__pycache__/
 logs/

@@ -1,0 +1,153 @@
+{
+  "generated_at_utc": "2026-04-10T22:42:30.031998+00:00",
+  "upstream_ref": "origin/master",
+  "head_short": "6c860647e",
+  "upstream_short": "3fc65063d",
+  "head_contains_upstream": true,
+  "upstream_contains_head": false,
+  "fork_only_commits": [
+    "6c860647e merge: upstream ggerganov/llama.cpp master; keep Triality/TurboQuant",
+    "dce830d55 merge: upstream ggerganov/llama.cpp master; keep Triality/TurboQuant",
+    "a5974fd34 merge: upstream ggerganov/llama.cpp master; keep Triality/TurboQuant base",
+    "dbdd39727 Default GGUF conversion to Q8_0 and Triality metadata",
+    "ecdaa890f Add Hypura TurboQuant Triality GGUF metadata",
+    "abe37ec28 Implement TurboQuant integration with CUDA tooling and runtime configuration"
+  ],
+  "fork_only_files": [
+    "CMakeLists.txt",
+    "convert_hf_to_gguf.py",
+    "src/CMakeLists.txt",
+    "src/llama-graph.cpp",
+    "src/llama-kv-cache.cpp",
+    "src/llama-kv-cache.h",
+    "src/llama-turboquant.cpp",
+    "src/llama-turboquant.h",
+    "tools/CMakeLists.txt",
+    "tools/turboquant/CMakeLists.txt",
+    "tools/turboquant/turboquant.cpp"
+  ],
+  "incoming_upstream_commits_preview": [],
+  "incoming_upstream_files": [],
+  "incoming_api_touch_paths": [],
+  "security_flagged_incoming_commits": [],
+  "protected_paths_ok": true,
+  "merge_policy": {
+    "protected": [
+      {
+        "path": "convert_hf_to_gguf.py",
+        "reason": "Keep Hypura GGUF TurboQuant metadata embedding and default knobs."
+      },
+      {
+        "path": "src/llama-kv-cache.cpp",
+        "reason": "Keep KV-cache TurboQuant hooks and env bridge integration."
+      },
+      {
+        "path": "src/llama-kv-cache.h",
+        "reason": "Keep KV-cache TurboQuant wiring and runtime config exposure."
+      },
+      {
+        "path": "src/llama-turboquant.cpp",
+        "reason": "Keep Triality/SO8 runtime helpers unless upstream fully supersedes them."
+      },
+      {
+        "path": "src/llama-turboquant.h",
+        "reason": "Keep Triality/SO8 runtime interface unless upstream fully supersedes it."
+      }
+    ],
+    "prefer_upstream": [
+      {
+        "path": "CMakeLists.txt",
+        "reason": "Prefer upstream build plumbing when equivalent functionality exists."
+      },
+      {
+        "path": "src/CMakeLists.txt",
+        "reason": "Prefer upstream build plumbing when equivalent functionality exists."
+      },
+      {
+        "path": "src/llama-graph.cpp",
+        "reason": "Prefer upstream graph/runtime changes, then re-apply only TurboQuant benefits."
+      },
+      {
+        "path": "tools/CMakeLists.txt",
+        "reason": "Prefer upstream tool wiring when equivalent functionality exists."
+      }
+    ],
+    "reinject_benefits": [
+      {
+        "path": "convert_hf_to_gguf.py",
+        "reason": "Re-apply Hypura GGUF metadata defaults after upstream converter changes."
+      },
+      {
+        "path": "src/llama-graph.cpp",
+        "reason": "Re-apply TurboQuant runtime hooks on top of upstream graph updates."
+      },
+      {
+        "path": "src/llama-kv-cache.cpp",
+        "reason": "Re-apply KV-cache Triality/SO8 behavior on top of upstream bugfixes."
+      },
+      {
+        "path": "src/llama-kv-cache.h",
+        "reason": "Re-apply KV-cache interface benefits on top of upstream API changes."
+      }
+    ]
+  },
+  "fork_policy_overlap": {
+    "protected": [
+      "convert_hf_to_gguf.py",
+      "src/llama-kv-cache.cpp",
+      "src/llama-kv-cache.h",
+      "src/llama-turboquant.cpp",
+      "src/llama-turboquant.h"
+    ],
+    "prefer_upstream": [
+      "CMakeLists.txt",
+      "src/CMakeLists.txt",
+      "src/llama-graph.cpp",
+      "tools/CMakeLists.txt"
+    ],
+    "reinject_benefits": [
+      "convert_hf_to_gguf.py",
+      "src/llama-graph.cpp",
+      "src/llama-kv-cache.cpp",
+      "src/llama-kv-cache.h"
+    ]
+  },
+  "incoming_policy_overlap": {
+    "protected": [],
+    "prefer_upstream": [],
+    "reinject_benefits": []
+  },
+  "default_alignment": [
+    {
+      "label": "GGUF outtype default",
+      "path": "vendor/llama.cpp/convert_hf_to_gguf.py",
+      "expected": "default=\"q8_0\"",
+      "ok": true
+    },
+    {
+      "label": "GGUF TurboQuant mode default",
+      "path": "vendor/llama.cpp/convert_hf_to_gguf.py",
+      "expected": "default=\"research-kv-split\"",
+      "ok": true
+    },
+    {
+      "label": "GGUF TrialitySO8 rotation default",
+      "path": "vendor/llama.cpp/convert_hf_to_gguf.py",
+      "expected": "default=\"triality_vector\"",
+      "ok": true
+    },
+    {
+      "label": "CLI TurboQuant mode default",
+      "path": "src/main.rs",
+      "expected": "default_value_t = TurboQuantMode::ResearchKvSplit",
+      "ok": true
+    },
+    {
+      "label": "CLI TrialitySO8 rotation default",
+      "path": "src/main.rs",
+      "expected": "default_value_t = RotationPolicy::TrialityVector",
+      "ok": true
+    }
+  ],
+  "default_alignment_ok": true
+}

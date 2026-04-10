@@ -301,6 +301,8 @@ pub fn resolve_turboquant_config(
                         gguf_metadata: Some(gguf_metadata),
                     });
                 }
+                // NOTE: Exact fallback preserves safety when research artifacts are missing.
+                // Broader "Triality-by-default without sidecar" alignment is tracked separately.
                 if mode == TurboQuantMode::ResearchKvSplit {
                     tracing::warn!(
                         "No TurboQuant research sidecar or GGUF metadata found next to {}. Falling back to exact runtime.",

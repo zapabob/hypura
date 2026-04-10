@@ -4,15 +4,19 @@ use std::time::Instant;
 use std::{fs, path::PathBuf};
 use std::collections::{HashMap, VecDeque};
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{header, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum::response::Html;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::compute::inference::{GenerateFromLoadedParams, GenerationResult, LoadedModel};
+use crate::compute::inference::{
+    GenerateFromLoadedParams, GenerationResult, LoadedModel, LlamaTurboquantCliBridge,
+};
 use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
 use crate::server::chat::format_chat_prompt;
 use crate::server::ollama_types::*;
@@ -29,6 +33,10 @@ pub struct AppState {
     pub load_duration_ns: u64,
     pub telemetry: Arc<TelemetryEmitter>,
     pub turboquant: ResolvedTurboQuantConfig,
+    /// CLI `hypura serve` TurboQuant mode — reused by hot model switch for parity.
+    pub serve_turboquant_mode: TurboQuantMode,
+    pub serve_turboquant_config_path: Option<PathBuf>,
+    pub serve_llama_bridge: LlamaTurboquantCliBridge,
     pub active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub generation_in_progress: Arc<AtomicBool>,
     pub gui_presets: Arc<Mutex<HashMap<String, GuiPresetItem>>>,
@@ -64,7 +72,44 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/extra/true_max_context_length",
             get(kobold_true_max_context_length_handler),
         )
+        .layer(middleware::from_fn(enforce_optional_api_key))
         .with_state(state)
+}
+
+async fn enforce_optional_api_key(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path();
+    if path == "/" || path == "/kobold-lite" {
+        return next.run(request).await;
+    }
+    let Ok(expected) = std::env::var("HYPURA_API_KEY") else {
+        return next.run(request).await;
+    };
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return next.run(request).await;
+    }
+    let bearer_ok = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ").map(str::trim))
+        .map(|t| t == expected)
+        .unwrap_or(false);
+    let xkey_ok = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|t| t.trim() == expected)
+        .unwrap_or(false);
+    if bearer_ok || xkey_ok {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid or missing API key" })),
+        )
+            .into_response()
+    }
 }
 
 async fn health_handler() -> Json<serde_json::Value> {
@@ -945,12 +990,16 @@ async fn model_switch_handler(
 
     let context = req.context.unwrap_or(state.default_context).max(256);
     let path_for_setup = next_model_path.clone();
+    let tq_mode = state.serve_turboquant_mode;
+    let tq_config = state.serve_turboquant_config_path.clone();
+    let bridge = state.serve_llama_bridge.clone();
     let setup = match tokio::task::spawn_blocking(move || {
         crate::compute::inference::resolve_runtime_setup(
             &path_for_setup,
             context,
-            TurboQuantMode::Exact,
-            None,
+            tq_mode,
+            tq_config.as_deref(),
+            bridge,
         )
     })
     .await
@@ -1173,7 +1222,7 @@ async fn ui_theme_set_handler(
         }
     };
     *state.ui_theme.lock().unwrap() = next.clone();
-    std::env::set_var("HYPURA_UI_THEME", &next);
+    set_process_env_var("HYPURA_UI_THEME", &next);
     push_gui_event(&state, "info", format!("ui theme changed: {next}"));
     Json(serde_json::json!({ "success": true, "theme": next })).into_response()
 }
@@ -1643,52 +1692,64 @@ fn build_sampling(opts: &GenerateOptions) -> crate::compute::ffi::SamplingParams
     s
 }
 
+fn set_process_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+fn remove_process_env_var<K: AsRef<std::ffi::OsStr>>(key: K) {
+    unsafe {
+        std::env::remove_var(key);
+    }
+}
+
 fn apply_turboquant_runtime_overrides(opts: &GenerateOptions) {
     if let Some(v) = opts.tq_so8_off {
-        std::env::set_var("LLAMA_TURBOQUANT_SO8", if v { "0" } else { "1" });
+        set_process_env_var("LLAMA_TURBOQUANT_SO8", if v { "0" } else { "1" });
     }
     if let Some(v) = opts.tq_so8_learned {
-        std::env::set_var("LLAMA_TURBOQUANT_SO8_LEARNED", if v { "1" } else { "0" });
+        set_process_env_var("LLAMA_TURBOQUANT_SO8_LEARNED", if v { "1" } else { "0" });
     }
     if let Some(v) = opts.tq_triality_off {
-        std::env::set_var("LLAMA_TURBOQUANT_TRIALITY", if v { "0" } else { "1" });
+        set_process_env_var("LLAMA_TURBOQUANT_TRIALITY", if v { "0" } else { "1" });
     }
     if let Some(v) = opts.tq_triality_mix {
-        std::env::set_var("LLAMA_TURBOQUANT_TRIALITY_MIX", format!("{v:.3}"));
+        set_process_env_var("LLAMA_TURBOQUANT_TRIALITY_MIX", format!("{v:.3}"));
     }
     if let Some(v) = opts.tq_rotation_seed {
-        std::env::set_var("LLAMA_TURBOQUANT_ROTATION_SEED", v.to_string());
+        set_process_env_var("LLAMA_TURBOQUANT_ROTATION_SEED", v.to_string());
     }
     if let Some(path) = &opts.tq_artifact {
         if path.trim().is_empty() {
-            std::env::remove_var("LLAMA_TURBOQUANT_ARTIFACT");
+            remove_process_env_var("LLAMA_TURBOQUANT_ARTIFACT");
         } else {
-            std::env::set_var("LLAMA_TURBOQUANT_ARTIFACT", path);
+            set_process_env_var("LLAMA_TURBOQUANT_ARTIFACT", path);
         }
     }
 }
 
 fn apply_turboquant_runtime_overrides_kobold(opts: &KoboldGenerateRequest) {
     if let Some(v) = opts.tq_so8_off {
-        std::env::set_var("LLAMA_TURBOQUANT_SO8", if v { "0" } else { "1" });
+        set_process_env_var("LLAMA_TURBOQUANT_SO8", if v { "0" } else { "1" });
     }
     if let Some(v) = opts.tq_so8_learned {
-        std::env::set_var("LLAMA_TURBOQUANT_SO8_LEARNED", if v { "1" } else { "0" });
+        set_process_env_var("LLAMA_TURBOQUANT_SO8_LEARNED", if v { "1" } else { "0" });
     }
     if let Some(v) = opts.tq_triality_off {
-        std::env::set_var("LLAMA_TURBOQUANT_TRIALITY", if v { "0" } else { "1" });
+        set_process_env_var("LLAMA_TURBOQUANT_TRIALITY", if v { "0" } else { "1" });
     }
     if let Some(v) = opts.tq_triality_mix {
-        std::env::set_var("LLAMA_TURBOQUANT_TRIALITY_MIX", format!("{v:.3}"));
+        set_process_env_var("LLAMA_TURBOQUANT_TRIALITY_MIX", format!("{v:.3}"));
     }
     if let Some(v) = opts.tq_rotation_seed {
-        std::env::set_var("LLAMA_TURBOQUANT_ROTATION_SEED", v.to_string());
+        set_process_env_var("LLAMA_TURBOQUANT_ROTATION_SEED", v.to_string());
     }
     if let Some(path) = &opts.tq_artifact {
         if path.trim().is_empty() {
-            std::env::remove_var("LLAMA_TURBOQUANT_ARTIFACT");
+            remove_process_env_var("LLAMA_TURBOQUANT_ARTIFACT");
         } else {
-            std::env::set_var("LLAMA_TURBOQUANT_ARTIFACT", path);
+            set_process_env_var("LLAMA_TURBOQUANT_ARTIFACT", path);
         }
     }
 }

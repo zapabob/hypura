@@ -19,7 +19,8 @@ use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 use crate::model::tensor_role::TensorRole;
 use crate::model::turboquant_sidecar::{
-    resolve_turboquant_config, GgufTurboQuantConfig, ResolvedTurboQuantConfig, TurboQuantMode,
+    resolve_turboquant_config, GgufTurboQuantConfig, ResolvedTurboQuantConfig, RotationPolicy,
+    TurboQuantMode,
 };
 use crate::profiler;
 use crate::profiler::types::HardwareProfile;
@@ -236,6 +237,88 @@ struct RuntimeTensorShape {
     dim3: usize,
 }
 
+/// LLAMA_* TurboQuant env bridge from CLI when the GGUF has no `hypura.turboquant.*` metadata.
+#[derive(Debug, Clone)]
+pub struct LlamaTurboquantCliBridge {
+    pub rotation_policy: RotationPolicy,
+    /// Written to `LLAMA_TURBOQUANT_ROTATION_SEED`.
+    pub llama_rotation_seed: u32,
+    pub tq_so8_off: bool,
+    pub tq_triality_off: bool,
+    pub tq_so8_learned: bool,
+    pub tq_triality_mix: f32,
+    pub tq_artifact: Option<String>,
+}
+
+impl Default for LlamaTurboquantCliBridge {
+    fn default() -> Self {
+        Self {
+            rotation_policy: RotationPolicy::TrialityVector,
+            llama_rotation_seed: 0,
+            tq_so8_off: false,
+            tq_triality_off: false,
+            tq_so8_learned: false,
+            tq_triality_mix: 0.5,
+            tq_artifact: None,
+        }
+    }
+}
+
+fn set_process_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    // Hypura intentionally uses process-global environment variables as the
+    // bridge into vendored llama.cpp runtime configuration.
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+fn apply_llama_turboquant_cli_bridge(
+    turboquant_mode: TurboQuantMode,
+    resolved: &ResolvedTurboQuantConfig,
+    bridge: &LlamaTurboquantCliBridge,
+) {
+    if resolved.gguf_metadata.is_some() {
+        return;
+    }
+    if turboquant_mode == TurboQuantMode::Exact {
+        return;
+    }
+
+    let p = bridge.rotation_policy;
+    let so8_enabled =
+        !bridge.tq_so8_off && !matches!(p, RotationPolicy::RandomHaar);
+    let so8_learned =
+        bridge.tq_so8_learned || matches!(p, RotationPolicy::BlockSo8Learned);
+    let triality_enabled = !bridge.tq_triality_off && p.is_triality();
+
+    set_process_env_var("LLAMA_TURBOQUANT", "1");
+    set_process_env_var(
+        "LLAMA_TURBOQUANT_SO8",
+        if so8_enabled { "1" } else { "0" },
+    );
+    set_process_env_var(
+        "LLAMA_TURBOQUANT_SO8_LEARNED",
+        if so8_learned { "1" } else { "0" },
+    );
+    set_process_env_var(
+        "LLAMA_TURBOQUANT_TRIALITY",
+        if triality_enabled { "1" } else { "0" },
+    );
+    set_process_env_var(
+        "LLAMA_TURBOQUANT_TRIALITY_MIX",
+        format!("{:.3}", bridge.tq_triality_mix.clamp(0.0, 1.0)),
+    );
+    set_process_env_var(
+        "LLAMA_TURBOQUANT_ROTATION_SEED",
+        bridge.llama_rotation_seed.to_string(),
+    );
+    if let Some(ref path) = bridge.tq_artifact {
+        if !path.trim().is_empty() {
+            set_process_env_var("LLAMA_TURBOQUANT_ARTIFACT", path.trim());
+        }
+    }
+}
+
 impl RuntimeTensorShape {
     fn total_elements(self) -> usize {
         self.dim0
@@ -270,6 +353,7 @@ pub fn resolve_runtime_setup(
     context: u32,
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&Path>,
+    llama_bridge: LlamaTurboquantCliBridge,
 ) -> anyhow::Result<RuntimeSetup> {
     anyhow::ensure!(
         model_path.exists(),
@@ -292,6 +376,7 @@ pub fn resolve_runtime_setup(
     let turboquant =
         resolve_turboquant_config(model_path, &metadata, &gguf, turboquant_mode, turboquant_config)?;
     apply_gguf_turboquant_env(turboquant.gguf_metadata.as_ref());
+    apply_llama_turboquant_cli_bridge(turboquant_mode, &turboquant, &llama_bridge);
     let plan = compute_placement_with_context(&gguf, &hardware, context)?;
     let placement_summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
     let gpu_budget = compute_gpu_budget(&hardware, &metadata, context);
@@ -313,24 +398,24 @@ fn apply_gguf_turboquant_env(gguf_turboquant: Option<&GgufTurboQuantConfig>) {
         return;
     };
 
-    std::env::set_var("LLAMA_TURBOQUANT", if cfg.enabled { "1" } else { "0" });
+    set_process_env_var("LLAMA_TURBOQUANT", if cfg.enabled { "1" } else { "0" });
     if let Some(rotation_policy) = cfg.rotation_policy {
         let so8_enabled = !matches!(rotation_policy, crate::model::turboquant_sidecar::RotationPolicy::RandomHaar);
         let so8_learned = matches!(rotation_policy, crate::model::turboquant_sidecar::RotationPolicy::BlockSo8Learned);
-        std::env::set_var("LLAMA_TURBOQUANT_SO8", if so8_enabled { "1" } else { "0" });
-        std::env::set_var("LLAMA_TURBOQUANT_SO8_LEARNED", if so8_learned { "1" } else { "0" });
-        std::env::set_var(
+        set_process_env_var("LLAMA_TURBOQUANT_SO8", if so8_enabled { "1" } else { "0" });
+        set_process_env_var("LLAMA_TURBOQUANT_SO8_LEARNED", if so8_learned { "1" } else { "0" });
+        set_process_env_var(
             "LLAMA_TURBOQUANT_TRIALITY",
             if rotation_policy.is_triality() { "1" } else { "0" },
         );
     }
     if let Some(mix) = cfg.triality_mix {
-        std::env::set_var("LLAMA_TURBOQUANT_TRIALITY_MIX", format!("{mix:.3}"));
+        set_process_env_var("LLAMA_TURBOQUANT_TRIALITY_MIX", format!("{mix:.3}"));
     }
-    std::env::set_var("LLAMA_TURBOQUANT_ROTATION_SEED", cfg.rotation_seed.to_string());
+    set_process_env_var("LLAMA_TURBOQUANT_ROTATION_SEED", cfg.rotation_seed.to_string());
     if let Some(path) = &cfg.artifact_path {
         if !path.trim().is_empty() {
-            std::env::set_var("LLAMA_TURBOQUANT_ARTIFACT", path.trim());
+            set_process_env_var("LLAMA_TURBOQUANT_ARTIFACT", path.trim());
         }
     }
 }

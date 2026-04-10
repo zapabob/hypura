@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hypura Desktop</title>
+  </head>
+  <body>
+    <main style="font-family: system-ui, sans-serif; padding: 1rem; max-width: 48rem">
+      <h1>Hypura Desktop</h1>
+      <p>
+        GGUF をドラッグ＆ドロップするか「Choose GGUF…」で選び、<code>hypura serve</code> を起動します。KoboldCpp / EasyNovelAssistant（Novel 系）はベース URL のみで接続できます。
+      </p>
+      <p style="color: #555; font-size: 0.9rem">
+        Drop a <code>.gguf</code> onto this window, or use the file button. Then start the server and paste the base URL into KoboldCpp / EasyNovelAssistant.
+      </p>
+
+      <section style="margin: 1rem 0; padding: 0.75rem; border: 1px dashed #888; border-radius: 6px">
+        <strong>GGUF</strong>
+        <p style="margin: 0.5rem 0">
+          <button id="pick" type="button">Choose GGUF…</button>
+        </p>
+        <p><label>Path <input id="path" type="text" readonly size="72" style="max-width: 100%" /></label></p>
+        <p id="drop-hint" style="font-size: 0.85rem; color: #666">Drop zone: ウィンドウ内に .gguf をドロップ / Drop a .gguf file here.</p>
+      </section>
+
+      <p>
+        <label>Host <input id="host" type="text" value="127.0.0.1" /></label>
+        <label> Port <input id="port" type="number" value="8080" /></label>
+      </p>
+      <p>
+        <label>Optional API key (if <code>HYPURA_API_KEY</code> is set on the server)<br />
+          <input id="apiKey" type="password" size="48" placeholder="same as server env" autocomplete="off" />
+        </label>
+      </p>
+      <p>
+        <button id="serve" type="button">Start hypura serve</button>
+        <button id="stop" type="button">Stop server process</button>
+        <button id="switch" type="button">Switch model (HTTP, server running)</button>
+      </p>
+      <p id="status"></p>
+
+      <section style="margin-top: 1.25rem">
+        <h2 style="font-size: 1.1rem">URLs（コピー用）/ Copy targets</h2>
+        <p><strong>Base URL:</strong> <code id="url">—</code> <button type="button" data-copy-target="url">Copy</button></p>
+        <p><code id="u-kobold-gen">—</code> <button type="button" data-copy-from="u-kobold-gen">Copy</button> <span style="font-size: 0.85rem; color: #666">POST Kobold <code>/api/v1/generate</code></span></p>
+        <p><code id="u-kobold-model">—</code> <button type="button" data-copy-from="u-kobold-model">Copy</button> <span style="font-size: 0.85rem; color: #666">GET Kobold <code>/api/v1/model</code></span></p>
+        <p><code id="u-lite">—</code> <button type="button" data-copy-from="u-lite">Copy</button> <span style="font-size: 0.85rem; color: #666">Kobold-lite UI</span></p>
+      </section>
+
+      <section style="margin-top: 1.25rem">
+        <h2 style="font-size: 1.1rem">最近の GGUF / Recent</h2>
+        <ul id="recent" style="padding-left: 1.2rem"></ul>
+      </section>
+
+      <p style="margin-top: 1.5rem; color: #555; font-size: 0.85rem">
+        <code>hypura</code> は PATH 上か、実行ファイルと同じフォルダの <code>hypura.exe</code>、または環境変数 <code>HYPURA_EXE</code> で指定します。
+      </p>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

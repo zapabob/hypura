@@ -1,0 +1,7 @@
+# Copy to %USERPROFILE%\.cargo\config.toml (merge with existing) to enable sccache.
+# Install: scoop install sccache  OR  cargo install sccache
+# Optional CMake (PowerShell): $env:CMAKE_C_COMPILER_LAUNCHER="sccache"; $env:CMAKE_CXX_COMPILER_LAUNCHER="sccache"
+
+[build]
+rustc-wrapper = "sccache"
+rustc-workspace-wrapper = "sccache"
