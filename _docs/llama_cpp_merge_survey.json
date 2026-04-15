@@ -1,11 +1,13 @@
 {
-  "generated_at_utc": "2026-04-10T22:42:30.031998+00:00",
+  "generated_at_utc": "2026-04-15T10:23:24.452267+00:00",
   "upstream_ref": "origin/master",
-  "head_short": "6c860647e",
-  "upstream_short": "3fc65063d",
+  "head_short": "df3913e92",
+  "upstream_short": "8dc530b86",
   "head_contains_upstream": true,
   "upstream_contains_head": false,
   "fork_only_commits": [
+    "df3913e92 merge: upstream ggerganov/llama.cpp master; keep Triality/TurboQuant API-aligned",
+    "785678b45 feat(turboquant): default TrialitySO8 rotation",
     "6c860647e merge: upstream ggerganov/llama.cpp master; keep Triality/TurboQuant",
     "dce830d55 merge: upstream ggerganov/llama.cpp master; keep Triality/TurboQuant",
     "a5974fd34 merge: upstream ggerganov/llama.cpp master; keep Triality/TurboQuant base",
