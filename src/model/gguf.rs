@@ -323,13 +323,26 @@ impl GgufFile {
         })
     }
 
+    /// Get a u64 metadata value, trying architecture-prefixed keys.
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.metadata.get(key).and_then(|v| v.as_u64()).or_else(|| {
+            let arch = self.get_string("general.architecture")?;
+            self.metadata
+                .get(&format!("{arch}.{key}"))
+                .and_then(|v| v.as_u64())
+        })
+    }
+
     /// Get a bool metadata value, trying both `general.X` and `X` keys.
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        self.metadata.get(key).and_then(|v| v.as_bool()).or_else(|| {
-            self.metadata
-                .get(&format!("general.{key}"))
-                .and_then(|v| v.as_bool())
-        })
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_bool())
+            .or_else(|| {
+                self.metadata
+                    .get(&format!("general.{key}"))
+                    .and_then(|v| v.as_bool())
+            })
     }
 
     /// Get a float metadata value, trying both `general.X` and `X` keys.

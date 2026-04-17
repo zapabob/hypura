@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use hypura::model::{gguf::GgufFile, metadata::ModelMetadata, tensor_role::TensorRole};
+use hypura::model::{
+    gguf::GgufFile, metadata::ModelMetadata, tensor_role::TensorRole,
+    turboquant_sidecar::read_gguf_turboquant_config,
+};
 
 use super::fmt_util::{format_bytes, format_params};
 
@@ -46,6 +49,40 @@ fn inspect_gguf(path: &Path, show_tensors: bool) -> anyhow::Result<()> {
         gguf.total_tensor_bytes() as f64 / (1u64 << 30) as f64
     );
     println!("  Tensors: {}", gguf.tensors.len());
+
+    if let Some(tq) = read_gguf_turboquant_config(&gguf, &metadata) {
+        println!("  Triality/TurboQuant:");
+        println!("    Source: {}", tq.source_label());
+        println!("    Public mode: {}", tq.public_mode_label);
+        println!("    Runtime mode: {}", tq.runtime_mode);
+        println!("    Schema version: {}", tq.schema_version);
+        println!(
+            "    Rotation: {} (seed={})",
+            tq.rotation_policy
+                .map(|policy| policy.as_str().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            tq.rotation_seed
+        );
+        println!(
+            "    Triality view: {} (mix={:.3})",
+            tq.triality_view.as_deref().unwrap_or("none"),
+            tq.triality_mix.unwrap_or(0.0)
+        );
+        println!(
+            "    Fidelity: paper_fidelity={} k_bits={:.3} v_bits={:.3}",
+            tq.paper_fidelity, tq.k_bits, tq.v_bits
+        );
+        println!(
+            "    Payload: format={} bytes={} inline_json={}",
+            tq.payload_format.as_deref().unwrap_or("none"),
+            tq.payload_bytes,
+            if tq.payload_json.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
 
     if show_tensors {
         println!();

@@ -105,6 +105,9 @@ enum Commands {
         /// Optional Kobold-lite theme hint (stored in env for UI)
         #[arg(long, default_value = "classic")]
         ui_theme: String,
+        /// Resolve Triality/TurboQuant runtime wiring without loading the model server
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -137,6 +140,9 @@ enum Commands {
         /// Rotation seed for deterministic rotation
         #[arg(long, default_value = "0")]
         rotation_seed: u32,
+        /// Resolve runtime and print the benchmark plan without loading the model
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print model metadata, tensor list, and placement plan
     Inspect {
@@ -212,6 +218,7 @@ fn main() -> anyhow::Result<()> {
             tq_artifact,
             model_dir,
             ui_theme,
+            dry_run,
         } => cli::serve::run(
             &model,
             &host,
@@ -229,6 +236,7 @@ fn main() -> anyhow::Result<()> {
             tq_artifact.as_deref(),
             model_dir.as_deref(),
             &ui_theme,
+            dry_run,
         ),
         Commands::Bench {
             model,
@@ -241,6 +249,7 @@ fn main() -> anyhow::Result<()> {
             turboquant_config,
             rotation_policy,
             rotation_seed,
+            dry_run,
         } => cli::bench::run(
             &model,
             baseline,
@@ -252,6 +261,7 @@ fn main() -> anyhow::Result<()> {
             turboquant_config.as_deref(),
             rotation_policy,
             rotation_seed,
+            dry_run,
         ),
         Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
         Commands::Iobench { model, read_gb } => cli::iobench::run(&model, read_gb),

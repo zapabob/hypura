@@ -1,24 +1,46 @@
 use std::env;
 use std::path::PathBuf;
 
+fn resolve_llama_dir(manifest_dir: &str) -> PathBuf {
+    let explicit = env::var_os("HYPURA_LLAMA_CPP_PATH").map(PathBuf::from);
+    let candidate = explicit
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(manifest_dir).join("../vendor/llama.cpp"));
+
+    dunce::canonicalize(&candidate).unwrap_or_else(|_| {
+        if explicit.is_some() {
+            panic!(
+                "HYPURA_LLAMA_CPP_PATH not found or invalid: {}",
+                candidate.display()
+            );
+        }
+        panic!(
+            "vendor/llama.cpp not found: {} (run `git submodule update --init --recursive` or set HYPURA_LLAMA_CPP_PATH)",
+            candidate.display()
+        );
+    })
+}
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let llama_dir = PathBuf::from(&manifest_dir).join("../vendor/llama.cpp");
-    // dunce::canonicalize strips the \\?\ UNC prefix that std::fs::canonicalize
-    // adds on Windows, which would otherwise cause MSBuild to reject source paths.
-    let llama_dir = dunce::canonicalize(&llama_dir)
-        .expect("vendor/llama.cpp not found — run: git submodule update --init --recursive");
+    let llama_dir = resolve_llama_dir(&manifest_dir);
+
+    println!("cargo:rerun-if-env-changed=HYPURA_LLAMA_CPP_PATH");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let use_metal = target_os == "macos";
     let use_cuda = !use_metal && cuda_is_available();
 
-    // ── Build llama.cpp via cmake ────────────────────────────────────────────
     let mut cmake_config = cmake::Config::new(&llama_dir);
-    // cmake-rs may default to a preview VS generator (e.g. VS 18 2026) that is not
-    // installed. Prefer VS 2022 when the user has not set CMAKE_GENERATOR.
     if target_os == "windows" && env::var("CMAKE_GENERATOR").is_err() {
         cmake_config.generator("Visual Studio 17 2022");
+    }
+    if target_os == "windows" {
+        if let Some(masm) = find_masm() {
+            let masm = masm.display().to_string();
+            cmake_config.define("CMAKE_ASM_COMPILER", &masm);
+            cmake_config.define("CMAKE_ASM_MASM_COMPILER", masm);
+        }
     }
     cmake_config
         .define("BUILD_SHARED_LIBS", "OFF")
@@ -28,20 +50,16 @@ fn main() {
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
         .define("GGML_CPU", "ON")
-        .define("GGML_BLAS", "OFF");
+        .define("GGML_BLAS", "OFF")
+        .define("GGML_CPU_REPACK", "OFF");
 
     if use_metal {
-        // macOS / Apple Silicon — Metal GPU
         cmake_config
             .define("GGML_METAL", "ON")
             .define("GGML_METAL_EMBED_LIBRARY", "ON")
             .define("GGML_CUDA", "OFF")
             .define("GGML_OPENMP", "OFF");
     } else if use_cuda {
-        // Windows / WSL2 / Linux — NVIDIA CUDA
-        // Target RTX 20xx (sm_75) and up through RTX 50xx / H100 (sm_120).
-        // "native" detects only the current machine's GPU; a fixed list enables
-        // building a binary that runs on multiple NVIDIA generations.
         let cuda_arches =
             env::var("HYPURA_CUDA_ARCHITECTURES").unwrap_or_else(|_| "75;86;89;90".to_string());
 
@@ -58,7 +76,6 @@ fn main() {
             cmake_config.define("CUDAToolkit_ROOT", cuda_root.display().to_string());
         }
     } else {
-        // CPU-only fallback
         cmake_config
             .define("GGML_METAL", "OFF")
             .define("GGML_CUDA", "OFF")
@@ -68,7 +85,6 @@ fn main() {
     let dst = cmake_config.build();
     let lib_dir = dst.join("lib");
 
-    // ── Link the static libraries ────────────────────────────────────────────
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=llama");
     println!("cargo:rustc-link-lib=static=ggml");
@@ -93,19 +109,16 @@ fn main() {
         if target_os == "linux" {
             println!("cargo:rustc-link-lib=stdc++");
         }
-        // Windows: MSVC links its C++ runtime automatically.
     } else if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
     }
 
-    // Propagate feature flags to Rust code via cfg()
     if use_metal {
         println!("cargo:rustc-cfg=hypura_metal");
     } else if use_cuda {
         println!("cargo:rustc-cfg=hypura_cuda");
     }
 
-    // ── Compile the custom GGML buffer type C shim ───────────────────────────
     let src_dir = PathBuf::from(&manifest_dir).join("src");
     let include_ggml_internal = llama_dir.join("ggml/src");
 
@@ -119,7 +132,6 @@ fn main() {
         .include(&include_ggml_internal)
         .include(&src_dir);
 
-    // MSVC doesn't accept -std=c11; GCC/Clang do.
     if target_os != "windows" {
         cc_build.flag("-std=c11");
     }
@@ -132,7 +144,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/hypura_sampler_ext.c");
     println!("cargo:rerun-if-changed=src/hypura_sampler_ext.h");
 
-    // ── Generate Rust bindings via bindgen ───────────────────────────────────
     let include_llama = llama_dir.join("include");
     let include_ggml = llama_dir.join("ggml/include");
 
@@ -181,23 +192,17 @@ fn main() {
     );
 }
 
-// ── CUDA detection helpers ────────────────────────────────────────────────────
-
 fn cuda_is_available() -> bool {
-    // Explicit opt-out
     if env::var("HYPURA_NO_CUDA").is_ok() {
         return false;
     }
-    // Explicit opt-in (useful in CI or when auto-detection fails)
     if env::var("HYPURA_CUDA").is_ok() {
         return true;
     }
     get_cuda_root().is_some()
 }
 
-/// Return the CUDA toolkit root, trying common locations.
 fn get_cuda_root() -> Option<PathBuf> {
-    // Set by the Windows CUDA installer or by the user
     if let Ok(p) = env::var("CUDA_PATH") {
         let path = PathBuf::from(p);
         if path.exists() {
@@ -205,7 +210,6 @@ fn get_cuda_root() -> Option<PathBuf> {
         }
     }
 
-    // Linux / WSL2 default
     for candidate in &["/usr/local/cuda", "/usr/cuda"] {
         let p = PathBuf::from(candidate);
         if p.exists() {
@@ -213,7 +217,6 @@ fn get_cuda_root() -> Option<PathBuf> {
         }
     }
 
-    // If nvcc is on PATH, try to derive the root from it
     if let Some(nvcc) = find_nvcc() {
         if let Some(bin) = nvcc.parent() {
             if let Some(root) = bin.parent() {
@@ -237,12 +240,7 @@ fn get_cuda_lib_path() -> Option<PathBuf> {
 }
 
 fn find_nvcc() -> Option<PathBuf> {
-    // Check well-known paths first to avoid PATH-injection
-    let candidates = [
-        "/usr/local/cuda/bin/nvcc",
-        "/usr/cuda/bin/nvcc",
-        // Windows: CUDA_PATH is checked above; if we reach here, fall back to PATH
-    ];
+    let candidates = ["/usr/local/cuda/bin/nvcc", "/usr/cuda/bin/nvcc"];
     for c in &candidates {
         let p = PathBuf::from(c);
         if p.exists() {
@@ -250,7 +248,6 @@ fn find_nvcc() -> Option<PathBuf> {
         }
     }
 
-    // Last-resort: check that `nvcc` is runnable
     let ok = std::process::Command::new("nvcc")
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -259,7 +256,45 @@ fn find_nvcc() -> Option<PathBuf> {
         .map(|s| s.success())
         .unwrap_or(false);
     if ok {
-        return Some(PathBuf::from("nvcc")); // rely on PATH
+        return Some(PathBuf::from("nvcc"));
+    }
+
+    None
+}
+
+fn find_masm() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("VCToolsInstallDir") {
+        let candidate = PathBuf::from(dir).join("bin/Hostx64/x64/ml64.exe");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    let roots = [
+        PathBuf::from(
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC",
+        ),
+        PathBuf::from(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC"),
+    ];
+
+    for root in roots {
+        let mut versions: Vec<PathBuf> = match std::fs::read_dir(&root) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect(),
+            Err(_) => continue,
+        };
+        versions.sort();
+        versions.reverse();
+
+        for version_dir in versions {
+            let candidate = version_dir.join("bin/Hostx64/x64/ml64.exe");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
     }
 
     None
