@@ -240,7 +240,11 @@ impl ResolvedTurboQuantConfig {
         self.source_path
             .as_ref()
             .map(|p| p.display().to_string())
-            .or_else(|| self.gguf_metadata.as_ref().map(|cfg| cfg.source_label().to_string()))
+            .or_else(|| {
+                self.gguf_metadata
+                    .as_ref()
+                    .map(|cfg| cfg.source_label().to_string())
+            })
             .unwrap_or_else(|| "none".to_string())
     }
 
@@ -252,10 +256,19 @@ impl ResolvedTurboQuantConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GgufTurboQuantConfig {
     pub enabled: bool,
+    pub schema_version: u32,
     pub mode: TurboQuantMode,
+    pub public_mode_label: String,
+    pub runtime_mode: String,
     pub rotation_policy: Option<RotationPolicy>,
     pub triality_view: Option<String>,
     pub triality_mix: Option<f32>,
+    pub paper_fidelity: bool,
+    pub k_bits: f32,
+    pub v_bits: f32,
+    pub payload_format: Option<String>,
+    pub payload_bytes: u64,
+    pub payload_json: Option<String>,
     pub rotation_seed: u32,
     pub artifact_path: Option<String>,
     pub head_dim: u32,
@@ -265,7 +278,38 @@ pub struct GgufTurboQuantConfig {
 
 impl GgufTurboQuantConfig {
     pub fn source_label(&self) -> &'static str {
-        "gguf-metadata"
+        "gguf-embedded"
+    }
+}
+
+fn parse_embedded_mode(raw_mode: &str) -> Option<(TurboQuantMode, String, String)> {
+    match raw_mode {
+        "paper-faithful" => Some((
+            TurboQuantMode::PaperKeyOnly,
+            "paper-faithful".to_string(),
+            "paper-key-only".to_string(),
+        )),
+        "triality-so8-pareto" => Some((
+            TurboQuantMode::ResearchKvSplit,
+            "triality-so8-pareto".to_string(),
+            "research-kv-split".to_string(),
+        )),
+        "paper-key-only" => Some((
+            TurboQuantMode::PaperKeyOnly,
+            "paper-faithful".to_string(),
+            "paper-key-only".to_string(),
+        )),
+        "paper-full-kv" => Some((
+            TurboQuantMode::PaperFullKv,
+            "paper-faithful".to_string(),
+            "paper-full-kv".to_string(),
+        )),
+        "research-kv-split" => Some((
+            TurboQuantMode::ResearchKvSplit,
+            "triality-so8-pareto".to_string(),
+            "research-kv-split".to_string(),
+        )),
+        _ => None,
     }
 }
 
@@ -276,10 +320,19 @@ pub fn resolve_turboquant_config(
     mode: TurboQuantMode,
     explicit_config: Option<&Path>,
 ) -> anyhow::Result<ResolvedTurboQuantConfig> {
+    let gguf_metadata = read_gguf_turboquant_config(gguf, metadata);
+    if let Some(gguf_metadata) = gguf_metadata {
+        return Ok(ResolvedTurboQuantConfig {
+            mode: gguf_metadata.mode,
+            schema_kind: None,
+            source_path: None,
+            config: None,
+            gguf_metadata: Some(gguf_metadata),
+        });
+    }
+
     if mode == TurboQuantMode::Exact {
-        let mut resolved = ResolvedTurboQuantConfig::exact();
-        resolved.gguf_metadata = read_gguf_turboquant_config(gguf, metadata);
-        return Ok(resolved);
+        return Ok(ResolvedTurboQuantConfig::exact());
     }
 
     let config_path = match explicit_config {
@@ -287,20 +340,6 @@ pub fn resolve_turboquant_config(
         None => match auto_discover_sidecar_path(model_path, mode) {
             Some(path) => path,
             None => {
-                if let Some(gguf_metadata) = read_gguf_turboquant_config(gguf, metadata) {
-                    anyhow::ensure!(
-                        gguf_metadata.mode == mode,
-                        "GGUF TurboQuant metadata requests mode `{}`, but CLI requested `{mode}`",
-                        gguf_metadata.mode
-                    );
-                    return Ok(ResolvedTurboQuantConfig {
-                        mode,
-                        schema_kind: None,
-                        source_path: None,
-                        config: None,
-                        gguf_metadata: Some(gguf_metadata),
-                    });
-                }
                 // NOTE: Exact fallback preserves safety when research artifacts are missing.
                 // Broader "Triality-by-default without sidecar" alignment is tracked separately.
                 if mode == TurboQuantMode::ResearchKvSplit {
@@ -347,7 +386,7 @@ pub fn resolve_turboquant_config(
         schema_kind: Some(schema_kind),
         source_path: Some(config_path),
         config: Some(config),
-        gguf_metadata: read_gguf_turboquant_config(gguf, metadata),
+        gguf_metadata: None,
     })
 }
 
@@ -360,13 +399,8 @@ pub fn read_gguf_turboquant_config(
         return None;
     }
 
-    let mode = match gguf.get_string("hypura.turboquant.mode")? {
-        "exact" => TurboQuantMode::Exact,
-        "paper-key-only" => TurboQuantMode::PaperKeyOnly,
-        "paper-full-kv" => TurboQuantMode::PaperFullKv,
-        "research-kv-split" => TurboQuantMode::ResearchKvSplit,
-        _ => return None,
-    };
+    let raw_mode = gguf.get_string("hypura.turboquant.mode")?;
+    let (mode, public_mode_label, default_runtime_mode) = parse_embedded_mode(raw_mode)?;
 
     let rotation_policy = gguf
         .get_string("hypura.turboquant.rotation_policy")
@@ -391,10 +425,33 @@ pub fn read_gguf_turboquant_config(
 
     Some(GgufTurboQuantConfig {
         enabled,
+        schema_version: gguf
+            .get_u32("hypura.turboquant.schema_version")
+            .unwrap_or(0),
         mode,
+        public_mode_label,
+        runtime_mode: gguf
+            .get_string("hypura.turboquant.runtime_mode")
+            .unwrap_or(&default_runtime_mode)
+            .to_string(),
         rotation_policy,
         triality_view,
         triality_mix: gguf.get_f32("hypura.turboquant.triality_mix"),
+        paper_fidelity: gguf
+            .get_bool("hypura.turboquant.paper_fidelity")
+            .unwrap_or(matches!(
+                mode,
+                TurboQuantMode::PaperKeyOnly | TurboQuantMode::PaperFullKv
+            )),
+        k_bits: gguf.get_f32("hypura.turboquant.k_bits").unwrap_or(0.0),
+        v_bits: gguf.get_f32("hypura.turboquant.v_bits").unwrap_or(0.0),
+        payload_format: gguf
+            .get_string("hypura.turboquant.payload_format")
+            .map(ToOwned::to_owned),
+        payload_bytes: gguf.get_u64("hypura.turboquant.payload_bytes").unwrap_or(0),
+        payload_json: gguf
+            .get_string("hypura.turboquant.payload_json")
+            .map(ToOwned::to_owned),
         rotation_seed: gguf.get_u32("hypura.turboquant.rotation_seed").unwrap_or(0),
         artifact_path: gguf
             .get_string("hypura.turboquant.artifact")
@@ -723,13 +780,21 @@ mod tests {
     #[test]
     fn gguf_triality_metadata_resolves_without_sidecar() {
         let mut gguf = sample_gguf();
-        gguf.metadata.insert(
-            "hypura.turboquant.enabled".into(),
-            GgufValue::Bool(true),
-        );
+        let payload_json = serde_json::json!({
+            "schema_kind": "triality_gguf_payload",
+            "schema_version": 1,
+            "mode": "triality-so8-pareto"
+        })
+        .to_string();
+        gguf.metadata
+            .insert("hypura.turboquant.enabled".into(), GgufValue::Bool(true));
         gguf.metadata.insert(
             "hypura.turboquant.mode".into(),
-            GgufValue::String("research-kv-split".into()),
+            GgufValue::String("triality-so8-pareto".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.schema_version".into(),
+            GgufValue::Uint32(1),
         );
         gguf.metadata.insert(
             "hypura.turboquant.rotation_policy".into(),
@@ -743,6 +808,26 @@ mod tests {
             "hypura.turboquant.triality_mix".into(),
             GgufValue::Float32(0.75),
         );
+        gguf.metadata
+            .insert("hypura.turboquant.k_bits".into(), GgufValue::Float32(3.5));
+        gguf.metadata
+            .insert("hypura.turboquant.v_bits".into(), GgufValue::Float32(8.0));
+        gguf.metadata.insert(
+            "hypura.turboquant.paper_fidelity".into(),
+            GgufValue::Bool(false),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.payload_format".into(),
+            GgufValue::String("json-inline-v1".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.payload_bytes".into(),
+            GgufValue::Uint64(payload_json.len() as u64),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.payload_json".into(),
+            GgufValue::String(payload_json),
+        );
 
         let resolved = resolve_turboquant_config(
             Path::new("model.gguf"),
@@ -753,10 +838,59 @@ mod tests {
         )
         .unwrap();
 
-        let gguf_cfg = resolved.gguf_metadata.expect("gguf metadata should be attached");
+        let gguf_cfg = resolved
+            .gguf_metadata
+            .expect("gguf metadata should be attached");
         assert_eq!(gguf_cfg.mode, TurboQuantMode::ResearchKvSplit);
-        assert_eq!(gguf_cfg.rotation_policy, Some(RotationPolicy::TrialitySpinorPlus));
+        assert_eq!(gguf_cfg.public_mode_label, "triality-so8-pareto");
+        assert_eq!(gguf_cfg.runtime_mode, "research-kv-split");
+        assert_eq!(gguf_cfg.schema_version, 1);
+        assert_eq!(
+            gguf_cfg.rotation_policy,
+            Some(RotationPolicy::TrialitySpinorPlus)
+        );
         assert_eq!(gguf_cfg.triality_view.as_deref(), Some("spinor_plus_proxy"));
         assert_eq!(gguf_cfg.rotation_seed, 17);
+        assert_eq!(gguf_cfg.payload_format.as_deref(), Some("json-inline-v1"));
+        assert_eq!(
+            gguf_cfg.payload_bytes,
+            gguf_cfg.payload_json.as_ref().unwrap().len() as u64
+        );
+    }
+
+    #[test]
+    fn gguf_triality_metadata_overrides_cli_mode_defaults() {
+        let mut gguf = sample_gguf();
+        gguf.metadata
+            .insert("hypura.turboquant.enabled".into(), GgufValue::Bool(true));
+        gguf.metadata.insert(
+            "hypura.turboquant.mode".into(),
+            GgufValue::String("paper-faithful".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.schema_version".into(),
+            GgufValue::Uint32(1),
+        );
+
+        let resolved = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &sample_metadata(),
+            &gguf,
+            TurboQuantMode::ResearchKvSplit,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.mode, TurboQuantMode::PaperKeyOnly);
+        assert!(resolved.config.is_none());
+        assert!(resolved.source_path.is_none());
+        assert_eq!(
+            resolved
+                .gguf_metadata
+                .as_ref()
+                .expect("gguf metadata should win")
+                .public_mode_label,
+            "paper-faithful"
+        );
     }
 }

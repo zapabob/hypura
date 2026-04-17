@@ -246,18 +246,18 @@ unsafe extern "C" fn compress_k_callback(
     }
 
     let codec_ptr = rust_ctx as *const Mutex<Box<dyn KvCodec + Send>>;
-    let codec = match codec_ptr.as_ref() {
+    let codec = match unsafe { codec_ptr.as_ref() } {
         Some(c) => c,
         None => return -1,
     };
 
-    let data = std::slice::from_raw_parts(k_data, head_dim as usize);
+    let data = unsafe { std::slice::from_raw_parts(k_data, head_dim as usize) };
 
     let result = codec.lock().unwrap().ingest_k(layer, head, token, data);
 
     match result {
         Ok(reconstructed) => {
-            let out_slice = std::slice::from_raw_parts_mut(output, head_dim as usize);
+            let out_slice = unsafe { std::slice::from_raw_parts_mut(output, head_dim as usize) };
             out_slice.copy_from_slice(&reconstructed);
             reconstructed.len() as i32
         }
@@ -280,18 +280,18 @@ unsafe extern "C" fn compress_v_callback(
     }
 
     let codec_ptr = rust_ctx as *const Mutex<Box<dyn KvCodec + Send>>;
-    let codec = match codec_ptr.as_ref() {
+    let codec = match unsafe { codec_ptr.as_ref() } {
         Some(c) => c,
         None => return -1,
     };
 
-    let data = std::slice::from_raw_parts(v_data, head_dim as usize);
+    let data = unsafe { std::slice::from_raw_parts(v_data, head_dim as usize) };
 
     let result = codec.lock().unwrap().ingest_v(layer, head, token, data);
 
     match result {
         Ok(reconstructed) => {
-            let out_slice = std::slice::from_raw_parts_mut(output, head_dim as usize);
+            let out_slice = unsafe { std::slice::from_raw_parts_mut(output, head_dim as usize) };
             out_slice.copy_from_slice(&reconstructed);
             reconstructed.len() as i32
         }
@@ -315,12 +315,12 @@ unsafe extern "C" fn score_k_callback(
     }
 
     let codec_ptr = rust_ctx as *const Mutex<Box<dyn KvCodec + Send>>;
-    let codec = match codec_ptr.as_ref() {
+    let codec = match unsafe { codec_ptr.as_ref() } {
         Some(c) => c,
         None => return -1,
     };
 
-    let query_slice = std::slice::from_raw_parts(query, head_dim as usize);
+    let query_slice = unsafe { std::slice::from_raw_parts(query, head_dim as usize) };
     let token_range: Range<u32> = token_start..token_end;
     let n_tokens = (token_end - token_start) as usize;
 
@@ -331,7 +331,7 @@ unsafe extern "C" fn score_k_callback(
 
     match result {
         Ok(scored) => {
-            let out_slice = std::slice::from_raw_parts_mut(scores, n_tokens);
+            let out_slice = unsafe { std::slice::from_raw_parts_mut(scores, n_tokens) };
             out_slice.copy_from_slice(&scored);
             0
         }
@@ -354,7 +354,7 @@ unsafe extern "C" fn read_v_callback(
     }
 
     let codec_ptr = rust_ctx as *const Mutex<Box<dyn KvCodec + Send>>;
-    let codec = match codec_ptr.as_ref() {
+    let codec = match unsafe { codec_ptr.as_ref() } {
         Some(c) => c,
         None => return -1,
     };
@@ -367,7 +367,7 @@ unsafe extern "C" fn read_v_callback(
 
     match result {
         Ok(values) => {
-            let out_slice = std::slice::from_raw_parts_mut(v_buffer, total_elements);
+            let out_slice = unsafe { std::slice::from_raw_parts_mut(v_buffer, total_elements) };
             out_slice.copy_from_slice(&values[..total_elements.min(values.len())]);
             0
         }
@@ -419,6 +419,7 @@ mod tests {
             schema_kind: Some(TurboQuantSchemaKind::Paper),
             source_path: None,
             config: Some(TurboQuantSidecarConfig::Paper(paper)),
+            gguf_metadata: None,
         }
     }
 

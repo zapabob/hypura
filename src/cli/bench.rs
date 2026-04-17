@@ -26,6 +26,7 @@ pub fn run(
     turboquant_config: Option<&str>,
     rotation_policy: RotationPolicy,
     rotation_seed: u32,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
@@ -39,6 +40,7 @@ pub fn run(
         turboquant_config,
         rotation_policy,
         rotation_seed,
+        dry_run,
     ))
 }
 
@@ -53,6 +55,7 @@ async fn run_async(
     turboquant_config: Option<&str>,
     rotation_policy: RotationPolicy,
     rotation_seed: u32,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     let prompt_text = prompt.unwrap_or(DEFAULT_PROMPT);
@@ -68,6 +71,47 @@ async fn run_async(
         turboquant_config.map(Path::new),
         llama_bridge,
     )?;
+
+    if dry_run {
+        println!();
+        println!("Hypura benchmark dry-run");
+        println!("  Model: {}", path.display());
+        println!(
+            "  Placement: {} GPU | {} RAM | {} NVMe",
+            format_bytes(runtime.placement_summary.total_gpu_bytes),
+            format_bytes(runtime.placement_summary.total_ram_bytes),
+            format_bytes(runtime.placement_summary.total_nvme_bytes),
+        );
+        println!(
+            "  Config: context={}, max_tokens={}, n_gpu_layers={}, baseline={}",
+            context, max_tokens, runtime.n_gpu_layers, run_baseline
+        );
+        println!(
+            "  TurboQuant: mode={}, schema={}, config={}, runtime_status={}",
+            runtime.turboquant.mode,
+            runtime.turboquant.schema_label(),
+            runtime.turboquant.source_label(),
+            turboquant_runtime_status(runtime.turboquant.mode, runtime.turboquant.config.is_some()),
+        );
+        if let Some(ref gguf_cfg) = runtime.turboquant.gguf_metadata {
+            println!(
+                "  Triality profile: public_mode={}, runtime_mode={}, schema_version={}",
+                gguf_cfg.public_mode_label, gguf_cfg.runtime_mode, gguf_cfg.schema_version
+            );
+            println!(
+                "  Triality payload: format={} bytes={} inline_json={}",
+                gguf_cfg.payload_format.as_deref().unwrap_or("none"),
+                gguf_cfg.payload_bytes,
+                if gguf_cfg.payload_json.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+        }
+        println!("  Dry-run: benchmark plan resolved without loading model weights");
+        return Ok(());
+    }
 
     let has_nvme = runtime
         .plan

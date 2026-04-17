@@ -1,8 +1,8 @@
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 use std::sync::atomic::AtomicBool;
-use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use hypura::compute::inference::{self, LlamaTurboquantCliBridge};
 use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
@@ -36,6 +36,7 @@ pub fn run(
     tq_artifact: Option<&str>,
     model_dir: Option<&str>,
     ui_theme: &str,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     let llama_bridge = LlamaTurboquantCliBridge {
         rotation_policy,
@@ -59,13 +60,8 @@ pub fn run(
         turboquant_config,
         model_dir,
         llama_bridge,
+        dry_run,
     ))
-}
-async fn api_key() -> Option<String> {
-    std::env::var("HYPURA_API_KEY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 async fn run_async(
     model_path: &str,
@@ -76,6 +72,7 @@ async fn run_async(
     turboquant_config: Option<&str>,
     model_dir: Option<&str>,
     llama_bridge: LlamaTurboquantCliBridge,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
 
@@ -102,6 +99,66 @@ async fn run_async(
     )?;
     if cli_progress_enabled() {
         pb_setup.finish_and_clear();
+    }
+
+    if dry_run {
+        println!();
+        println!("Hypura serve dry-run");
+        println!("  Model: {}", path.display());
+        println!("  Bind: http://{host}:{port}");
+        println!(
+            "  Placement: GPU={} RAM={} NVMe={} n_gpu_layers={}",
+            runtime.placement_summary.total_gpu_bytes,
+            runtime.placement_summary.total_ram_bytes,
+            runtime.placement_summary.total_nvme_bytes,
+            runtime.n_gpu_layers
+        );
+        println!(
+            "  TurboQuant: mode={}, schema={}, config={}, runtime_status={}",
+            runtime.turboquant.mode,
+            runtime.turboquant.schema_label(),
+            runtime.turboquant.source_label(),
+            if runtime.turboquant.mode == hypura::model::turboquant_sidecar::TurboQuantMode::Exact {
+                "inactive"
+            } else if runtime.turboquant.mode
+                == hypura::model::turboquant_sidecar::TurboQuantMode::PaperFullKv
+            {
+                "experimental-full-kv"
+            } else {
+                "faithful-attached"
+            }
+        );
+        if let Some(ref gguf_cfg) = runtime.turboquant.gguf_metadata {
+            println!(
+                "  Triality profile: public_mode={}, runtime_mode={}, schema_version={}",
+                gguf_cfg.public_mode_label, gguf_cfg.runtime_mode, gguf_cfg.schema_version
+            );
+            println!(
+                "  Triality rotation: policy={}, seed={}, view={}, mix={:.3}",
+                gguf_cfg
+                    .rotation_policy
+                    .map(|policy| policy.as_str().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                gguf_cfg.rotation_seed,
+                gguf_cfg.triality_view.as_deref().unwrap_or("none"),
+                gguf_cfg.triality_mix.unwrap_or(0.0)
+            );
+            println!(
+                "  Triality payload: format={}, bytes={}, paper_fidelity={}, k_bits={:.3}, v_bits={:.3}, inline_json={}",
+                gguf_cfg.payload_format.as_deref().unwrap_or("none"),
+                gguf_cfg.payload_bytes,
+                gguf_cfg.paper_fidelity,
+                gguf_cfg.k_bits,
+                gguf_cfg.v_bits,
+                if gguf_cfg.payload_json.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+        }
+        println!("  Dry-run: runtime wiring resolved without loading model weights");
+        return Ok(());
     }
     let file_size = std::fs::metadata(path)?.len();
 
@@ -178,8 +235,7 @@ async fn run_async(
         .filter(|s| matches!(s.as_str(), "light" | "dark" | "classic"))
         .unwrap_or_else(|| "classic".to_string());
 
-    let serve_turboquant_config_path =
-        turboquant_config.map(|s| std::path::PathBuf::from(s));
+    let serve_turboquant_config_path = turboquant_config.map(|s| std::path::PathBuf::from(s));
 
     let state = Arc::new(AppState {
         loaded_model: Arc::new(std::sync::Mutex::new(loaded)),
@@ -218,7 +274,9 @@ async fn run_async(
         .filter(|s| !s.trim().is_empty())
         .is_some()
     {
-        println!("  API key: required (HYPURA_API_KEY); use Authorization: Bearer <key> or X-API-Key");
+        println!(
+            "  API key: required (HYPURA_API_KEY); use Authorization: Bearer <key> or X-API-Key"
+        );
     }
     println!(
         "  TurboQuant: mode={}, schema={}, config={}, runtime_status={}",
@@ -235,6 +293,35 @@ async fn run_async(
             "faithful-attached"
         }
     );
+    if let Some(ref gguf_cfg) = state.turboquant.gguf_metadata {
+        println!(
+            "  Triality profile: public_mode={}, runtime_mode={}, schema_version={}",
+            gguf_cfg.public_mode_label, gguf_cfg.runtime_mode, gguf_cfg.schema_version
+        );
+        println!(
+            "  Triality rotation: policy={}, seed={}, view={}, mix={:.3}",
+            gguf_cfg
+                .rotation_policy
+                .map(|policy| policy.as_str().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            gguf_cfg.rotation_seed,
+            gguf_cfg.triality_view.as_deref().unwrap_or("none"),
+            gguf_cfg.triality_mix.unwrap_or(0.0)
+        );
+        println!(
+            "  Triality payload: format={}, bytes={}, paper_fidelity={}, k_bits={:.3}, v_bits={:.3}, inline_json={}",
+            gguf_cfg.payload_format.as_deref().unwrap_or("none"),
+            gguf_cfg.payload_bytes,
+            gguf_cfg.paper_fidelity,
+            gguf_cfg.k_bits,
+            gguf_cfg.v_bits,
+            if gguf_cfg.payload_json.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
     println!();
 
     axum::serve(listener, app).await?;
