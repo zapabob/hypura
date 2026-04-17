@@ -50,7 +50,7 @@ fn inspect_gguf(path: &Path, show_tensors: bool) -> anyhow::Result<()> {
     );
     println!("  Tensors: {}", gguf.tensors.len());
 
-    if let Some(tq) = read_gguf_turboquant_config(&gguf, &metadata) {
+    if let Some(tq) = read_gguf_turboquant_config(&gguf, &metadata)? {
         println!("  Triality/TurboQuant:");
         println!("    Source: {}", tq.source_label());
         println!("    Public mode: {}", tq.public_mode_label);

@@ -7,6 +7,7 @@ use std::time::Instant;
 use hypura::compute::inference::{self, LlamaTurboquantCliBridge};
 use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
 use hypura::scheduler::types::{HostPinnedPolicy, ResidencyPolicyConfig, ResidencyProfile};
+use hypura::server::compat::{CompatFeatureFlags, CompatPerfState};
 use hypura::server::ollama_types::GgufInfo;
 use hypura::server::routes::{self, AppState};
 use hypura::telemetry::metrics::TelemetryEmitter;
@@ -277,6 +278,14 @@ async fn run_async(
         gui_history: Arc::new(std::sync::Mutex::new(VecDeque::new())),
         gui_events: Arc::new(std::sync::Mutex::new(VecDeque::new())),
         ui_theme: Arc::new(std::sync::Mutex::new(init_theme)),
+        compat_started_at: Instant::now(),
+        compat_default_max_length: context,
+        compat_features: CompatFeatureFlags {
+            websearch: true,
+            embeddings: true,
+            ..CompatFeatureFlags::default()
+        },
+        compat_perf: Arc::new(std::sync::Mutex::new(CompatPerfState::default())),
     });
 
     let app = routes::router(state.clone());
