@@ -20,6 +20,7 @@ use crate::compute::inference::{
 use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
 use crate::scheduler::types::ResidencyPolicyConfig;
 use crate::server::chat::format_chat_prompt;
+use crate::server::compat::{self, CompatFeatureFlags, CompatPerfState};
 use crate::server::ollama_types::*;
 use crate::server::streaming;
 use crate::telemetry::metrics::TelemetryEmitter;
@@ -45,12 +46,28 @@ pub struct AppState {
     pub gui_history: Arc<Mutex<VecDeque<GuiHistoryItem>>>,
     pub gui_events: Arc<Mutex<VecDeque<GuiEventItem>>>,
     pub ui_theme: Arc<Mutex<String>>,
+    pub compat_started_at: Instant,
+    pub compat_default_max_length: u32,
+    pub compat_features: CompatFeatureFlags,
+    pub compat_perf: Arc<Mutex<CompatPerfState>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(health_handler))
         .route("/api/version", get(version_handler))
+        .route("/api/extra/version", get(kobold_extra_version_handler))
+        .route("/api/extra/perf", get(kobold_perf_handler))
+        .route("/api/extra/tokencount", post(kobold_token_count_handler))
+        .route("/api/extra/tokenize", post(kobold_token_count_handler))
+        .route("/api/extra/websearch", post(kobold_websearch_handler))
+        .route("/api/extra/embeddings", post(openai_embeddings_handler))
+        .route("/api/v1/info/version", get(kobold_api_info_version_handler))
+        .route("/api/v1/config/max_length", get(kobold_max_length_handler))
+        .route(
+            "/api/v1/config/max_context_length",
+            get(kobold_max_context_length_handler),
+        )
         .route("/api/tags", get(tags_handler))
         .route("/api/show", post(show_handler))
         .route("/kobold-lite", get(kobold_lite_gui_handler))
@@ -70,6 +87,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/chat", post(chat_handler))
         .route("/api/v1/model", get(kobold_model_handler))
         .route("/api/v1/generate", post(kobold_generate_handler))
+        .route("/v1/completions", post(openai_completions_handler))
+        .route("/v1/chat/completions", post(openai_chat_completions_handler))
+        .route(
+            "/lcpp/v1/chat/completions",
+            post(openai_chat_completions_handler),
+        )
+        .route("/v1/embeddings", post(openai_embeddings_handler))
+        .route("/sdapi/v1/txt2img", post(txt2img_unavailable_handler))
+        .route(
+            "/api/extra/transcribe",
+            post(transcribe_unavailable_handler),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcribe_unavailable_handler),
+        )
         .route(
             "/api/extra/generate/stream",
             post(kobold_generate_stream_handler),
@@ -129,6 +162,59 @@ async fn health_handler() -> Json<serde_json::Value> {
 
 async fn version_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({"version": env!("CARGO_PKG_VERSION")}))
+}
+
+async fn kobold_extra_version_handler(State(state): State<Arc<AppState>>) -> Json<KcppVersionResponse> {
+    let protected = std::env::var("HYPURA_API_KEY")
+        .ok()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    Json(compat::build_version_response(
+        protected,
+        state.compat_features,
+    ))
+}
+
+async fn kobold_perf_handler(State(state): State<Arc<AppState>>) -> Json<KcppPerfResponse> {
+    let snapshot = state.compat_perf.lock().unwrap().clone();
+    Json(compat::build_perf_response(
+        &snapshot,
+        state.compat_started_at,
+        state.generation_in_progress.load(Ordering::Relaxed),
+        false,
+    ))
+}
+
+async fn kobold_token_count_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TokenCountRequest>,
+) -> Json<TokenCountResponse> {
+    let model = state.loaded_model.lock().unwrap();
+    let ids = model.model.tokenize(&req.prompt, true, true);
+    Json(TokenCountResponse {
+        value: ids.len(),
+        ids,
+    })
+}
+
+async fn kobold_api_info_version_handler() -> Json<KoboldInfoVersionResponse> {
+    Json(KoboldInfoVersionResponse {
+        result: compat::KOBOLDAI_API_VERSION.into(),
+    })
+}
+
+async fn kobold_max_length_handler(State(state): State<Arc<AppState>>) -> Json<ScalarValueResponse> {
+    Json(ScalarValueResponse {
+        value: state.compat_default_max_length,
+    })
+}
+
+async fn kobold_max_context_length_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<ScalarValueResponse> {
+    Json(ScalarValueResponse {
+        value: state.default_context,
+    })
 }
 
 async fn kobold_lite_gui_handler() -> Html<&'static str> {

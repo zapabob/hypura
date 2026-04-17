@@ -24,19 +24,22 @@ pub struct ExpertLayout {
     pub expert_permutation: Option<Vec<u32>>,
 }
 
-/// Identifies which type of expert FFN tensor this is (gate, up, or down).
-/// Used as a cache key dimension — each expert has 3 tensor types.
+/// Identifies which type of expert FFN tensor this is.
+/// Used as a cache key dimension so fused expert layouts stay distinct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpertTensorType {
     Gate,
     Up,
     Down,
+    GateUp,
 }
 
 impl ExpertTensorType {
     /// Parse from a tensor name like `blk.N.ffn_gate_exps.weight`.
     pub fn from_name(name: &str) -> Option<Self> {
-        if name.contains("ffn_gate_exps") {
+        if name.contains("ffn_gate_up_exps") {
+            Some(Self::GateUp)
+        } else if name.contains("ffn_gate_exps") {
             Some(Self::Gate)
         } else if name.contains("ffn_up_exps") {
             Some(Self::Up)
@@ -109,6 +112,10 @@ mod tests {
         assert_eq!(
             ExpertTensorType::from_name("blk.0.ffn_down_exps.weight"),
             Some(ExpertTensorType::Down)
+        );
+        assert_eq!(
+            ExpertTensorType::from_name("blk.0.ffn_gate_up_exps.weight"),
+            Some(ExpertTensorType::GateUp)
         );
         assert_eq!(ExpertTensorType::from_name("blk.0.ffn_gate.weight"), None);
     }

@@ -234,6 +234,220 @@ pub struct KoboldTrueMaxContextLengthResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ScalarValueResponse {
+    pub value: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenCountRequest {
+    pub prompt: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenCountResponse {
+    pub value: usize,
+    pub ids: Vec<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KoboldInfoVersionResponse {
+    pub result: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KcppVersionResponse {
+    pub result: String,
+    pub version: String,
+    pub protected: bool,
+    pub txt2img: bool,
+    pub vision: bool,
+    pub transcribe: bool,
+    pub multiplayer: bool,
+    pub websearch: bool,
+    pub tts: bool,
+    pub embeddings: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KcppPerfResponse {
+    pub last_process: f64,
+    pub last_eval: f64,
+    pub last_token_count: u32,
+    pub last_seed: u32,
+    pub last_draft_success: u32,
+    pub last_draft_failed: u32,
+    pub total_gens: u64,
+    pub total_img_gens: u64,
+    pub total_tts_gens: u64,
+    pub total_transcribe_gens: u64,
+    pub stop_reason: i32,
+    pub queue: u32,
+    pub idle: u32,
+    pub hordeexitcounter: i32,
+    pub uptime: u64,
+    pub idletime: f64,
+    pub quiet: bool,
+    pub last_input_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAiPromptInput {
+    Single(String),
+    Many(Vec<String>),
+}
+
+impl OpenAiPromptInput {
+    pub fn to_prompt_text(&self) -> String {
+        match self {
+            OpenAiPromptInput::Single(text) => text.clone(),
+            OpenAiPromptInput::Many(items) => items.join("\n\n"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAiStopInput {
+    Single(String),
+    Many(Vec<String>),
+}
+
+impl OpenAiStopInput {
+    pub fn to_stop_sequences(&self) -> Vec<String> {
+        match self {
+            OpenAiStopInput::Single(text) => vec![text.clone()],
+            OpenAiStopInput::Many(items) => items.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiContentPart {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAiMessageContent {
+    Text(String),
+    Parts(Vec<OpenAiContentPart>),
+}
+
+impl OpenAiMessageContent {
+    pub fn flatten_text(&self) -> String {
+        match self {
+            OpenAiMessageContent::Text(text) => text.clone(),
+            OpenAiMessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| part.text.as_deref())
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: Option<OpenAiMessageContent>,
+}
+
+impl OpenAiChatMessage {
+    pub fn to_chat_message(&self) -> ChatMessage {
+        ChatMessage {
+            role: self.role.clone(),
+            content: self
+                .content
+                .as_ref()
+                .map(OpenAiMessageContent::flatten_text)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiCompletionRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub prompt: OpenAiPromptInput,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<i32>,
+    #[serde(default)]
+    pub top_a: Option<f32>,
+    #[serde(default)]
+    pub tfs: Option<f32>,
+    #[serde(default)]
+    pub typical: Option<f32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<u32>,
+    #[serde(default)]
+    pub sampler_order: Option<Vec<i32>>,
+    #[serde(default)]
+    pub stop: Option<OpenAiStopInput>,
+    #[serde(default)]
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiChatCompletionRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub messages: Vec<OpenAiChatMessage>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<i32>,
+    #[serde(default)]
+    pub top_a: Option<f32>,
+    #[serde(default)]
+    pub tfs: Option<f32>,
+    #[serde(default)]
+    pub typical: Option<f32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<u32>,
+    #[serde(default)]
+    pub sampler_order: Option<Vec<i32>>,
+    #[serde(default)]
+    pub stop: Option<OpenAiStopInput>,
+    #[serde(default)]
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiEmbeddingsRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub input: OpenAiPromptInput,
+}
+
+#[derive(Debug, Serialize)]
 pub struct AvailableModelItem {
     pub name: String,
     pub path: String,

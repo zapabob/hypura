@@ -151,7 +151,11 @@ impl LlamaModel {
     }
 
     /// Tokenize text into token IDs.
-    pub fn tokenize(&self, text: &str, add_bos: bool) -> Vec<i32> {
+    ///
+    /// When `parse_special` is true, chat-template markers and other special
+    /// tokens are matched against the vocab instead of being tokenized as raw
+    /// bytes.
+    pub fn tokenize(&self, text: &str, add_bos: bool, parse_special: bool) -> Vec<i32> {
         let c_text = CString::new(text).unwrap_or_default();
         let max = (text.len() as i32 + 32).max(64);
         let mut tokens = vec![0i32; max as usize];
@@ -164,7 +168,7 @@ impl LlamaModel {
                 tokens.as_mut_ptr(),
                 max,
                 add_bos,
-                false,
+                parse_special,
             )
         };
 
@@ -179,7 +183,7 @@ impl LlamaModel {
                     tokens.as_mut_ptr(),
                     -n,
                     add_bos,
-                    false,
+                    parse_special,
                 )
             };
             tokens.truncate(n2.max(0) as usize);
@@ -455,14 +459,14 @@ impl LlamaSampler {
 
         unsafe {
             let apply_id = |id: i32,
-                                added_top_k: &mut bool,
-                                added_top_a: &mut bool,
-                                added_top_p: &mut bool,
-                                added_tfs: &mut bool,
-                                added_typical: &mut bool,
-                                added_min_p: &mut bool,
-                                added_temp: &mut bool,
-                                added_pen: &mut bool| {
+                            added_top_k: &mut bool,
+                            added_top_a: &mut bool,
+                            added_top_p: &mut bool,
+                            added_tfs: &mut bool,
+                            added_typical: &mut bool,
+                            added_min_p: &mut bool,
+                            added_temp: &mut bool,
+                            added_pen: &mut bool| {
                 match id {
                     0 if !*added_top_k => {
                         hypura_sys::llama_sampler_chain_add(

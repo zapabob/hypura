@@ -45,6 +45,10 @@ impl ModelMetadata {
         let num_kv_heads = gguf
             .get_u32(&format!("{arch}.attention.head_count_kv"))
             .or_else(|| gguf.get_u32("attention.head_count_kv"))
+            .or_else(|| {
+                gguf.get_u32_array("attention.head_count_kv")
+                    .and_then(|values| values.into_iter().max())
+            })
             .unwrap_or(num_heads);
 
         let vocab_size = gguf

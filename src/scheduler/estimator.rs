@@ -71,19 +71,24 @@ pub fn estimate_performance(
         for t in &layer_tensors {
             let role = TensorRole::from_name(&t.name);
             let freq = role.access_frequency(experts_per_token, total_experts);
-            let tier = placement
-                .tier_assignments
+            let placement_entry = placement
+                .tensor_placements
                 .get(&t.name)
-                .unwrap_or(&StorageTier::Nvme);
+                .copied()
+                .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
 
-            match tier {
-                StorageTier::Gpu => {
+            match placement_entry.residence {
+                TensorResidence::GpuResident => {
                     layer_compute_time += t.size_bytes as f64 * freq / gpu_bw;
                 }
-                StorageTier::Ram => {
+                TensorResidence::HostPinned => {
+                    layer_compute_time +=
+                        t.size_bytes as f64 * freq / hardware.memory.h2d_pinned_bandwidth_bytes_per_sec.max(1) as f64;
+                }
+                TensorResidence::HostPageable => {
                     layer_compute_time += t.size_bytes as f64 * freq / ram_bw;
                 }
-                StorageTier::Nvme => {
+                TensorResidence::NvmeBacked => {
                     let effective_freq = if metadata.is_moe {
                         match role {
                             TensorRole::MoeExpert { .. } | TensorRole::MoeFusedExperts => {
@@ -121,15 +126,20 @@ pub fn estimate_performance(
         }
         let role = TensorRole::from_name(&t.name);
         let freq = role.access_frequency(experts_per_token, total_experts);
-        let tier = placement
-            .tier_assignments
+        let placement_entry = placement
+            .tensor_placements
             .get(&t.name)
-            .unwrap_or(&StorageTier::Nvme);
+            .copied()
+            .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
 
-        let transfer = match tier {
-            StorageTier::Gpu => t.size_bytes as f64 * freq / gpu_bw,
-            StorageTier::Ram => t.size_bytes as f64 * freq / ram_bw,
-            StorageTier::Nvme => {
+        let transfer = match placement_entry.residence {
+            TensorResidence::GpuResident => t.size_bytes as f64 * freq / gpu_bw,
+            TensorResidence::HostPinned => {
+                t.size_bytes as f64 * freq
+                    / hardware.memory.h2d_pinned_bandwidth_bytes_per_sec.max(1) as f64
+            }
+            TensorResidence::HostPageable => t.size_bytes as f64 * freq / ram_bw,
+            TensorResidence::NvmeBacked => {
                 total_nvme_bytes_per_token += t.size_bytes as f64 * freq;
                 t.size_bytes as f64 * freq / nvme_bw
             }
@@ -163,7 +173,12 @@ pub fn estimate_performance(
         metadata.context_length
     };
 
-    let placement_summary = summarize_placement(&placement.tier_assignments, &model.tensors);
+    let placement_summary = summarize_placement(
+        &placement.tensor_placements,
+        &model.tensors,
+        placement.inference_mode,
+        hardware.memory.pinned_budget_bytes,
+    );
     let experience_tier = ExperienceTier::from_tok_per_sec(interactive_tps);
 
     Ok(HypuraEstimate {

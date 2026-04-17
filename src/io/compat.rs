@@ -241,3 +241,112 @@ pub fn advise_free_pages(ptr: *mut u8, size: usize) {
 // Re-export
 // ─────────────────────────────────────────────────────────────
 pub use imp::{alloc_pages, close_fd, free_pages, open_direct_fd, read_at_fd};
+
+#[cfg(windows)]
+mod cuda_host {
+    use std::ffi::CString;
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+
+    type CudaHostRegister = unsafe extern "system" fn(*mut core::ffi::c_void, usize, u32) -> i32;
+    type CudaHostUnregister = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+
+    struct CudaHostRuntime {
+        #[allow(dead_code)]
+        handle: usize,
+        register: CudaHostRegister,
+        unregister: CudaHostUnregister,
+    }
+
+    fn load_runtime() -> Option<CudaHostRuntime> {
+        const CANDIDATES: &[&str] = &[
+            "cudart64_130.dll",
+            "cudart64_12.dll",
+            "cudart64_120.dll",
+            "cudart64_110.dll",
+        ];
+
+        for candidate in CANDIDATES {
+            let name = CString::new(*candidate).ok()?;
+            let handle = unsafe { LoadLibraryA(name.as_ptr() as *const u8) };
+            if handle.is_null() {
+                continue;
+            }
+
+            let Some(register) =
+                (unsafe { GetProcAddress(handle, c"cudaHostRegister".as_ptr() as *const u8) })
+            else {
+                continue;
+            };
+            let Some(unregister) = (unsafe {
+                GetProcAddress(handle, c"cudaHostUnregister".as_ptr() as *const u8)
+            }) else {
+                continue;
+            };
+
+            return Some(CudaHostRuntime {
+                handle: handle as usize,
+                register: unsafe { std::mem::transmute(register) },
+                unregister: unsafe { std::mem::transmute(unregister) },
+            });
+        }
+
+        None
+    }
+
+    fn runtime() -> Option<&'static CudaHostRuntime> {
+        static CUDA_RUNTIME: OnceLock<Option<CudaHostRuntime>> = OnceLock::new();
+        CUDA_RUNTIME.get_or_init(load_runtime).as_ref()
+    }
+
+    pub fn available() -> bool {
+        runtime().is_some()
+    }
+
+    pub fn try_register(ptr: *mut u8, size: usize) -> bool {
+        if ptr.is_null() || size == 0 {
+            return false;
+        }
+        let Some(runtime) = runtime() else {
+            return false;
+        };
+        let rc = unsafe { (runtime.register)(ptr.cast(), size, 0) };
+        rc == 0
+    }
+
+    pub fn unregister(ptr: *mut u8) {
+        if ptr.is_null() {
+            return;
+        }
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let _ = unsafe { (runtime.unregister)(ptr.cast()) };
+    }
+}
+
+#[cfg(not(windows))]
+mod cuda_host {
+    pub fn available() -> bool {
+        false
+    }
+
+    pub fn try_register(_ptr: *mut u8, _size: usize) -> bool {
+        false
+    }
+
+    pub fn unregister(_ptr: *mut u8) {}
+}
+
+pub fn cuda_host_pinning_available() -> bool {
+    cuda_host::available()
+}
+
+pub fn try_register_cuda_host_pages(ptr: *mut u8, size: usize) -> bool {
+    cuda_host::try_register(ptr, size)
+}
+
+pub fn unregister_cuda_host_pages(ptr: *mut u8) {
+    cuda_host::unregister(ptr)
+}

@@ -84,6 +84,30 @@ impl GgufValue {
         }
     }
 
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Array(values) => values.iter().map(Self::as_u32).collect(),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32_array(&self) -> Option<Vec<f32>> {
+        match self {
+            Self::Array(values) => values.iter().map(Self::as_f32).collect(),
+            _ => None,
+        }
+    }
+
+    pub fn as_string_array(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Array(values) => values
+                .iter()
+                .map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect(),
+            _ => None,
+        }
+    }
+
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Uint64(v) => Some(*v),
@@ -331,6 +355,45 @@ impl GgufFile {
                 .get(&format!("{arch}.{key}"))
                 .and_then(|v| v.as_u64())
         })
+    }
+
+    /// Get a u32-array metadata value, trying architecture-prefixed keys.
+    pub fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_u32_array())
+            .or_else(|| {
+                let arch = self.get_string("general.architecture")?;
+                self.metadata
+                    .get(&format!("{arch}.{key}"))
+                    .and_then(|v| v.as_u32_array())
+            })
+    }
+
+    /// Get a float-array metadata value, trying architecture-prefixed keys.
+    pub fn get_f32_array(&self, key: &str) -> Option<Vec<f32>> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_f32_array())
+            .or_else(|| {
+                let arch = self.get_string("general.architecture")?;
+                self.metadata
+                    .get(&format!("{arch}.{key}"))
+                    .and_then(|v| v.as_f32_array())
+            })
+    }
+
+    /// Get a string-array metadata value, trying architecture-prefixed keys.
+    pub fn get_string_array(&self, key: &str) -> Option<Vec<String>> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_string_array())
+            .or_else(|| {
+                let arch = self.get_string("general.architecture")?;
+                self.metadata
+                    .get(&format!("{arch}.{key}"))
+                    .and_then(|v| v.as_string_array())
+            })
     }
 
     /// Get a bool metadata value, trying both `general.X` and `X` keys.

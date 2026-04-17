@@ -299,3 +299,41 @@ fn find_masm() -> Option<PathBuf> {
 
     None
 }
+
+fn find_masm() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("VCToolsInstallDir") {
+        let candidate = PathBuf::from(dir).join("bin/Hostx64/x64/ml64.exe");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    let roots = [
+        PathBuf::from(
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC",
+        ),
+        PathBuf::from(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC"),
+    ];
+
+    for root in roots {
+        let mut versions: Vec<PathBuf> = match std::fs::read_dir(&root) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect(),
+            Err(_) => continue,
+        };
+        versions.sort();
+        versions.reverse();
+
+        for version_dir in versions {
+            let candidate = version_dir.join("bin/Hostx64/x64/ml64.exe");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}

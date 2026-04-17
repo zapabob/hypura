@@ -80,10 +80,14 @@ pub fn run(model_path: &str, read_gb: f64) -> anyhow::Result<()> {
 
     println!("  Diagnosis:");
     if advfree_impact > 30.0 {
-        println!("    >> Page-release re-fault is a major bottleneck ({advfree_impact:.0}% throughput loss)");
+        println!(
+            "    >> Page-release re-fault is a major bottleneck ({advfree_impact:.0}% throughput loss)"
+        );
     }
     if nocache_impact > 20.0 {
-        println!("    >> Cache-bypass is a significant bottleneck ({nocache_impact:.0}% throughput loss)");
+        println!(
+            "    >> Cache-bypass is a significant bottleneck ({nocache_impact:.0}% throughput loss)"
+        );
     }
     if scatter_impact > 30.0 {
         println!(

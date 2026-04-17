@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::model::gguf::TensorInfo;
 use crate::model::metadata::ModelMetadata;
+use crate::model::tensor_role::TensorRole;
 use crate::profiler::types::HardwareProfile;
 use crate::scheduler::types::*;
 
@@ -10,10 +11,11 @@ use crate::scheduler::types::*;
 /// For each layer, determines which NVMe-resident tensors should be prefetched
 /// and how many layers ahead the prefetch should start.
 pub fn build_prefetch_schedule(
-    tier_assignments: &HashMap<String, StorageTier>,
+    tensor_placements: &HashMap<String, TensorPlacement>,
     tensors: &[TensorInfo],
     metadata: &ModelMetadata,
     hardware: &HardwareProfile,
+    inference_mode: InferenceMode,
 ) -> PrefetchSchedule {
     let num_layers = metadata.num_layers as usize;
     if num_layers == 0 {
@@ -51,7 +53,12 @@ pub fn build_prefetch_schedule(
         .map(|layer| {
             let gpu_bytes: u64 = layer
                 .iter()
-                .filter(|t| tier_assignments.get(&t.name) == Some(&StorageTier::Gpu))
+                .filter(|t| {
+                    tensor_placements
+                        .get(&t.name)
+                        .map(|p| p.residence == TensorResidence::GpuResident)
+                        .unwrap_or(false)
+                })
                 .map(|t| t.size_bytes)
                 .sum();
             gpu_bytes as f64 / gpu_bw
@@ -64,8 +71,27 @@ pub fn build_prefetch_schedule(
         let mut ops = Vec::new();
 
         for t in &layer_tensors[layer_idx] {
-            let tier = tier_assignments.get(&t.name).unwrap_or(&StorageTier::Nvme);
-            if *tier != StorageTier::Nvme {
+            let role = TensorRole::from_name(&t.name);
+            let placement = tensor_placements
+                .get(&t.name)
+                .copied()
+                .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
+            let source_residence = match inference_mode {
+                InferenceMode::ExpertStreaming if matches!(role, TensorRole::MoeFusedExperts) => {
+                    TensorResidence::NvmeBacked
+                }
+                InferenceMode::DenseFfnStreaming
+                    if matches!(
+                        role,
+                        TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                    ) =>
+                {
+                    TensorResidence::NvmeBacked
+                }
+                _ => placement.residence,
+            };
+
+            if source_residence != TensorResidence::NvmeBacked {
                 continue;
             }
 
@@ -87,8 +113,8 @@ pub fn build_prefetch_schedule(
 
             ops.push(PrefetchOp {
                 tensor_name: t.name.clone(),
-                source_tier: StorageTier::Nvme,
-                target_tier: StorageTier::Ram,
+                source_residence: TensorResidence::NvmeBacked,
+                target_residence: placement.residence,
                 size_bytes: t.size_bytes,
                 lead_time_layers: lead_time,
             });

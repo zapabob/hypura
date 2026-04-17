@@ -22,11 +22,27 @@ pub fn profile_memory() -> anyhow::Result<MemoryProfile> {
     };
     let bandwidth_bytes_per_sec = measure_memory_bandwidth();
     let is_unified = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let supports_host_pinning = cfg!(target_os = "windows");
+    let h2d_pageable_bandwidth_bytes_per_sec = bandwidth_bytes_per_sec / 6;
+    let h2d_pinned_bandwidth_bytes_per_sec = if supports_host_pinning {
+        bandwidth_bytes_per_sec / 4
+    } else {
+        h2d_pageable_bandwidth_bytes_per_sec
+    };
+    let pinned_budget_bytes = if supports_host_pinning {
+        (available_bytes / 8).min(2 * (1 << 30))
+    } else {
+        0
+    };
 
     Ok(MemoryProfile {
         total_bytes,
         available_bytes,
         bandwidth_bytes_per_sec,
+        h2d_pageable_bandwidth_bytes_per_sec,
+        h2d_pinned_bandwidth_bytes_per_sec,
+        supports_host_pinning,
+        pinned_budget_bytes,
         is_unified,
     })
 }

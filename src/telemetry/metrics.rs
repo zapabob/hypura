@@ -13,6 +13,13 @@ pub enum TelemetryEvent {
     PrefetchStatus {
         hit_rate: f64,
         nvme_mbps: f64,
+        gpu_slot_hit_rate: f64,
+        pinned_slot_hit_rate: f64,
+        pageable_fallback_rate: f64,
+        h2d_pinned_mbps: f64,
+        h2d_pageable_mbps: f64,
+        eviction_churn_per_token: f64,
+        first_token_stall_ms: f64,
     },
     KvCacheUpdate {
         hot_tokens: u32,
@@ -59,6 +66,13 @@ pub struct TelemetrySummary {
     pub ram_bandwidth_utilization: f64,
     pub nvme_read_mbps: f64,
     pub prefetch_hit_rate: f64,
+    pub gpu_slot_hit_rate: f64,
+    pub pinned_slot_hit_rate: f64,
+    pub pageable_fallback_rate: f64,
+    pub h2d_pinned_mbps: f64,
+    pub h2d_pageable_mbps: f64,
+    pub eviction_churn_per_token: f64,
+    pub first_token_stall_ms: f64,
     pub kv_cache_hot_tokens: u32,
     pub kv_cache_warm_tokens: u32,
 }

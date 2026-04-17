@@ -422,6 +422,7 @@ impl ResearchKvSplitCodec {
                 gguf_cfg.num_kv_heads,
                 gguf_cfg.head_dim,
                 rotation_policy.as_deref(),
+                gguf_cfg.triality_view.as_deref(),
                 Some(gguf_cfg.rotation_seed),
             )?,
             value_vectors: HashMap::new(),

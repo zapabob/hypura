@@ -96,6 +96,18 @@ pub enum RotationPolicy {
 }
 
 impl RotationPolicy {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "random_haar" => Some(Self::RandomHaar),
+            "block_so8_static" => Some(Self::BlockSo8Static),
+            "block_so8_learned" => Some(Self::BlockSo8Learned),
+            "triality_vector" => Some(Self::TrialityVector),
+            "triality_spinor_plus" => Some(Self::TrialitySpinorPlus),
+            "triality_spinor_minus" => Some(Self::TrialitySpinorMinus),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::RandomHaar => "random_haar",
@@ -122,6 +134,24 @@ impl RotationPolicy {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GgufTurboQuantLayerConfig {
+    pub total_bits: f32,
+    pub runtime_bits_per_channel: f32,
+    pub stage1_effective_bits: f32,
+    pub qjl_bits: u32,
+    pub qjl_dim: u32,
+    pub rotation_policy: RotationPolicy,
+    pub rotation_seed: u32,
+    pub qjl_seed: u32,
+    pub triality_mode: String,
+    pub triality_view: String,
+    pub stage1_allocation_scheme: String,
+    pub stage1_bitwidth_payload_dtype: String,
+    pub norm_dtype: String,
+    pub sign_pack_format: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +292,7 @@ pub struct GgufTurboQuantConfig {
     pub runtime_mode: String,
     pub rotation_policy: Option<RotationPolicy>,
     pub triality_view: Option<String>,
+    pub triality_mode: Option<String>,
     pub triality_mix: Option<f32>,
     pub paper_fidelity: bool,
     pub k_bits: f32,
@@ -274,11 +305,25 @@ pub struct GgufTurboQuantConfig {
     pub head_dim: u32,
     pub num_layers: u32,
     pub num_kv_heads: u32,
+    pub layers: Vec<GgufTurboQuantLayerConfig>,
 }
 
 impl GgufTurboQuantConfig {
     pub fn source_label(&self) -> &'static str {
         "gguf-embedded"
+    }
+
+    pub fn llama_runtime_mode(&self) -> &'static str {
+        match self.triality_view.as_deref() {
+            Some("vector") => "triality_vector",
+            Some("spinor_plus_proxy") => "triality_spinor_plus",
+            Some("spinor_minus_proxy") => "triality_spinor_minus",
+            _ => match self.mode {
+                TurboQuantMode::PaperFullKv => "asym_q8_turbo4",
+                TurboQuantMode::PaperKeyOnly | TurboQuantMode::ResearchKvSplit => "triality_vector",
+                TurboQuantMode::Exact => "exact",
+            },
+        }
     }
 }
 
@@ -320,7 +365,7 @@ pub fn resolve_turboquant_config(
     mode: TurboQuantMode,
     explicit_config: Option<&Path>,
 ) -> anyhow::Result<ResolvedTurboQuantConfig> {
-    let gguf_metadata = read_gguf_turboquant_config(gguf, metadata);
+    let gguf_metadata = read_gguf_turboquant_config(gguf, metadata)?;
     if let Some(gguf_metadata) = gguf_metadata {
         return Ok(ResolvedTurboQuantConfig {
             mode: gguf_metadata.mode,
@@ -390,40 +435,106 @@ pub fn resolve_turboquant_config(
     })
 }
 
-pub fn read_gguf_turboquant_config(
-    gguf: &GgufFile,
-    metadata: &ModelMetadata,
-) -> Option<GgufTurboQuantConfig> {
-    let enabled = gguf.get_bool("hypura.turboquant.enabled")?;
-    if !enabled {
-        return None;
+fn parse_turboquant_mode(raw: &str) -> anyhow::Result<TurboQuantMode> {
+    match raw {
+        "exact" => Ok(TurboQuantMode::Exact),
+        "paper-faithful" | "paper-key-only" => Ok(TurboQuantMode::PaperKeyOnly),
+        "paper-full-kv" => Ok(TurboQuantMode::PaperFullKv),
+        "triality-so8-pareto" | "research-kv-split" => Ok(TurboQuantMode::ResearchKvSplit),
+        other => Err(anyhow::anyhow!(
+            "Unsupported GGUF TurboQuant mode `{other}`"
+        )),
     }
+}
 
-    let raw_mode = gguf.get_string("hypura.turboquant.mode")?;
-    let (mode, public_mode_label, default_runtime_mode) = parse_embedded_mode(raw_mode)?;
-
-    let rotation_policy = gguf
-        .get_string("hypura.turboquant.rotation_policy")
-        .and_then(|value| match value {
-            "random_haar" => Some(RotationPolicy::RandomHaar),
-            "block_so8_static" => Some(RotationPolicy::BlockSo8Static),
-            "block_so8_learned" => Some(RotationPolicy::BlockSo8Learned),
-            "triality_vector" => Some(RotationPolicy::TrialityVector),
-            "triality_spinor_plus" => Some(RotationPolicy::TrialitySpinorPlus),
-            "triality_spinor_minus" => Some(RotationPolicy::TrialitySpinorMinus),
-            _ => None,
-        });
-    let triality_view = gguf
-        .get_string("hypura.turboquant.triality_view")
-        .map(ToOwned::to_owned)
-        .or_else(|| rotation_policy.and_then(|policy| policy.triality_view().map(str::to_string)));
-    let head_dim = if metadata.num_heads == 0 {
+fn head_dim_from_metadata(metadata: &ModelMetadata) -> u32 {
+    if metadata.num_heads == 0 {
         0
     } else {
         metadata.embedding_dim / metadata.num_heads
-    };
+    }
+}
 
-    Some(GgufTurboQuantConfig {
+fn require_f32_array(gguf: &GgufFile, key: &str, expected_len: usize) -> anyhow::Result<Vec<f32>> {
+    let values = gguf
+        .get_f32_array(key)
+        .ok_or_else(|| anyhow::anyhow!("GGUF TurboQuant metadata is missing `{key}`"))?;
+    anyhow::ensure!(
+        values.len() == expected_len,
+        "GGUF TurboQuant metadata `{key}` must have length {expected_len}, got {}",
+        values.len()
+    );
+    Ok(values)
+}
+
+fn require_u32_array(gguf: &GgufFile, key: &str, expected_len: usize) -> anyhow::Result<Vec<u32>> {
+    let values = gguf
+        .get_u32_array(key)
+        .ok_or_else(|| anyhow::anyhow!("GGUF TurboQuant metadata is missing `{key}`"))?;
+    anyhow::ensure!(
+        values.len() == expected_len,
+        "GGUF TurboQuant metadata `{key}` must have length {expected_len}, got {}",
+        values.len()
+    );
+    Ok(values)
+}
+
+fn require_string_array(
+    gguf: &GgufFile,
+    key: &str,
+    expected_len: usize,
+) -> anyhow::Result<Vec<String>> {
+    let values = gguf
+        .get_string_array(key)
+        .ok_or_else(|| anyhow::anyhow!("GGUF TurboQuant metadata is missing `{key}`"))?;
+    anyhow::ensure!(
+        values.len() == expected_len,
+        "GGUF TurboQuant metadata `{key}` must have length {expected_len}, got {}",
+        values.len()
+    );
+    Ok(values)
+}
+
+fn infer_triality_view_from_legacy_policy(rotation_policy: RotationPolicy) -> Option<String> {
+    rotation_policy.triality_view().map(str::to_string)
+}
+
+fn parse_legacy_gguf_turboquant_config(
+    gguf: &GgufFile,
+    metadata: &ModelMetadata,
+) -> anyhow::Result<Option<GgufTurboQuantConfig>> {
+    let Some(enabled) = gguf.get_bool("hypura.turboquant.enabled") else {
+        return Ok(None);
+    };
+    if !enabled {
+        return Ok(None);
+    }
+
+    let raw_mode = gguf
+        .get_string("hypura.turboquant.mode")
+        .ok_or_else(|| anyhow::anyhow!("Legacy GGUF TurboQuant metadata is missing `hypura.turboquant.mode`"))?;
+    let mode = parse_turboquant_mode(raw_mode)?;
+    let (public_mode_label, default_runtime_mode) = parse_embedded_mode(raw_mode)
+        .map(|(_, public, runtime)| (public, runtime))
+        .unwrap_or_else(|| (mode.as_str().to_string(), mode.as_str().to_string()));
+
+    let rotation_policy = gguf
+        .get_string("hypura.turboquant.rotation_policy")
+        .and_then(RotationPolicy::from_str);
+    let triality_view = gguf
+        .get_string("hypura.turboquant.triality_view")
+        .map(ToOwned::to_owned)
+        .or_else(|| rotation_policy.and_then(infer_triality_view_from_legacy_policy));
+    let triality_mode = gguf
+        .get_string("hypura.turboquant.triality_mode")
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            rotation_policy
+                .filter(|policy| policy.is_triality())
+                .map(|_| "triality_proxy".to_string())
+        });
+
+    Ok(Some(GgufTurboQuantConfig {
         enabled,
         schema_version: gguf
             .get_u32("hypura.turboquant.schema_version")
@@ -436,6 +547,7 @@ pub fn read_gguf_turboquant_config(
             .to_string(),
         rotation_policy,
         triality_view,
+        triality_mode,
         triality_mix: gguf.get_f32("hypura.turboquant.triality_mix"),
         paper_fidelity: gguf
             .get_bool("hypura.turboquant.paper_fidelity")
@@ -456,10 +568,143 @@ pub fn read_gguf_turboquant_config(
         artifact_path: gguf
             .get_string("hypura.turboquant.artifact")
             .map(ToOwned::to_owned),
-        head_dim,
+        head_dim: head_dim_from_metadata(metadata),
         num_layers: metadata.num_layers,
         num_kv_heads: metadata.num_kv_heads,
+        layers: Vec::new(),
+    }))
+}
+
+fn parse_strict_gguf_turboquant_config(
+    gguf: &GgufFile,
+    metadata: &ModelMetadata,
+    schema_version: u32,
+) -> anyhow::Result<GgufTurboQuantConfig> {
+    let expected_len = metadata.num_layers as usize;
+    anyhow::ensure!(
+        expected_len > 0,
+        "GGUF TurboQuant metadata requires a non-zero layer count"
+    );
+
+    let total_bits = require_f32_array(gguf, "tq_total_bits", expected_len)?;
+    let runtime_bits = require_f32_array(gguf, "tq_runtime_bits_per_channel", expected_len)?;
+    let stage1_effective_bits = require_f32_array(gguf, "tq_stage1_effective_bits", expected_len)?;
+    let qjl_bits = require_u32_array(gguf, "tq_qjl_bits", expected_len)?;
+    let qjl_dim = require_u32_array(gguf, "tq_qjl_dim", expected_len)?;
+    let rotation_policy = require_string_array(gguf, "tq_rotation_policy", expected_len)?;
+    let rotation_seed = require_u32_array(gguf, "tq_rotation_seed", expected_len)?;
+    let qjl_seed = require_u32_array(gguf, "tq_qjl_seed", expected_len)?;
+    let triality_mode = require_string_array(gguf, "tq_triality_mode", expected_len)?;
+    let triality_view = require_string_array(gguf, "tq_triality_view", expected_len)?;
+    let stage1_allocation_scheme =
+        require_string_array(gguf, "tq_stage1_allocation_scheme", expected_len)?;
+    let stage1_bitwidth_payload_dtype =
+        require_string_array(gguf, "tq_stage1_bitwidth_payload_dtype", expected_len)?;
+    let norm_dtype = require_string_array(gguf, "tq_norm_dtype", expected_len)?;
+    let sign_pack_format = require_string_array(gguf, "tq_sign_pack_format", expected_len)?;
+
+    let mut layers = Vec::with_capacity(expected_len);
+    for i in 0..expected_len {
+        anyhow::ensure!(
+            (stage1_effective_bits[i] + qjl_bits[i] as f32 - runtime_bits[i]).abs() <= 1e-6,
+            "GGUF TurboQuant metadata layer {i} is inconsistent: tq_stage1_effective_bits + tq_qjl_bits != tq_runtime_bits_per_channel"
+        );
+        let parsed_rotation_policy = RotationPolicy::from_str(&rotation_policy[i]).ok_or_else(|| {
+            anyhow::anyhow!(
+                "GGUF TurboQuant metadata layer {i} has unsupported tq_rotation_policy `{}`",
+                rotation_policy[i]
+            )
+        })?;
+        layers.push(GgufTurboQuantLayerConfig {
+            total_bits: total_bits[i],
+            runtime_bits_per_channel: runtime_bits[i],
+            stage1_effective_bits: stage1_effective_bits[i],
+            qjl_bits: qjl_bits[i],
+            qjl_dim: qjl_dim[i],
+            rotation_policy: parsed_rotation_policy,
+            rotation_seed: rotation_seed[i],
+            qjl_seed: qjl_seed[i],
+            triality_mode: triality_mode[i].clone(),
+            triality_view: triality_view[i].clone(),
+            stage1_allocation_scheme: stage1_allocation_scheme[i].clone(),
+            stage1_bitwidth_payload_dtype: stage1_bitwidth_payload_dtype[i].clone(),
+            norm_dtype: norm_dtype[i].clone(),
+            sign_pack_format: sign_pack_format[i].clone(),
+        });
+    }
+
+    let first_layer = layers
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("GGUF TurboQuant metadata did not contain any layers"))?;
+    let raw_mode = gguf.get_string("hypura.turboquant.mode");
+    let mode = raw_mode
+        .map(parse_turboquant_mode)
+        .transpose()?
+        .unwrap_or(TurboQuantMode::ResearchKvSplit);
+    let (public_mode_label, default_runtime_mode) = raw_mode
+        .and_then(parse_embedded_mode)
+        .map(|(_, public, runtime)| (public, runtime))
+        .unwrap_or_else(|| (mode.as_str().to_string(), mode.as_str().to_string()));
+    let legacy_rotation_policy = gguf
+        .get_string("hypura.turboquant.rotation_policy")
+        .and_then(RotationPolicy::from_str)
+        .or_else(|| match first_layer.triality_view.as_str() {
+            "vector" => Some(RotationPolicy::TrialityVector),
+            "spinor_plus_proxy" => Some(RotationPolicy::TrialitySpinorPlus),
+            "spinor_minus_proxy" => Some(RotationPolicy::TrialitySpinorMinus),
+            _ => Some(first_layer.rotation_policy),
+        });
+
+    Ok(GgufTurboQuantConfig {
+        enabled: gguf.get_bool("hypura.turboquant.enabled").unwrap_or(true),
+        schema_version,
+        mode,
+        public_mode_label,
+        runtime_mode: gguf
+            .get_string("hypura.turboquant.runtime_mode")
+            .unwrap_or(&default_runtime_mode)
+            .to_string(),
+        rotation_policy: legacy_rotation_policy,
+        triality_view: Some(first_layer.triality_view.clone()),
+        triality_mode: Some(first_layer.triality_mode.clone()),
+        triality_mix: gguf.get_f32("hypura.turboquant.triality_mix"),
+        paper_fidelity: gguf
+            .get_bool("hypura.turboquant.paper_fidelity")
+            .unwrap_or(matches!(
+                mode,
+                TurboQuantMode::PaperKeyOnly | TurboQuantMode::PaperFullKv
+            )),
+        k_bits: gguf
+            .get_f32("hypura.turboquant.k_bits")
+            .unwrap_or(first_layer.total_bits),
+        v_bits: gguf.get_f32("hypura.turboquant.v_bits").unwrap_or(0.0),
+        payload_format: gguf
+            .get_string("hypura.turboquant.payload_format")
+            .map(ToOwned::to_owned),
+        payload_bytes: gguf.get_u64("hypura.turboquant.payload_bytes").unwrap_or(0),
+        payload_json: gguf
+            .get_string("hypura.turboquant.payload_json")
+            .map(ToOwned::to_owned),
+        rotation_seed: first_layer.rotation_seed,
+        artifact_path: gguf
+            .get_string("hypura.turboquant.artifact")
+            .map(ToOwned::to_owned),
+        head_dim: head_dim_from_metadata(metadata),
+        num_layers: metadata.num_layers,
+        num_kv_heads: metadata.num_kv_heads,
+        layers,
     })
+}
+
+pub fn read_gguf_turboquant_config(
+    gguf: &GgufFile,
+    metadata: &ModelMetadata,
+) -> anyhow::Result<Option<GgufTurboQuantConfig>> {
+    if let Some(schema_version) = gguf.get_u32("tq_schema_version") {
+        return parse_strict_gguf_turboquant_config(gguf, metadata, schema_version).map(Some);
+    }
+    parse_legacy_gguf_turboquant_config(gguf, metadata)
 }
 
 pub fn auto_discover_sidecar_path(model_path: &Path, mode: TurboQuantMode) -> Option<PathBuf> {
@@ -740,6 +985,10 @@ mod tests {
         }
     }
 
+    fn array(values: Vec<GgufValue>) -> GgufValue {
+        GgufValue::Array(values)
+    }
+
     #[test]
     fn paper_config_parse_and_validate() {
         let path = Path::new("model.turboquant_config.paper.json");
@@ -892,5 +1141,110 @@ mod tests {
                 .public_mode_label,
             "paper-faithful"
         );
+    }
+
+    #[test]
+    fn strict_gguf_turboquant_metadata_resolves_with_layer_arrays() {
+        let mut gguf = sample_gguf();
+        gguf.metadata
+            .insert("tq_schema_version".into(), GgufValue::Uint32(1));
+        gguf.metadata.insert(
+            "tq_total_bits".into(),
+            array(vec![GgufValue::Float32(3.5), GgufValue::Float32(3.5)]),
+        );
+        gguf.metadata.insert(
+            "tq_runtime_bits_per_channel".into(),
+            array(vec![GgufValue::Float32(3.25), GgufValue::Float32(3.25)]),
+        );
+        gguf.metadata.insert(
+            "tq_stage1_effective_bits".into(),
+            array(vec![GgufValue::Float32(2.25), GgufValue::Float32(2.25)]),
+        );
+        gguf.metadata.insert(
+            "tq_qjl_bits".into(),
+            array(vec![GgufValue::Uint32(1), GgufValue::Uint32(1)]),
+        );
+        gguf.metadata.insert(
+            "tq_qjl_dim".into(),
+            array(vec![GgufValue::Uint32(128), GgufValue::Uint32(128)]),
+        );
+        gguf.metadata.insert(
+            "tq_rotation_policy".into(),
+            array(vec![
+                GgufValue::String("block_so8_learned".into()),
+                GgufValue::String("block_so8_learned".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_rotation_seed".into(),
+            array(vec![GgufValue::Uint32(17), GgufValue::Uint32(17)]),
+        );
+        gguf.metadata.insert(
+            "tq_qjl_seed".into(),
+            array(vec![GgufValue::Uint32(1), GgufValue::Uint32(1)]),
+        );
+        gguf.metadata.insert(
+            "tq_triality_mode".into(),
+            array(vec![
+                GgufValue::String("triality_proxy".into()),
+                GgufValue::String("triality_proxy".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_triality_view".into(),
+            array(vec![
+                GgufValue::String("vector".into()),
+                GgufValue::String("vector".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_stage1_allocation_scheme".into(),
+            array(vec![
+                GgufValue::String("magnitude-topk".into()),
+                GgufValue::String("magnitude-topk".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_stage1_bitwidth_payload_dtype".into(),
+            array(vec![
+                GgufValue::String("uint8".into()),
+                GgufValue::String("uint8".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_norm_dtype".into(),
+            array(vec![
+                GgufValue::String("float32".into()),
+                GgufValue::String("float32".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_sign_pack_format".into(),
+            array(vec![
+                GgufValue::String("int8_unpacked_binary".into()),
+                GgufValue::String("int8_unpacked_binary".into()),
+            ]),
+        );
+
+        let resolved = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &sample_metadata(),
+            &gguf,
+            TurboQuantMode::ResearchKvSplit,
+            None,
+        )
+        .unwrap();
+
+        let gguf_cfg = resolved
+            .gguf_metadata
+            .expect("strict gguf metadata should be attached");
+        assert_eq!(gguf_cfg.schema_version, 1);
+        assert_eq!(gguf_cfg.mode, TurboQuantMode::ResearchKvSplit);
+        assert_eq!(gguf_cfg.rotation_policy, Some(RotationPolicy::TrialityVector));
+        assert_eq!(gguf_cfg.triality_mode.as_deref(), Some("triality_proxy"));
+        assert_eq!(gguf_cfg.triality_view.as_deref(), Some("vector"));
+        assert_eq!(gguf_cfg.layers.len(), 2);
+        assert_eq!(gguf_cfg.layers[0].qjl_dim, 128);
+        assert_eq!(gguf_cfg.layers[1].sign_pack_format, "int8_unpacked_binary");
     }
 }
