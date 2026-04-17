@@ -36,7 +36,12 @@ pub fn run(model_path: &str) -> anyhow::Result<()> {
 
     // Estimate performance
     let estimate = estimate_performance(&gguf, &metadata, &hardware, &placement)?;
-    let summary = summarize_placement(&placement.tier_assignments, &gguf.tensors);
+    let summary = summarize_placement(
+        &placement.tensor_placements,
+        &gguf.tensors,
+        placement.inference_mode,
+        hardware.memory.pinned_budget_bytes,
+    );
 
     // Print results
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
@@ -76,11 +81,19 @@ pub fn run(model_path: &str) -> anyhow::Result<()> {
             summary.layers_on_gpu
         );
     }
-    if summary.total_ram_bytes > 0 {
+    if summary.total_host_pageable_bytes > 0 {
         println!(
-            "    RAM:            {:>10}   ({} layers)",
-            format_bytes(summary.total_ram_bytes),
-            summary.layers_in_ram
+            "    Host pageable:  {:>10}   ({} layers)",
+            format_bytes(summary.total_host_pageable_bytes),
+            summary.layers_in_host_pageable
+        );
+    }
+    if summary.total_host_pinned_bytes > 0 || summary.host_pinned_active {
+        println!(
+            "    Host pinned:    {:>10}   ({} layers, budget {})",
+            format_bytes(summary.total_host_pinned_bytes),
+            summary.layers_in_host_pinned,
+            format_bytes(summary.host_pinned_budget_bytes),
         );
     }
     if summary.total_nvme_bytes > 0 {
@@ -141,6 +154,16 @@ pub fn run(model_path: &str) -> anyhow::Result<()> {
         "  Experience: {} — {}",
         estimate.experience_tier.label(),
         estimate.experience_tier.description()
+    );
+    println!(
+        "  Residency: mode={}, pinned_tier={}, pinned_policy={}",
+        placement.residency_policy.residency_profile.label(),
+        if summary.host_pinned_active {
+            "active"
+        } else {
+            "collapsed"
+        },
+        placement.residency_policy.host_pinned_policy.label(),
     );
 
     Ok(())

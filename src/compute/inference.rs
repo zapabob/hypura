@@ -15,6 +15,7 @@ use crate::compute::ffi::*;
 use crate::compute::nvme_backend::{
     build_override_patterns, eval_callback, HypuraBuftController, LayerStatus, PrefetchState,
 };
+use crate::io::compat;
 use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 use crate::model::tensor_role::TensorRole;
@@ -24,7 +25,9 @@ use crate::model::turboquant_sidecar::{
 };
 use crate::profiler;
 use crate::profiler::types::HardwareProfile;
-use crate::scheduler::placement::{compute_placement_with_context, summarize_placement};
+use crate::scheduler::placement::{
+    backing_residence, compute_placement_with_context_and_policy, summarize_placement,
+};
 use crate::scheduler::types::*;
 use crate::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
 
@@ -167,17 +170,37 @@ enum RuntimeCodecEngine {
 }
 
 impl RuntimeCodecEngine {
-    fn ingest_k(&self, layer: u32, head: u32, token: u32, data: &[f32]) -> anyhow::Result<Vec<f32>> {
+    fn ingest_k(
+        &self,
+        layer: u32,
+        head: u32,
+        token: u32,
+        data: &[f32],
+    ) -> anyhow::Result<Vec<f32>> {
         match self {
-            RuntimeCodecEngine::Rust(codec) => codec.lock().unwrap().ingest_k(layer, head, token, data),
-            RuntimeCodecEngine::Cffi(codec) => codec.lock().unwrap().compress_k(layer, head, token, data),
+            RuntimeCodecEngine::Rust(codec) => {
+                codec.lock().unwrap().ingest_k(layer, head, token, data)
+            }
+            RuntimeCodecEngine::Cffi(codec) => {
+                codec.lock().unwrap().compress_k(layer, head, token, data)
+            }
         }
     }
 
-    fn ingest_v(&self, layer: u32, head: u32, token: u32, data: &[f32]) -> anyhow::Result<Vec<f32>> {
+    fn ingest_v(
+        &self,
+        layer: u32,
+        head: u32,
+        token: u32,
+        data: &[f32],
+    ) -> anyhow::Result<Vec<f32>> {
         match self {
-            RuntimeCodecEngine::Rust(codec) => codec.lock().unwrap().ingest_v(layer, head, token, data),
-            RuntimeCodecEngine::Cffi(codec) => codec.lock().unwrap().compress_v(layer, head, token, data),
+            RuntimeCodecEngine::Rust(codec) => {
+                codec.lock().unwrap().ingest_v(layer, head, token, data)
+            }
+            RuntimeCodecEngine::Cffi(codec) => {
+                codec.lock().unwrap().compress_v(layer, head, token, data)
+            }
         }
     }
 
@@ -189,8 +212,18 @@ impl RuntimeCodecEngine {
         token_range: std::ops::Range<u32>,
     ) -> anyhow::Result<Vec<f32>> {
         match self {
-            RuntimeCodecEngine::Rust(codec) => codec.lock().unwrap().score_k(layer, head, query, token_range),
-            RuntimeCodecEngine::Cffi(codec) => codec.lock().unwrap().score_k(layer, head, query, token_range),
+            RuntimeCodecEngine::Rust(codec) => {
+                codec
+                    .lock()
+                    .unwrap()
+                    .score_k(layer, head, query, token_range)
+            }
+            RuntimeCodecEngine::Cffi(codec) => {
+                codec
+                    .lock()
+                    .unwrap()
+                    .score_k(layer, head, query, token_range)
+            }
         }
     }
 
@@ -202,8 +235,15 @@ impl RuntimeCodecEngine {
         head_dim: usize,
     ) -> anyhow::Result<Vec<f32>> {
         match self {
-            RuntimeCodecEngine::Rust(codec) => codec.lock().unwrap().read_v(layer, head, token_range),
-            RuntimeCodecEngine::Cffi(codec) => codec.lock().unwrap().read_v(layer, head, token_range, head_dim),
+            RuntimeCodecEngine::Rust(codec) => {
+                codec.lock().unwrap().read_v(layer, head, token_range)
+            }
+            RuntimeCodecEngine::Cffi(codec) => {
+                codec
+                    .lock()
+                    .unwrap()
+                    .read_v(layer, head, token_range, head_dim)
+            }
         }
     }
 }
@@ -285,17 +325,13 @@ fn apply_llama_turboquant_cli_bridge(
     }
 
     let p = bridge.rotation_policy;
-    let so8_enabled =
-        !bridge.tq_so8_off && !matches!(p, RotationPolicy::RandomHaar);
-    let so8_learned =
-        bridge.tq_so8_learned || matches!(p, RotationPolicy::BlockSo8Learned);
+    let so8_enabled = !bridge.tq_so8_off && !matches!(p, RotationPolicy::RandomHaar);
+    let so8_learned = bridge.tq_so8_learned || matches!(p, RotationPolicy::BlockSo8Learned);
     let triality_enabled = !bridge.tq_triality_off && p.is_triality();
 
     set_process_env_var("LLAMA_TURBOQUANT", "1");
-    set_process_env_var(
-        "LLAMA_TURBOQUANT_SO8",
-        if so8_enabled { "1" } else { "0" },
-    );
+    set_process_env_var("LLAMA_TURBOQUANT_MODE", p.as_str());
+    set_process_env_var("LLAMA_TURBOQUANT_SO8", if so8_enabled { "1" } else { "0" });
     set_process_env_var(
         "LLAMA_TURBOQUANT_SO8_LEARNED",
         if so8_learned { "1" } else { "0" },
@@ -354,6 +390,7 @@ pub fn resolve_runtime_setup(
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&Path>,
     llama_bridge: LlamaTurboquantCliBridge,
+    residency_policy: ResidencyPolicyConfig,
 ) -> anyhow::Result<RuntimeSetup> {
     anyhow::ensure!(
         model_path.exists(),
@@ -373,12 +410,23 @@ pub fn resolve_runtime_setup(
 
     let gguf = GgufFile::open(model_path)?;
     let metadata = ModelMetadata::from_gguf(&gguf)?;
-    let turboquant =
-        resolve_turboquant_config(model_path, &metadata, &gguf, turboquant_mode, turboquant_config)?;
+    let turboquant = resolve_turboquant_config(
+        model_path,
+        &metadata,
+        &gguf,
+        turboquant_mode,
+        turboquant_config,
+    )?;
     apply_gguf_turboquant_env(turboquant.gguf_metadata.as_ref());
     apply_llama_turboquant_cli_bridge(turboquant_mode, &turboquant, &llama_bridge);
-    let plan = compute_placement_with_context(&gguf, &hardware, context)?;
-    let placement_summary = summarize_placement(&plan.tier_assignments, &gguf.tensors);
+    let plan =
+        compute_placement_with_context_and_policy(&gguf, &hardware, context, residency_policy)?;
+    let placement_summary = summarize_placement(
+        &plan.tensor_placements,
+        &gguf.tensors,
+        plan.inference_mode,
+        hardware.memory.pinned_budget_bytes,
+    );
     let gpu_budget = compute_gpu_budget(&hardware, &metadata, context);
     let n_gpu_layers = gpu_layers_from_placement(&plan, &gguf, gpu_budget);
 
@@ -399,20 +447,37 @@ fn apply_gguf_turboquant_env(gguf_turboquant: Option<&GgufTurboQuantConfig>) {
     };
 
     set_process_env_var("LLAMA_TURBOQUANT", if cfg.enabled { "1" } else { "0" });
+    set_process_env_var("LLAMA_TURBOQUANT_MODE", cfg.llama_runtime_mode());
     if let Some(rotation_policy) = cfg.rotation_policy {
-        let so8_enabled = !matches!(rotation_policy, crate::model::turboquant_sidecar::RotationPolicy::RandomHaar);
-        let so8_learned = matches!(rotation_policy, crate::model::turboquant_sidecar::RotationPolicy::BlockSo8Learned);
+        let so8_enabled = !matches!(
+            rotation_policy,
+            crate::model::turboquant_sidecar::RotationPolicy::RandomHaar
+        );
+        let so8_learned = matches!(
+            rotation_policy,
+            crate::model::turboquant_sidecar::RotationPolicy::BlockSo8Learned
+        );
         set_process_env_var("LLAMA_TURBOQUANT_SO8", if so8_enabled { "1" } else { "0" });
-        set_process_env_var("LLAMA_TURBOQUANT_SO8_LEARNED", if so8_learned { "1" } else { "0" });
+        set_process_env_var(
+            "LLAMA_TURBOQUANT_SO8_LEARNED",
+            if so8_learned { "1" } else { "0" },
+        );
         set_process_env_var(
             "LLAMA_TURBOQUANT_TRIALITY",
-            if rotation_policy.is_triality() { "1" } else { "0" },
+            if rotation_policy.is_triality() {
+                "1"
+            } else {
+                "0"
+            },
         );
     }
     if let Some(mix) = cfg.triality_mix {
         set_process_env_var("LLAMA_TURBOQUANT_TRIALITY_MIX", format!("{mix:.3}"));
     }
-    set_process_env_var("LLAMA_TURBOQUANT_ROTATION_SEED", cfg.rotation_seed.to_string());
+    set_process_env_var(
+        "LLAMA_TURBOQUANT_ROTATION_SEED",
+        cfg.rotation_seed.to_string(),
+    );
     if let Some(path) = &cfg.artifact_path {
         if !path.trim().is_empty() {
             set_process_env_var("LLAMA_TURBOQUANT_ARTIFACT", path.trim());
@@ -605,12 +670,9 @@ impl TurboQuantRuntimeSession {
                     let Some(attn) = weights.remove(&(layer, head as u32, token)) else {
                         continue;
                     };
-                    let read_back = self.codec.read_v(
-                        layer,
-                        head as u32,
-                        0..attn.len() as u32,
-                        tracked_dim,
-                    )?;
+                    let read_back =
+                        self.codec
+                            .read_v(layer, head as u32, 0..attn.len() as u32, tracked_dim)?;
                     if read_back.is_empty() {
                         continue;
                     }
@@ -756,9 +818,7 @@ fn validate_turboquant_runtime_mode(turboquant: &ResolvedTurboQuantConfig) -> an
         TurboQuantMode::Exact
         | TurboQuantMode::PaperKeyOnly
         | TurboQuantMode::PaperFullKv
-        | TurboQuantMode::ResearchKvSplit => {
-            Ok(())
-        }
+        | TurboQuantMode::ResearchKvSplit => Ok(()),
     }
 }
 
@@ -909,10 +969,7 @@ pub fn load_model(
     let turboquant_layout = turboquant_runtime_layout(&metadata, turboquant.mode);
     validate_turboquant_runtime_mode(turboquant)?;
 
-    let has_nvme = plan
-        .tier_assignments
-        .values()
-        .any(|t| *t == StorageTier::Nvme);
+    let has_nvme = has_nvme_backing(plan, gguf);
 
     // Derive model name from GGUF metadata or filename
     let model_name = gguf
@@ -946,33 +1003,34 @@ pub fn load_model(
     let (_patterns, overrides) =
         build_override_patterns(plan, gguf, controller.buft_ptr(), n_gpu_layers);
 
-    let nvme_count = plan
-        .tier_assignments
-        .values()
-        .filter(|t| **t == StorageTier::Nvme)
+    let nvme_count = gguf
+        .tensors
+        .iter()
+        .filter(|t| tensor_backing_residence(plan, t) == TensorResidence::NvmeBacked)
         .count();
     tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
 
     let model =
         LlamaModel::load_with_overrides(model_path, n_gpu_layers, true, overrides.as_ptr())?;
-        
+
     let num_layers = model.n_layers() as u32;
 
     let nvme_layers: std::collections::HashSet<u32> = gguf
         .tensors
         .iter()
-        .filter(|t| plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme))
+        .filter(|t| tensor_backing_residence(plan, t) == TensorResidence::NvmeBacked)
         .filter_map(|t| t.layer_index)
         .collect();
 
     let prefetch_state = controller.build_prefetch_state(gguf, num_layers, nvme_layers);
+    configure_pinned_staging_for_plan(&prefetch_state, gguf, plan, total_physical_memory());
 
     // Determine keep-resident mode
     let total_ram = total_physical_memory();
     let nvme_bytes: u64 = gguf
         .tensors
         .iter()
-        .filter(|t| plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme))
+        .filter(|t| tensor_backing_residence(plan, t) == TensorResidence::NvmeBacked)
         .map(|t| t.size_bytes)
         .sum();
 
@@ -981,8 +1039,12 @@ pub fn load_model(
         .tensors
         .iter()
         .filter(|t| {
-            let tier = plan.tier_assignments.get(&t.name);
-            tier == Some(&StorageTier::Nvme) || tier == Some(&StorageTier::Ram)
+            matches!(
+                tensor_backing_residence(plan, t),
+                TensorResidence::NvmeBacked
+                    | TensorResidence::HostPinned
+                    | TensorResidence::HostPageable
+            )
         })
         .map(|t| t.size_bytes)
         .sum();
@@ -1106,7 +1168,7 @@ pub fn generate_from_loaded(
 
     let mut sampler = LlamaSampler::new_with_order(sampling, sampler_order);
 
-    let tokens = loaded.model.tokenize(prompt, true);
+    let tokens = loaded.model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
@@ -1158,6 +1220,9 @@ pub fn generate_from_loaded(
             tok_per_sec,
             token: piece.clone(),
         });
+        if let Some(ref state) = loaded.prefetch_state {
+            emit_prefetch_telemetry(telemetry.as_ref(), state, n_generated);
+        }
 
         if token_tx
             .send(GeneratedToken {
@@ -1261,6 +1326,84 @@ pub fn compute_gpu_budget(
         .saturating_sub(runtime_overhead)
 }
 
+fn tensor_backing_residence(plan: &PlacementPlan, tensor: &crate::model::gguf::TensorInfo) -> TensorResidence {
+    let role = TensorRole::from_name(&tensor.name);
+    let placement = plan
+        .placement_for(&tensor.name)
+        .copied()
+        .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
+    backing_residence(&placement, &role, plan.inference_mode)
+}
+
+fn has_nvme_backing(plan: &PlacementPlan, gguf: &GgufFile) -> bool {
+    gguf.tensors
+        .iter()
+        .any(|tensor| tensor_backing_residence(plan, tensor) == TensorResidence::NvmeBacked)
+}
+
+fn configure_pinned_staging_for_plan(
+    prefetch_state: &Arc<PrefetchState>,
+    gguf: &GgufFile,
+    plan: &PlacementPlan,
+    total_host_bytes: u64,
+) {
+    if plan.residency_policy.host_pinned_policy == HostPinnedPolicy::Off {
+        return;
+    }
+    if !compat::cuda_host_pinning_available() {
+        return;
+    }
+
+    let slot_size = match plan.inference_mode {
+        InferenceMode::ExpertStreaming => gguf
+            .tensors
+            .iter()
+            .filter(|t| matches!(TensorRole::from_name(&t.name), TensorRole::MoeFusedExperts))
+            .map(|t| t.size_bytes as usize)
+            .max()
+            .unwrap_or(0),
+        InferenceMode::DenseFfnStreaming => gguf
+            .tensors
+            .iter()
+            .filter(|t| {
+                matches!(
+                    TensorRole::from_name(&t.name),
+                    TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+                )
+            })
+            .map(|t| t.size_bytes as usize)
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    };
+
+    if slot_size == 0 {
+        return;
+    }
+
+    let budget_bytes = (total_host_bytes / 8).min(2 * (1 << 30));
+    prefetch_state.configure_pinned_staging(budget_bytes as usize, slot_size);
+}
+
+fn emit_prefetch_telemetry(
+    telemetry: &TelemetryEmitter,
+    prefetch_state: &PrefetchState,
+    generated_tokens: u32,
+) {
+    let hit_rate = prefetch_state.neuron_cache.lock().unwrap().hit_rate();
+    telemetry.emit(TelemetryEvent::PrefetchStatus {
+        hit_rate,
+        nvme_mbps: prefetch_state.nvme_mbps(),
+        gpu_slot_hit_rate: prefetch_state.gpu_slot_hit_rate(),
+        pinned_slot_hit_rate: prefetch_state.pinned_slot_hit_rate(),
+        pageable_fallback_rate: prefetch_state.pageable_fallback_rate(),
+        h2d_pinned_mbps: prefetch_state.h2d_pinned_mbps(),
+        h2d_pageable_mbps: prefetch_state.h2d_pageable_mbps(),
+        eviction_churn_per_token: prefetch_state.eviction_churn_per_token(generated_tokens as u64),
+        first_token_stall_ms: prefetch_state.first_token_stall_ms(),
+    });
+}
+
 /// Derive `n_gpu_layers` from a PlacementPlan.
 ///
 /// In expert-streaming mode, expert tensors are on the Hypura NVMe buffer (not Metal),
@@ -1328,7 +1471,7 @@ pub fn gpu_layers_from_placement(
             }
 
             *layer_sizes.entry(layer_idx).or_default() += t.size_bytes;
-            if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
+            if tensor_backing_residence(plan, t) == TensorResidence::NvmeBacked {
                 first_nvme_layer = Some(match first_nvme_layer {
                     Some(existing) => existing.min(layer_idx),
                     None => layer_idx,
@@ -1427,7 +1570,7 @@ fn generate_blocking_internal(
     let mut sampler = LlamaSampler::new(&config.sampling);
 
     // Tokenize prompt
-    let tokens = model.tokenize(prompt, true);
+    let tokens = model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
@@ -1549,10 +1692,7 @@ pub fn generate_with_nvme_scheduling(
     let turboquant_session = build_turboquant_runtime_session(turboquant, turboquant_layout)?;
 
     // Check if there are any NVMe tensors
-    let has_nvme = plan
-        .tier_assignments
-        .values()
-        .any(|t| *t == StorageTier::Nvme);
+    let has_nvme = has_nvme_backing(plan, gguf);
 
     if !has_nvme {
         return generate_blocking_internal(
@@ -1571,10 +1711,10 @@ pub fn generate_with_nvme_scheduling(
     let (_patterns, overrides) =
         build_override_patterns(plan, gguf, controller.buft_ptr(), n_gpu_layers);
 
-    let nvme_count = plan
-        .tier_assignments
-        .values()
-        .filter(|t| **t == StorageTier::Nvme)
+    let nvme_count = gguf
+        .tensors
+        .iter()
+        .filter(|t| tensor_backing_residence(plan, t) == TensorResidence::NvmeBacked)
         .count();
     tracing::info!("NVMe scheduling: {nvme_count} tensors on custom buffer type");
 
@@ -1602,11 +1742,12 @@ pub fn generate_with_nvme_scheduling(
     let nvme_layers: std::collections::HashSet<u32> = gguf
         .tensors
         .iter()
-        .filter(|t| plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme))
+        .filter(|t| tensor_backing_residence(plan, t) == TensorResidence::NvmeBacked)
         .filter_map(|t| t.layer_index)
         .collect();
 
     let prefetch_state = controller.build_prefetch_state(gguf, num_layers, nvme_layers);
+    configure_pinned_staging_for_plan(&prefetch_state, gguf, plan, total_physical_memory());
 
     // Determine if NVMe layers can stay resident in physical memory.
     // When the NVMe spill is modest relative to total RAM, we keep NVMe-tier data
@@ -1618,7 +1759,7 @@ pub fn generate_with_nvme_scheduling(
     let nvme_bytes: u64 = gguf
         .tensors
         .iter()
-        .filter(|t| plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme))
+        .filter(|t| tensor_backing_residence(plan, t) == TensorResidence::NvmeBacked)
         .map(|t| t.size_bytes)
         .sum();
     // Keep-resident mode: keep NVMe data loaded after the first forward pass,
@@ -1636,8 +1777,12 @@ pub fn generate_with_nvme_scheduling(
         .tensors
         .iter()
         .filter(|t| {
-            let tier = plan.tier_assignments.get(&t.name);
-            tier == Some(&StorageTier::Nvme) || tier == Some(&StorageTier::Ram)
+            matches!(
+                tensor_backing_residence(plan, t),
+                TensorResidence::NvmeBacked
+                    | TensorResidence::HostPinned
+                    | TensorResidence::HostPageable
+            )
         })
         .map(|t| t.size_bytes)
         .sum();
@@ -1846,7 +1991,7 @@ pub fn generate_with_nvme_scheduling(
     };
 
     // Tokenize prompt
-    let tokens = model.tokenize(prompt, true);
+    let tokens = model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
@@ -2185,10 +2330,23 @@ mod tests {
     }
 
     fn make_plan(assignments: HashMap<String, StorageTier>) -> PlacementPlan {
+        let tensor_placements = assignments
+            .into_iter()
+            .map(|(name, residence)| {
+                (
+                    name,
+                    TensorPlacement::new(
+                        residence,
+                        ComputeTarget::Gpu,
+                        PrefetchPriority::Warm,
+                    ),
+                )
+            })
+            .collect();
         PlacementPlan {
             model_id: "test".into(),
             hardware_profile_hash: "".into(),
-            tier_assignments: assignments,
+            tensor_placements,
             prefetch_schedule: PrefetchSchedule {
                 layer_prefetches: vec![],
             },
@@ -2201,10 +2359,13 @@ mod tests {
                 warm_tier: StorageTier::Ram,
                 hot_bytes: 0,
                 warm_bytes: 0,
+                pinned_bytes: 0,
+                pageable_bytes: 0,
                 kv_quantization: None,
             },
             experience_tier: ExperienceTier::Fast,
             inference_mode: InferenceMode::FullStreaming,
+            residency_policy: ResidencyPolicyConfig::default(),
         }
     }
 

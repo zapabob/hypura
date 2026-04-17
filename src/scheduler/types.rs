@@ -1,16 +1,202 @@
 use std::collections::HashMap;
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-/// Memory/storage tier for tensor placement.
+/// Physical residence tier for a tensor or streamed runtime unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum StorageTier {
-    /// Metal GPU (fastest, most limited)
+pub enum TensorResidence {
+    /// GPU-resident weights or hot runtime slots.
+    GpuResident,
+    /// CUDA-registered / otherwise pinned host memory used for warm staging.
+    HostPinned,
+    /// Regular pageable host memory or OS page-cache backed warm data.
+    HostPageable,
+    /// Cold backing storage on NVMe.
+    NvmeBacked,
+}
+
+#[allow(non_upper_case_globals)]
+impl TensorResidence {
+    /// Compatibility alias for older code paths.
+    pub const Gpu: Self = Self::GpuResident;
+    /// Compatibility alias for older code paths.
+    pub const Ram: Self = Self::HostPageable;
+    /// Compatibility alias for older code paths.
+    pub const Nvme: Self = Self::NvmeBacked;
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GpuResident => "GPU",
+            Self::HostPinned => "HOST_PINNED",
+            Self::HostPageable => "HOST_PAGEABLE",
+            Self::NvmeBacked => "NVME",
+        }
+    }
+
+    pub fn is_host(self) -> bool {
+        matches!(self, Self::HostPinned | Self::HostPageable)
+    }
+}
+
+/// Backward-compatible alias while the rest of the codebase migrates to
+/// `TensorResidence` naming.
+pub type StorageTier = TensorResidence;
+
+/// Coarse scheduler shape used when comparing the 4-tier residency model against
+/// the previous GPU/RAM/NVMe behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+pub enum ResidencyProfile {
+    #[value(name = "legacy-3tier")]
+    Legacy3Tier,
+    #[value(name = "four-tier")]
+    FourTier,
+}
+
+impl ResidencyProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy3Tier => "legacy-3tier",
+            Self::FourTier => "four-tier",
+        }
+    }
+}
+
+/// Whether the scheduler should use the host pinned tier when it is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+pub enum HostPinnedPolicy {
+    #[value(name = "auto")]
+    Auto,
+    #[value(name = "off")]
+    Off,
+    #[value(name = "force")]
+    Force,
+}
+
+impl HostPinnedPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Force => "force",
+        }
+    }
+}
+
+/// Operator-facing scheduling knobs for residency experiments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResidencyPolicyConfig {
+    pub residency_profile: ResidencyProfile,
+    pub host_pinned_policy: HostPinnedPolicy,
+}
+
+impl ResidencyPolicyConfig {
+    pub const fn new(
+        residency_profile: ResidencyProfile,
+        host_pinned_policy: HostPinnedPolicy,
+    ) -> Self {
+        Self {
+            residency_profile,
+            host_pinned_policy,
+        }
+    }
+
+    pub const fn normalized(self) -> Self {
+        match self.residency_profile {
+            ResidencyProfile::Legacy3Tier => Self {
+                residency_profile: self.residency_profile,
+                host_pinned_policy: HostPinnedPolicy::Off,
+            },
+            ResidencyProfile::FourTier => self,
+        }
+    }
+}
+
+impl Default for ResidencyPolicyConfig {
+    fn default() -> Self {
+        Self::new(ResidencyProfile::FourTier, HostPinnedPolicy::Auto)
+    }
+}
+
+/// Where compute is expected to execute for a tensor's consuming operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ComputeTarget {
     Gpu,
-    /// System RAM
-    Ram,
-    /// NVMe SSD (largest, slowest)
-    Nvme,
+    CpuFallback,
+}
+
+/// Priority used by runtime prefetch/promotion decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PrefetchPriority {
+    Critical,
+    Warm,
+    Opportunistic,
+}
+
+/// Complete scheduling intent for a tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TensorPlacement {
+    pub residence: TensorResidence,
+    pub compute_target: ComputeTarget,
+    pub prefetch_priority: PrefetchPriority,
+}
+
+impl TensorPlacement {
+    pub const fn new(
+        residence: TensorResidence,
+        compute_target: ComputeTarget,
+        prefetch_priority: PrefetchPriority,
+    ) -> Self {
+        Self {
+            residence,
+            compute_target,
+            prefetch_priority,
+        }
+    }
+
+    pub const fn gpu_resident() -> Self {
+        Self::new(
+            TensorResidence::GpuResident,
+            ComputeTarget::Gpu,
+            PrefetchPriority::Critical,
+        )
+    }
+
+    pub const fn host_pageable(prefetch_priority: PrefetchPriority) -> Self {
+        Self::new(
+            TensorResidence::HostPageable,
+            ComputeTarget::Gpu,
+            prefetch_priority,
+        )
+    }
+
+    pub const fn host_pinned(prefetch_priority: PrefetchPriority) -> Self {
+        Self::new(
+            TensorResidence::HostPinned,
+            ComputeTarget::Gpu,
+            prefetch_priority,
+        )
+    }
+
+    pub const fn nvme_backed(prefetch_priority: PrefetchPriority) -> Self {
+        Self::new(
+            TensorResidence::NvmeBacked,
+            ComputeTarget::Gpu,
+            prefetch_priority,
+        )
+    }
+
+    pub const fn cpu_fallback(residence: TensorResidence) -> Self {
+        Self::new(residence, ComputeTarget::CpuFallback, PrefetchPriority::Warm)
+    }
+
+    pub fn summary_residence(self) -> TensorResidence {
+        self.residence
+    }
+
+    pub fn prefers_host_pinned(self) -> bool {
+        self.residence == TensorResidence::HostPinned
+    }
 }
 
 /// User experience classification based on predicted tok/s.
@@ -76,14 +262,25 @@ pub enum InferenceMode {
 pub struct PlacementPlan {
     pub model_id: String,
     pub hardware_profile_hash: String,
-    /// tensor_name → tier
-    pub tier_assignments: HashMap<String, StorageTier>,
+    /// tensor_name → placement policy
+    pub tensor_placements: HashMap<String, TensorPlacement>,
     pub prefetch_schedule: PrefetchSchedule,
     pub estimated_tok_per_sec: f64,
     pub estimated_time_to_first_token: f64,
     pub kv_cache_plan: KvCachePlan,
     pub experience_tier: ExperienceTier,
     pub inference_mode: InferenceMode,
+    pub residency_policy: ResidencyPolicyConfig,
+}
+
+impl PlacementPlan {
+    pub fn placement_for(&self, tensor_name: &str) -> Option<&TensorPlacement> {
+        self.tensor_placements.get(tensor_name)
+    }
+
+    pub fn residence_for(&self, tensor_name: &str) -> Option<TensorResidence> {
+        self.tensor_placements.get(tensor_name).map(|p| p.residence)
+    }
 }
 
 /// Schedule for prefetching tensors from slower tiers.
@@ -97,8 +294,8 @@ pub struct PrefetchSchedule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefetchOp {
     pub tensor_name: String,
-    pub source_tier: StorageTier,
-    pub target_tier: StorageTier,
+    pub source_residence: TensorResidence,
+    pub target_residence: TensorResidence,
     pub size_bytes: u64,
     /// How many layers ahead this prefetch should start.
     pub lead_time_layers: u32,
@@ -128,10 +325,12 @@ impl KvQuantization {
 pub struct KvCachePlan {
     pub hot_window_tokens: u32,
     pub warm_window_tokens: u32,
-    pub hot_tier: StorageTier,
-    pub warm_tier: StorageTier,
+    pub hot_tier: TensorResidence,
+    pub warm_tier: TensorResidence,
     pub hot_bytes: u64,
     pub warm_bytes: u64,
+    pub pinned_bytes: u64,
+    pub pageable_bytes: u64,
     /// Auto-selected KV quantization (None = F16 default).
     pub kv_quantization: Option<KvQuantization>,
 }
@@ -140,11 +339,15 @@ pub struct KvCachePlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementSummary {
     pub layers_on_gpu: u32,
-    pub layers_in_ram: u32,
+    pub layers_in_host_pinned: u32,
+    pub layers_in_host_pageable: u32,
     pub layers_on_nvme: u32,
     pub total_gpu_bytes: u64,
-    pub total_ram_bytes: u64,
+    pub total_host_pinned_bytes: u64,
+    pub total_host_pageable_bytes: u64,
     pub total_nvme_bytes: u64,
+    pub host_pinned_active: bool,
+    pub host_pinned_budget_bytes: u64,
 }
 
 /// Unified memory budget estimation for Apple Silicon.

@@ -119,7 +119,10 @@ impl KvCodecRuntimeBridge {
         let ffi = KvCodecFfi::new(resolved)?;
         let cfg = unsafe { ffi.to_c_config() };
         let runtime = unsafe { hypura_sys::hypura_kv_codec_runtime_create(&cfg) };
-        anyhow::ensure!(!runtime.is_null(), "failed to create hypura_kv_codec runtime");
+        anyhow::ensure!(
+            !runtime.is_null(),
+            "failed to create hypura_kv_codec runtime"
+        );
         Ok(Self { ffi, runtime })
     }
 

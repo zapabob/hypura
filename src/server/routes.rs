@@ -1,23 +1,24 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf};
-use std::collections::{HashMap, VecDeque};
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::Html;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum::response::Html;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::compute::inference::{
-    GenerateFromLoadedParams, GenerationResult, LoadedModel, LlamaTurboquantCliBridge,
+    GenerateFromLoadedParams, GenerationResult, LlamaTurboquantCliBridge, LoadedModel,
 };
 use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
+use crate::scheduler::types::ResidencyPolicyConfig;
 use crate::server::chat::format_chat_prompt;
 use crate::server::ollama_types::*;
 use crate::server::streaming;
@@ -37,6 +38,7 @@ pub struct AppState {
     pub serve_turboquant_mode: TurboQuantMode,
     pub serve_turboquant_config_path: Option<PathBuf>,
     pub serve_llama_bridge: LlamaTurboquantCliBridge,
+    pub serve_residency_policy: ResidencyPolicyConfig,
     pub active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub generation_in_progress: Arc<AtomicBool>,
     pub gui_presets: Arc<Mutex<HashMap<String, GuiPresetItem>>>,
@@ -56,7 +58,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/extra/model/switch", post(model_switch_handler))
         .route("/api/extra/presets/list", get(gui_presets_list_handler))
         .route("/api/extra/presets/save", post(gui_presets_save_handler))
-        .route("/api/extra/presets/delete", post(gui_presets_delete_handler))
+        .route(
+            "/api/extra/presets/delete",
+            post(gui_presets_delete_handler),
+        )
         .route("/api/extra/history", get(gui_history_handler))
         .route("/api/extra/events", get(gui_events_handler))
         .route("/api/extra/ui-theme", get(ui_theme_get_handler))
@@ -65,8 +70,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/chat", post(chat_handler))
         .route("/api/v1/model", get(kobold_model_handler))
         .route("/api/v1/generate", post(kobold_generate_handler))
-        .route("/api/extra/generate/stream", post(kobold_generate_stream_handler))
-        .route("/api/extra/generate/check", get(kobold_generate_check_handler))
+        .route(
+            "/api/extra/generate/stream",
+            post(kobold_generate_stream_handler),
+        )
+        .route(
+            "/api/extra/generate/check",
+            get(kobold_generate_check_handler),
+        )
         .route("/api/extra/abort", post(kobold_abort_handler))
         .route(
             "/api/extra/true_max_context_length",
@@ -913,12 +924,13 @@ async fn show_handler(
 
 async fn kobold_model_handler(State(state): State<Arc<AppState>>) -> Json<KoboldModelResponse> {
     let model_name = state.model_name.lock().unwrap().clone();
-    Json(KoboldModelResponse {
-        result: model_name,
-    })
+    Json(KoboldModelResponse { result: model_name })
 }
 
-fn collect_gguf_models(model_dir: &PathBuf, active_path: &str) -> anyhow::Result<Vec<AvailableModelItem>> {
+fn collect_gguf_models(
+    model_dir: &PathBuf,
+    active_path: &str,
+) -> anyhow::Result<Vec<AvailableModelItem>> {
     let mut models = Vec::new();
     for entry in fs::read_dir(model_dir)? {
         let entry = entry?;
@@ -950,7 +962,12 @@ fn collect_gguf_models(model_dir: &PathBuf, active_path: &str) -> anyhow::Result
 }
 
 async fn models_handler(State(state): State<Arc<AppState>>) -> Response {
-    let active_path = state.model_path.lock().unwrap().to_string_lossy().to_string();
+    let active_path = state
+        .model_path
+        .lock()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     match collect_gguf_models(&state.model_dir, &active_path) {
         Ok(models) => Json(AvailableModelsResponse {
             models,
@@ -970,7 +987,11 @@ async fn model_switch_handler(
     Json(req): Json<ModelSwitchRequest>,
 ) -> Response {
     if state.generation_in_progress.load(Ordering::Relaxed) {
-        push_gui_event(&state, "warn", "model switch rejected: generation in progress");
+        push_gui_event(
+            &state,
+            "warn",
+            "model switch rejected: generation in progress",
+        );
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "generation in progress; abort first" })),
@@ -980,7 +1001,11 @@ async fn model_switch_handler(
 
     let next_model_path = PathBuf::from(req.path.trim());
     if !next_model_path.exists() {
-        push_gui_event(&state, "error", "model switch failed: model path does not exist");
+        push_gui_event(
+            &state,
+            "error",
+            "model switch failed: model path does not exist",
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "model path does not exist" })),
@@ -993,6 +1018,7 @@ async fn model_switch_handler(
     let tq_mode = state.serve_turboquant_mode;
     let tq_config = state.serve_turboquant_config_path.clone();
     let bridge = state.serve_llama_bridge.clone();
+    let residency_policy = state.serve_residency_policy;
     let setup = match tokio::task::spawn_blocking(move || {
         crate::compute::inference::resolve_runtime_setup(
             &path_for_setup,
@@ -1000,6 +1026,7 @@ async fn model_switch_handler(
             tq_mode,
             tq_config.as_deref(),
             bridge,
+            residency_policy,
         )
     })
     .await
@@ -1098,7 +1125,11 @@ async fn model_switch_handler(
     *state.gguf_info.lock().unwrap() = gguf_info;
 
     let model_name = state.model_name.lock().unwrap().clone();
-    push_gui_event(&state, "info", format!("model switched: {model_name} (ctx={context})"));
+    push_gui_event(
+        &state,
+        "info",
+        format!("model switched: {model_name} (ctx={context})"),
+    );
     Json(ModelSwitchResponse {
         success: true,
         model: model_name,
@@ -1143,8 +1174,16 @@ fn push_gui_history(
     }
 }
 
-async fn gui_presets_list_handler(State(state): State<Arc<AppState>>) -> Json<GuiPresetListResponse> {
-    let mut presets: Vec<GuiPresetItem> = state.gui_presets.lock().unwrap().values().cloned().collect();
+async fn gui_presets_list_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<GuiPresetListResponse> {
+    let mut presets: Vec<GuiPresetItem> = state
+        .gui_presets
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
     presets.sort_by(|a, b| a.name.cmp(&b.name));
     Json(GuiPresetListResponse { presets })
 }
@@ -1218,7 +1257,7 @@ async fn ui_theme_set_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "theme must be light|dark|classic" })),
             )
-                .into_response()
+                .into_response();
         }
     };
     *state.ui_theme.lock().unwrap() = next.clone();
@@ -1291,6 +1330,7 @@ async fn generate_handler(
                     Some(gen_result.tok_per_sec_avg),
                     started.elapsed().as_millis() as u64,
                 );
+                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
                 let _ = result_tx.send(gen_result);
             }
             Err(e) => {
@@ -1400,9 +1440,14 @@ async fn kobold_generate_handler(
                 Some(gen_result.tok_per_sec_avg),
                 started.elapsed().as_millis() as u64,
             );
+            record_compat_text_generation(&state_for_task, &sampling, &gen_result);
             let _ = result_tx.send(gen_result);
         } else if let Err(e) = result {
-            push_gui_event(&state_for_task, "error", format!("kobold generate failed: {e}"));
+            push_gui_event(
+                &state_for_task,
+                "error",
+                format!("kobold generate failed: {e}"),
+            );
         }
     });
 
@@ -1493,9 +1538,14 @@ async fn kobold_generate_stream_handler(
                 Some(gen_result.tok_per_sec_avg),
                 started.elapsed().as_millis() as u64,
             );
+            record_compat_text_generation(&state_for_task, &sampling, &gen_result);
             let _ = result_tx.send(gen_result);
         } else if let Err(e) = result {
-            push_gui_event(&state_for_task, "error", format!("kobold stream failed: {e}"));
+            push_gui_event(
+                &state_for_task,
+                "error",
+                format!("kobold stream failed: {e}"),
+            );
         }
     });
 
@@ -1538,7 +1588,9 @@ async fn kobold_generate_stream_handler(
         .into_response()
 }
 
-async fn kobold_generate_check_handler(State(state): State<Arc<AppState>>) -> Json<KoboldGenerateResponse> {
+async fn kobold_generate_check_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<KoboldGenerateResponse> {
     let status = if state.generation_in_progress.load(Ordering::Relaxed) {
         "busy"
     } else {
@@ -1564,8 +1616,341 @@ async fn kobold_true_max_context_length_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<KoboldTrueMaxContextLengthResponse> {
     Json(KoboldTrueMaxContextLengthResponse {
-        value: state.gguf_info.lock().unwrap().context_length,
+        value: state.default_context,
     })
+}
+
+async fn kobold_websearch_handler() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(compat::feature_unavailable_error("websearch")),
+    )
+        .into_response()
+}
+
+async fn txt2img_unavailable_handler() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(compat::feature_unavailable_error("txt2img")),
+    )
+        .into_response()
+}
+
+async fn transcribe_unavailable_handler() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(compat::openai_error(
+            "transcribe is not bundled in this Hypura compatibility slice yet",
+            "unsupported_feature",
+            "transcribe_unavailable",
+        )),
+    )
+        .into_response()
+}
+
+async fn openai_embeddings_handler() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(compat::openai_error(
+            "embeddings are not bundled in this Hypura compatibility slice yet",
+            "unsupported_feature",
+            "embeddings_unavailable",
+        )),
+    )
+        .into_response()
+}
+
+async fn openai_completions_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OpenAiCompletionRequest>,
+) -> Response {
+    let request_start = Instant::now();
+    let load_duration_ns = state.load_duration_ns;
+    let prompt = req.prompt.to_prompt_text();
+    let stop_sequences = req
+        .stop
+        .as_ref()
+        .map(OpenAiStopInput::to_stop_sequences)
+        .unwrap_or_default();
+    let sampling = build_sampling_from_openai_completion(&req, state.compat_default_max_length);
+    let sampler_order = req.sampler_order.clone();
+    let model_name = req
+        .model
+        .clone()
+        .unwrap_or_else(|| state.model_name.lock().unwrap().clone());
+    let created = chrono::Utc::now().timestamp();
+    let request_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
+
+    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
+    let loaded = state.loaded_model.clone();
+    let telemetry = state.telemetry.clone();
+    let cancel_flag = begin_generation(&state);
+    let state_for_task = state.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let mut model = loaded.lock().unwrap();
+        let params = GenerateFromLoadedParams {
+            prompt: &prompt,
+            sampling: &sampling,
+            sampler_order: sampler_order.as_deref(),
+            stop_sequences: &stop_sequences,
+            cancel_flag: Some(cancel_flag),
+            token_tx,
+            telemetry,
+        };
+        let result = crate::compute::inference::generate_from_loaded(&mut model, params);
+        end_generation(&state_for_task);
+        match result {
+            Ok(gen_result) => {
+                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
+                let active_model = state_for_task.model_name.lock().unwrap().clone();
+                push_gui_history(
+                    &state_for_task,
+                    "openai-completion",
+                    active_model,
+                    prompt.chars().count(),
+                    gen_result.text.chars().count(),
+                    Some(gen_result.tok_per_sec_avg),
+                    started.elapsed().as_millis() as u64,
+                );
+                let _ = result_tx.send(gen_result);
+            }
+            Err(e) => {
+                tracing::error!("OpenAI completion error: {e}");
+                push_gui_event(
+                    &state_for_task,
+                    "error",
+                    format!("openai completion failed: {e}"),
+                );
+            }
+        }
+    });
+
+    if req.stream {
+        let request_id_for_stream = request_id.clone();
+        let model_name_for_stream = model_name.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
+        tokio::spawn(async move {
+            while let Some(token) = token_rx.recv().await {
+                let chunk = serde_json::json!({
+                    "id": request_id_for_stream,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model_name_for_stream,
+                    "choices": [{
+                        "text": token.text,
+                        "index": 0,
+                        "finish_reason": serde_json::Value::Null,
+                    }]
+                });
+                if tx
+                    .send(Ok(format!("data: {}\n\n", chunk)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let result = result_rx.await.ok();
+            let final_chunk = serde_json::json!({
+                "id": request_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "text": "",
+                    "index": 0,
+                    "finish_reason": "stop",
+                }],
+                "usage": result.as_ref().map(|r| compat::openai_usage(r.prompt_tokens, r.tokens_generated)),
+                "total_duration": request_start.elapsed().as_nanos() as u64,
+                "load_duration": load_duration_ns,
+            });
+            let _ = tx.send(Ok(format!("data: {}\n\n", final_chunk))).await;
+            let _ = tx.send(Ok("data: [DONE]\n\n".to_string())).await;
+        });
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
+            .into_response()
+    } else {
+        let mut full_response = String::new();
+        while let Some(token) = token_rx.recv().await {
+            full_response.push_str(&token.text);
+        }
+        let result = result_rx.await.ok();
+        let body = compat::openai_completion_response(
+            &request_id,
+            created,
+            &model_name,
+            &full_response,
+            result.as_ref().map(|r| r.prompt_tokens).unwrap_or(0),
+            result.as_ref().map(|r| r.tokens_generated).unwrap_or(0),
+        );
+        Json(body).into_response()
+    }
+}
+
+async fn openai_chat_completions_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OpenAiChatCompletionRequest>,
+) -> Response {
+    let request_start = Instant::now();
+    let load_duration_ns = state.load_duration_ns;
+    let messages: Vec<ChatMessage> = req
+        .messages
+        .iter()
+        .map(OpenAiChatMessage::to_chat_message)
+        .collect();
+    let prompt = format_chat_prompt(&messages);
+    let stop_sequences = req
+        .stop
+        .as_ref()
+        .map(OpenAiStopInput::to_stop_sequences)
+        .unwrap_or_default();
+    let sampling = build_sampling_from_openai_chat(&req, state.compat_default_max_length);
+    let sampler_order = req.sampler_order.clone();
+    let model_name = req
+        .model
+        .clone()
+        .unwrap_or_else(|| state.model_name.lock().unwrap().clone());
+    let created = chrono::Utc::now().timestamp();
+    let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+
+    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
+    let loaded = state.loaded_model.clone();
+    let telemetry = state.telemetry.clone();
+    let cancel_flag = begin_generation(&state);
+    let state_for_task = state.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let mut model = loaded.lock().unwrap();
+        let params = GenerateFromLoadedParams {
+            prompt: &prompt,
+            sampling: &sampling,
+            sampler_order: sampler_order.as_deref(),
+            stop_sequences: &stop_sequences,
+            cancel_flag: Some(cancel_flag),
+            token_tx,
+            telemetry,
+        };
+        let result = crate::compute::inference::generate_from_loaded(&mut model, params);
+        end_generation(&state_for_task);
+        match result {
+            Ok(gen_result) => {
+                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
+                let active_model = state_for_task.model_name.lock().unwrap().clone();
+                push_gui_history(
+                    &state_for_task,
+                    "openai-chat",
+                    active_model,
+                    prompt.chars().count(),
+                    gen_result.text.chars().count(),
+                    Some(gen_result.tok_per_sec_avg),
+                    started.elapsed().as_millis() as u64,
+                );
+                let _ = result_tx.send(gen_result);
+            }
+            Err(e) => {
+                tracing::error!("OpenAI chat completion error: {e}");
+                push_gui_event(
+                    &state_for_task,
+                    "error",
+                    format!("openai chat completion failed: {e}"),
+                );
+            }
+        }
+    });
+
+    if req.stream {
+        let request_id_for_stream = request_id.clone();
+        let model_name_for_stream = model_name.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
+        tokio::spawn(async move {
+            let first_chunk = serde_json::json!({
+                "id": request_id_for_stream,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name_for_stream,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "" },
+                    "finish_reason": serde_json::Value::Null,
+                }]
+            });
+            if tx
+                .send(Ok(format!("data: {}\n\n", first_chunk)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            while let Some(token) = token_rx.recv().await {
+                let chunk = serde_json::json!({
+                    "id": request_id_for_stream,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name_for_stream,
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": token.text },
+                        "finish_reason": serde_json::Value::Null,
+                    }]
+                });
+                if tx
+                    .send(Ok(format!("data: {}\n\n", chunk)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let result = result_rx.await.ok();
+            let final_chunk = serde_json::json!({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+                "usage": result.as_ref().map(|r| compat::openai_usage(r.prompt_tokens, r.tokens_generated)),
+                "total_duration": request_start.elapsed().as_nanos() as u64,
+                "load_duration": load_duration_ns,
+            });
+            let _ = tx.send(Ok(format!("data: {}\n\n", final_chunk))).await;
+            let _ = tx.send(Ok("data: [DONE]\n\n".to_string())).await;
+        });
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
+            .into_response()
+    } else {
+        let mut full_response = String::new();
+        while let Some(token) = token_rx.recv().await {
+            full_response.push_str(&token.text);
+        }
+        let result = result_rx.await.ok();
+        let body = compat::openai_chat_response(
+            &request_id,
+            created,
+            &model_name,
+            &full_response,
+            result.as_ref().map(|r| r.prompt_tokens).unwrap_or(0),
+            result.as_ref().map(|r| r.tokens_generated).unwrap_or(0),
+        );
+        Json(body).into_response()
+    }
 }
 
 async fn chat_handler(
@@ -1616,6 +2001,7 @@ async fn chat_handler(
                     Some(gen_result.tok_per_sec_avg),
                     started.elapsed().as_millis() as u64,
                 );
+                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
                 let _ = result_tx.send(gen_result);
             }
             Err(e) => {
@@ -1690,6 +2076,93 @@ fn build_sampling(opts: &GenerateOptions) -> crate::compute::ffi::SamplingParams
         s.seed = seed;
     }
     s
+}
+
+fn build_sampling_from_openai_completion(
+    req: &OpenAiCompletionRequest,
+    default_max_length: u32,
+) -> crate::compute::ffi::SamplingParams {
+    let mut s = crate::compute::ffi::SamplingParams::default();
+    s.max_tokens = req.max_tokens.unwrap_or(default_max_length);
+    if let Some(t) = req.temperature {
+        s.temperature = t;
+    }
+    if let Some(p) = req.top_p {
+        s.top_p = p;
+    }
+    if let Some(k) = req.top_k {
+        s.top_k = k;
+    }
+    if let Some(a) = req.top_a {
+        s.top_a = a;
+    }
+    if let Some(tfs) = req.tfs {
+        s.tfs = tfs;
+    }
+    if let Some(typ) = req.typical {
+        s.typical = typ;
+    }
+    if let Some(mp) = req.min_p {
+        s.min_p = mp;
+    }
+    if let Some(seed) = req.seed {
+        s.seed = seed;
+    }
+    if let Some(v) = req.presence_penalty {
+        s.repeat_penalty = (1.0 + v).max(0.1);
+    }
+    if let Some(v) = req.frequency_penalty {
+        s.repeat_penalty = s.repeat_penalty.max((1.0 + v).max(0.1));
+    }
+    s
+}
+
+fn build_sampling_from_openai_chat(
+    req: &OpenAiChatCompletionRequest,
+    default_max_length: u32,
+) -> crate::compute::ffi::SamplingParams {
+    let mut s = crate::compute::ffi::SamplingParams::default();
+    s.max_tokens = req.max_tokens.unwrap_or(default_max_length);
+    if let Some(t) = req.temperature {
+        s.temperature = t;
+    }
+    if let Some(p) = req.top_p {
+        s.top_p = p;
+    }
+    if let Some(k) = req.top_k {
+        s.top_k = k;
+    }
+    if let Some(a) = req.top_a {
+        s.top_a = a;
+    }
+    if let Some(tfs) = req.tfs {
+        s.tfs = tfs;
+    }
+    if let Some(typ) = req.typical {
+        s.typical = typ;
+    }
+    if let Some(mp) = req.min_p {
+        s.min_p = mp;
+    }
+    if let Some(seed) = req.seed {
+        s.seed = seed;
+    }
+    if let Some(v) = req.presence_penalty {
+        s.repeat_penalty = (1.0 + v).max(0.1);
+    }
+    if let Some(v) = req.frequency_penalty {
+        s.repeat_penalty = s.repeat_penalty.max((1.0 + v).max(0.1));
+    }
+    s
+}
+
+fn record_compat_text_generation(
+    state: &Arc<AppState>,
+    sampling: &crate::compute::ffi::SamplingParams,
+    result: &GenerationResult,
+) {
+    let mut compat_perf = state.compat_perf.lock().unwrap();
+    compat::record_text_generation(&mut compat_perf, sampling, result);
 }
 
 fn set_process_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {

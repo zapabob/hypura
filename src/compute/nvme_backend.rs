@@ -11,6 +11,7 @@ use crate::cache::neuron_cache::NeuronCache;
 use crate::io::expert_layout::{ExpertLayout, ExpertTensorType};
 use crate::model::gguf::GgufFile;
 use crate::model::tensor_role::TensorRole;
+use crate::scheduler::placement::backing_residence;
 use crate::scheduler::types::*;
 
 /// Metadata about a tensor in our custom buffer.
@@ -28,6 +29,29 @@ pub enum LayerStatus {
     NotLoaded,
     Loading,
     Loaded,
+}
+
+/// Runtime residency for streamed units after the initial placement decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeResidency {
+    ColdNvme,
+    PageableWarm,
+    PinnedWarm,
+    GpuHot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StreamUnitKey {
+    Layer(u32),
+    Expert {
+        layer_idx: u32,
+        expert_id: u32,
+        tensor_type: ExpertTensorType,
+    },
+    DenseTensor {
+        layer_idx: u32,
+        tensor_name: String,
+    },
 }
 
 /// Message types for prefetch requests (high-level API).
@@ -200,6 +224,10 @@ fn io_worker(
                 // Last task for this layer — mark complete
                 let mut status = state.layer_status.lock().unwrap();
                 status.insert(task.completion.layer_idx, LayerStatus::Loaded);
+                state.mark_layer_residency(
+                    task.completion.layer_idx,
+                    state.preferred_warm_residency(),
+                );
                 state.layer_notify.notify_all();
             }
         }
@@ -261,6 +289,59 @@ impl IoTrace {
     }
 }
 
+pub struct PinnedStagingRing {
+    base: *mut u8,
+    bytes: usize,
+    slot_size: usize,
+    num_slots: usize,
+    registered_with_cuda: bool,
+}
+
+unsafe impl Send for PinnedStagingRing {}
+unsafe impl Sync for PinnedStagingRing {}
+
+impl PinnedStagingRing {
+    fn new(bytes: usize, slot_size: usize) -> Option<Self> {
+        if bytes == 0 || slot_size == 0 {
+            return None;
+        }
+        let aligned_bytes = (bytes + 4095) & !4095usize;
+        let base = compat::alloc_pages(aligned_bytes);
+        if base.is_null() {
+            return None;
+        }
+        let registered_with_cuda = compat::try_register_cuda_host_pages(base, aligned_bytes);
+        Some(Self {
+            base,
+            bytes: aligned_bytes,
+            slot_size,
+            num_slots: aligned_bytes / slot_size.max(1),
+            registered_with_cuda,
+        })
+    }
+
+    fn warm_residency(&self) -> RuntimeResidency {
+        if self.registered_with_cuda {
+            RuntimeResidency::PinnedWarm
+        } else {
+            RuntimeResidency::PageableWarm
+        }
+    }
+
+    fn budget_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for PinnedStagingRing {
+    fn drop(&mut self) {
+        if self.registered_with_cuda {
+            compat::unregister_cuda_host_pages(self.base);
+        }
+        compat::free_pages(self.base, self.bytes);
+    }
+}
+
 /// Shared state between the eval callback and the inference engine.
 /// This struct is passed as `user_data` to `cb_eval`.
 pub struct PrefetchState {
@@ -303,6 +384,14 @@ pub struct PrefetchState {
     // --- Neuron cache ---
     pub neuron_cache: Mutex<NeuronCache>,
     pub debug_logged_tensors: AtomicI32,
+    pub runtime_residency: Mutex<HashMap<StreamUnitKey, RuntimeResidency>>,
+    pub gpu_hot_slot_capacity: usize,
+    pub gpu_hot_hits: AtomicU64,
+    pub gpu_hot_misses: AtomicU64,
+    pub pageable_fallbacks: AtomicU64,
+    pub eviction_churn: AtomicU64,
+    pub first_token_stall_ms: AtomicU64,
+    pub pinned_staging: Mutex<Option<PinnedStagingRing>>,
 
     // --- Co-activation tracking (Phase 2) ---
     pub co_activation: Mutex<CoActivationMatrix>,
@@ -344,6 +433,152 @@ unsafe impl Send for PrefetchState {}
 unsafe impl Sync for PrefetchState {}
 
 impl PrefetchState {
+    pub fn configure_pinned_staging(&self, budget_bytes: usize, slot_size: usize) {
+        if budget_bytes == 0 || slot_size == 0 {
+            return;
+        }
+        let mut staging = self.pinned_staging.lock().unwrap();
+        if staging.is_some() {
+            return;
+        }
+        if let Some(ring) = PinnedStagingRing::new(budget_bytes, slot_size) {
+            if !ring.registered_with_cuda {
+                self.pageable_fallbacks.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::info!(
+                "Pinned staging ring: {:.1} MB, {} slots, slot_size={} MB, cuda_registered={}",
+                ring.budget_bytes() as f64 / 1e6,
+                ring.num_slots,
+                ring.slot_size as f64 / 1e6,
+                ring.registered_with_cuda,
+            );
+            *staging = Some(ring);
+        }
+    }
+
+    fn preferred_warm_residency(&self) -> RuntimeResidency {
+        self.pinned_staging
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|ring| ring.warm_residency())
+            .unwrap_or(RuntimeResidency::PageableWarm)
+    }
+
+    fn mark_unit_residency(&self, key: StreamUnitKey, residence: RuntimeResidency) {
+        self.runtime_residency.lock().unwrap().insert(key, residence);
+    }
+
+    fn mark_layer_residency(&self, layer_idx: u32, residence: RuntimeResidency) {
+        self.mark_unit_residency(StreamUnitKey::Layer(layer_idx), residence);
+    }
+
+    fn mark_expert_residency(
+        &self,
+        layer_idx: u32,
+        expert_id: u32,
+        tensor_type: ExpertTensorType,
+        residence: RuntimeResidency,
+    ) {
+        self.mark_unit_residency(
+            StreamUnitKey::Expert {
+                layer_idx,
+                expert_id,
+                tensor_type,
+            },
+            residence,
+        );
+    }
+
+    pub fn gpu_slot_hit_rate(&self) -> f64 {
+        let hits = self.gpu_hot_hits.load(Ordering::Relaxed) as f64;
+        let misses = self.gpu_hot_misses.load(Ordering::Relaxed) as f64;
+        if hits + misses == 0.0 {
+            0.0
+        } else {
+            hits / (hits + misses)
+        }
+    }
+
+    pub fn pinned_slot_hit_rate(&self) -> f64 {
+        let runtime = self.runtime_residency.lock().unwrap();
+        let pinned = runtime
+            .values()
+            .filter(|state| **state == RuntimeResidency::PinnedWarm)
+            .count() as f64;
+        let pageable = runtime
+            .values()
+            .filter(|state| **state == RuntimeResidency::PageableWarm)
+            .count() as f64;
+        if pinned + pageable == 0.0 {
+            0.0
+        } else {
+            pinned / (pinned + pageable)
+        }
+    }
+
+    pub fn pageable_fallback_rate(&self) -> f64 {
+        let fallbacks = self.pageable_fallbacks.load(Ordering::Relaxed) as f64;
+        let attempts = (self.gpu_hot_hits.load(Ordering::Relaxed)
+            + self.gpu_hot_misses.load(Ordering::Relaxed)) as f64;
+        if attempts == 0.0 {
+            0.0
+        } else {
+            (fallbacks / attempts).clamp(0.0, 1.0)
+        }
+    }
+
+    pub fn eviction_churn_per_token(&self, tokens: u64) -> f64 {
+        if tokens == 0 {
+            0.0
+        } else {
+            self.eviction_churn.load(Ordering::Relaxed) as f64 / tokens as f64
+        }
+    }
+
+    pub fn nvme_mbps(&self) -> f64 {
+        self.io_pool
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pool| pool.throughput_bps() / 1e6)
+            .unwrap_or(0.0)
+    }
+
+    pub fn h2d_pinned_mbps(&self) -> f64 {
+        if self
+            .pinned_staging
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|ring| ring.registered_with_cuda)
+            .unwrap_or(false)
+        {
+            self.nvme_mbps()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn h2d_pageable_mbps(&self) -> f64 {
+        if self
+            .pinned_staging
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|ring| !ring.registered_with_cuda)
+            .unwrap_or(true)
+        {
+            self.nvme_mbps()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn first_token_stall_ms(&self) -> f64 {
+        self.first_token_stall_ms.load(Ordering::Relaxed) as f64
+    }
+
     /// Submit a layer load to the I/O pool. Decomposes into tasks based on
     /// expert-aware loading when router selections are available.
     fn submit_layer_load(&self, layer_idx: u32) {
@@ -388,13 +623,27 @@ impl PrefetchState {
                             continue;
                         }
                         if cache.is_loaded(layer_idx, eid, tensor_type) {
+                            self.gpu_hot_hits.fetch_add(1, Ordering::Relaxed);
+                            self.mark_expert_residency(
+                                layer_idx,
+                                eid,
+                                tensor_type,
+                                RuntimeResidency::GpuHot,
+                            );
                             continue;
                         }
+                        self.gpu_hot_misses.fetch_add(1, Ordering::Relaxed);
                         regions.push((
                             layout.expert_buffer_offset(eid),
                             layout.expert_stride,
                             layout.expert_file_offset(eid),
                         ));
+                        self.mark_expert_residency(
+                            layer_idx,
+                            eid,
+                            tensor_type,
+                            self.preferred_warm_residency(),
+                        );
                         cache.mark_loaded(layer_idx, eid, tensor_type);
                     }
                     if !regions.is_empty() {
@@ -426,6 +675,7 @@ impl PrefetchState {
             // Nothing to load — mark as Loaded immediately
             let mut status = self.layer_status.lock().unwrap();
             status.insert(layer_idx, LayerStatus::Loaded);
+            self.mark_layer_residency(layer_idx, self.preferred_warm_residency());
             self.layer_notify.notify_all();
             return;
         }
@@ -453,6 +703,7 @@ impl PrefetchState {
             drop(pool);
             let mut status = self.layer_status.lock().unwrap();
             status.insert(layer_idx, LayerStatus::Loaded);
+            self.mark_layer_residency(layer_idx, RuntimeResidency::PageableWarm);
             self.layer_notify.notify_all();
         }
     }
@@ -490,13 +741,27 @@ impl PrefetchState {
                             continue;
                         }
                         if cache.is_loaded(layer_idx, eid, tensor_type) {
+                            self.gpu_hot_hits.fetch_add(1, Ordering::Relaxed);
+                            self.mark_expert_residency(
+                                layer_idx,
+                                eid,
+                                tensor_type,
+                                RuntimeResidency::GpuHot,
+                            );
                             continue;
                         }
+                        self.gpu_hot_misses.fetch_add(1, Ordering::Relaxed);
                         regions.push((
                             layout.expert_buffer_offset(eid),
                             layout.expert_stride,
                             layout.expert_file_offset(eid),
                         ));
+                        self.mark_expert_residency(
+                            layer_idx,
+                            eid,
+                            tensor_type,
+                            self.preferred_warm_residency(),
+                        );
                         cache.mark_loaded(layer_idx, eid, tensor_type);
                     }
                     if !regions.is_empty() {
@@ -550,6 +815,12 @@ impl PrefetchState {
                     status = self.layer_notify.wait(status).unwrap();
                     if tracing && status.get(&layer_idx).copied() == Some(LayerStatus::Loaded) {
                         let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+                        let _ = self.first_token_stall_ms.compare_exchange(
+                            0,
+                            wait_ms.round() as u64,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                         self.trace.record(TraceEvent::LayerStall {
                             layer: layer_idx,
                             wait_ms,
@@ -571,6 +842,12 @@ impl PrefetchState {
                     }
                     if tracing {
                         let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+                        let _ = self.first_token_stall_ms.compare_exchange(
+                            0,
+                            wait_ms.round() as u64,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                         self.trace.record(TraceEvent::LayerStall {
                             layer: layer_idx,
                             wait_ms,
@@ -606,6 +883,8 @@ impl PrefetchState {
             .lock()
             .unwrap()
             .insert(layer_idx, LayerStatus::NotLoaded);
+        self.mark_layer_residency(layer_idx, RuntimeResidency::ColdNvme);
+        self.eviction_churn.fetch_add(1, Ordering::Relaxed);
 
         if self.trace_enabled.load(Ordering::Relaxed) {
             self.trace.record(TraceEvent::Released(layer_idx));
@@ -740,8 +1019,23 @@ impl PrefetchState {
                         let tt = ExpertTensorType::from_name(&layout.tensor_name)
                             .unwrap_or(ExpertTensorType::Gate);
                         if !cache.is_loaded(layer_idx, eid, tt) {
+                            self.gpu_hot_misses.fetch_add(1, Ordering::Relaxed);
+                            self.mark_expert_residency(
+                                layer_idx,
+                                eid,
+                                tt,
+                                self.preferred_warm_residency(),
+                            );
                             missing = true;
                             break;
+                        } else {
+                            self.gpu_hot_hits.fetch_add(1, Ordering::Relaxed);
+                            self.mark_expert_residency(
+                                layer_idx,
+                                eid,
+                                tt,
+                                RuntimeResidency::GpuHot,
+                            );
                         }
                     }
                     if missing {
@@ -845,8 +1139,16 @@ impl PrefetchState {
                         continue;
                     }
                     if cache.is_loaded(layer_idx, eid, tensor_type) {
+                        self.gpu_hot_hits.fetch_add(1, Ordering::Relaxed);
+                        self.mark_expert_residency(
+                            layer_idx,
+                            eid,
+                            tensor_type,
+                            RuntimeResidency::GpuHot,
+                        );
                         continue;
                     }
+                    self.gpu_hot_misses.fetch_add(1, Ordering::Relaxed);
                     // Pool-relative: slot_offset + expert_id * stride
                     let mapped_eid = layout
                         .expert_permutation
@@ -859,6 +1161,12 @@ impl PrefetchState {
                         layout.expert_stride,
                         layout.expert_file_offset(eid),
                     ));
+                    self.mark_expert_residency(
+                        layer_idx,
+                        eid,
+                        tensor_type,
+                        self.preferred_warm_residency(),
+                    );
                     cache.mark_loaded(layer_idx, eid, tensor_type);
                 }
                 if !regions.is_empty() {
@@ -901,6 +1209,21 @@ impl PrefetchState {
         let mut status = self.layer_status.lock().unwrap();
         while status.get(&layer_idx).copied() != Some(LayerStatus::Loaded) {
             status = self.layer_notify.wait(status).unwrap();
+        }
+        drop(status);
+        for layout in layouts {
+            let tensor_type = ExpertTensorType::from_name(&layout.tensor_name)
+                .unwrap_or(ExpertTensorType::Gate);
+            for &eid in expert_ids {
+                if eid < layout.num_experts {
+                    self.mark_expert_residency(
+                        layer_idx,
+                        eid,
+                        tensor_type,
+                        RuntimeResidency::GpuHot,
+                    );
+                }
+            }
         }
     }
 
@@ -970,17 +1293,38 @@ impl PrefetchState {
                             continue;
                         }
                         if cache.is_loaded(layer_idx, eid, tensor_type) {
+                            self.gpu_hot_hits.fetch_add(1, Ordering::Relaxed);
+                            self.mark_expert_residency(
+                                layer_idx,
+                                eid,
+                                tensor_type,
+                                RuntimeResidency::GpuHot,
+                            );
                             continue;
                         }
+                        self.gpu_hot_misses.fetch_add(1, Ordering::Relaxed);
                         regions.push((
                             layout.expert_buffer_offset(eid),
                             layout.expert_stride,
                             layout.expert_file_offset(eid),
                         ));
+                        self.mark_expert_residency(
+                            layer_idx,
+                            eid,
+                            tensor_type,
+                            self.preferred_warm_residency(),
+                        );
                         // MADV_FREE evicted expert's pages on cache eviction
                         if let Some((ev_l, ev_e, ev_t)) =
                             cache.mark_loaded(layer_idx, eid, tensor_type)
                         {
+                            self.mark_expert_residency(
+                                ev_l,
+                                ev_e,
+                                ev_t,
+                                RuntimeResidency::ColdNvme,
+                            );
+                            self.eviction_churn.fetch_add(1, Ordering::Relaxed);
                             if let Some(ev_layouts) = self.expert_layouts.get(&ev_l) {
                                 for ev_layout in ev_layouts {
                                     if ExpertTensorType::from_name(&ev_layout.tensor_name)
@@ -2028,6 +2372,14 @@ impl HypuraBuftController {
             num_experts_total,
             neuron_cache: Mutex::new(NeuronCache::new(cache_capacity)),
             debug_logged_tensors: AtomicI32::new(0),
+            runtime_residency: Mutex::new(HashMap::new()),
+            gpu_hot_slot_capacity: cache_capacity,
+            gpu_hot_hits: AtomicU64::new(0),
+            gpu_hot_misses: AtomicU64::new(0),
+            pageable_fallbacks: AtomicU64::new(0),
+            eviction_churn: AtomicU64::new(0),
+            first_token_stall_ms: AtomicU64::new(0),
+            pinned_staging: Mutex::new(None),
             co_activation: Mutex::new(co_activation),
             prev_layer_experts: Mutex::new(None),
             expert_streaming: AtomicBool::new(false),
@@ -2220,7 +2572,14 @@ pub fn build_override_patterns(
     ) {
         let mut patterns = Vec::new();
         for t in &gguf.tensors {
-            if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
+            let role = TensorRole::from_name(&t.name);
+            let placement = plan
+                .placement_for(&t.name)
+                .copied()
+                .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
+            if backing_residence(&placement, &role, plan.inference_mode)
+                == TensorResidence::NvmeBacked
+            {
                 let escaped = regex_escape(&t.name);
                 patterns.push(format!("^{}$", escaped));
             }
@@ -2805,6 +3164,55 @@ extern "C" fn on_tensor_init_cb(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
+
+    fn make_test_prefetch_state() -> PrefetchState {
+        PrefetchState {
+            current_layer: AtomicI32::new(-1),
+            tensor_map: HashMap::new(),
+            model_path: PathBuf::from("test.gguf"),
+            buffer_base: Mutex::new(std::ptr::null_mut()),
+            layer_regions: HashMap::new(),
+            layer_status: Mutex::new(HashMap::new()),
+            layer_notify: Condvar::new(),
+            num_layers: 4,
+            prefetch_enabled: AtomicBool::new(true),
+            io_pool: Mutex::new(None),
+            nvme_layers: HashSet::new(),
+            keep_nvme_resident: AtomicBool::new(false),
+            sorted_nvme_layers: Vec::new(),
+            expert_layouts: HashMap::new(),
+            non_expert_regions: HashMap::new(),
+            selected_experts: Mutex::new(HashMap::new()),
+            num_experts_used: 2,
+            num_experts_total: 8,
+            neuron_cache: Mutex::new(NeuronCache::new(4)),
+            debug_logged_tensors: AtomicI32::new(0),
+            runtime_residency: Mutex::new(HashMap::new()),
+            gpu_hot_slot_capacity: 4,
+            gpu_hot_hits: AtomicU64::new(0),
+            gpu_hot_misses: AtomicU64::new(0),
+            pageable_fallbacks: AtomicU64::new(0),
+            eviction_churn: AtomicU64::new(0),
+            first_token_stall_ms: AtomicU64::new(0),
+            pinned_staging: Mutex::new(None),
+            co_activation: Mutex::new(CoActivationMatrix::new(4, 8)),
+            prev_layer_experts: Mutex::new(None),
+            expert_streaming: AtomicBool::new(true),
+            dense_ffn_streaming: AtomicBool::new(false),
+            dense_ffn_layouts: HashMap::new(),
+            dense_ffn_lookahead: 1,
+            expert_pool: Mutex::new(None),
+            fused_tensor_ptrs: HashMap::new(),
+            resident_ffn_layers: HashSet::new(),
+            resident_ffn_base: std::ptr::null_mut(),
+            resident_ffn_size: 0,
+            resident_ffn_offsets: HashMap::new(),
+            trace_enabled: AtomicBool::new(false),
+            trace: IoTrace::new(),
+        }
+    }
 
     #[test]
     fn test_regex_escape() {
@@ -2854,5 +3262,73 @@ mod tests {
             status.lock().unwrap().get(&0).copied(),
             Some(LayerStatus::NotLoaded)
         );
+    }
+
+    #[test]
+    fn test_runtime_residency_cold_to_pinned_to_gpu_hot() {
+        let state = make_test_prefetch_state();
+        state.mark_layer_residency(1, RuntimeResidency::ColdNvme);
+        state.mark_layer_residency(1, RuntimeResidency::PinnedWarm);
+        state.mark_expert_residency(1, 2, ExpertTensorType::Gate, RuntimeResidency::GpuHot);
+
+        let runtime = state.runtime_residency.lock().unwrap();
+        assert_eq!(
+            runtime.get(&StreamUnitKey::Layer(1)),
+            Some(&RuntimeResidency::PinnedWarm)
+        );
+        assert_eq!(
+            runtime.get(&StreamUnitKey::Expert {
+                layer_idx: 1,
+                expert_id: 2,
+                tensor_type: ExpertTensorType::Gate,
+            }),
+            Some(&RuntimeResidency::GpuHot)
+        );
+    }
+
+    #[test]
+    fn test_runtime_residency_gpu_hot_to_pinned_warm() {
+        let state = make_test_prefetch_state();
+        state.mark_expert_residency(2, 1, ExpertTensorType::Up, RuntimeResidency::GpuHot);
+        state.mark_expert_residency(2, 1, ExpertTensorType::Up, RuntimeResidency::PinnedWarm);
+
+        let runtime = state.runtime_residency.lock().unwrap();
+        assert_eq!(
+            runtime.get(&StreamUnitKey::Expert {
+                layer_idx: 2,
+                expert_id: 1,
+                tensor_type: ExpertTensorType::Up,
+            }),
+            Some(&RuntimeResidency::PinnedWarm)
+        );
+    }
+
+    #[test]
+    fn test_runtime_residency_warm_to_cold_nvme() {
+        let state = make_test_prefetch_state();
+        state.mark_layer_residency(3, RuntimeResidency::PageableWarm);
+        state.mark_layer_residency(3, RuntimeResidency::ColdNvme);
+
+        let runtime = state.runtime_residency.lock().unwrap();
+        assert_eq!(
+            runtime.get(&StreamUnitKey::Layer(3)),
+            Some(&RuntimeResidency::ColdNvme)
+        );
+    }
+
+    #[test]
+    fn test_pinned_staging_fallback_semantics() {
+        let state = make_test_prefetch_state();
+        assert_eq!(state.preferred_warm_residency(), RuntimeResidency::PageableWarm);
+
+        let ring = PinnedStagingRing {
+            base: std::ptr::null_mut(),
+            bytes: 4096,
+            slot_size: 1024,
+            num_slots: 4,
+            registered_with_cuda: false,
+        };
+        assert_eq!(ring.warm_residency(), RuntimeResidency::PageableWarm);
+        std::mem::forget(ring);
     }
 }

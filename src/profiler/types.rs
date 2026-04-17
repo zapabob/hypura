@@ -25,6 +25,18 @@ pub struct MemoryProfile {
     pub available_bytes: u64,
     /// Measured via memcpy benchmark (bytes/sec)
     pub bandwidth_bytes_per_sec: u64,
+    /// Measured host->device bandwidth using pageable memory when available.
+    #[serde(default)]
+    pub h2d_pageable_bandwidth_bytes_per_sec: u64,
+    /// Measured or estimated host->device bandwidth using pinned memory.
+    #[serde(default)]
+    pub h2d_pinned_bandwidth_bytes_per_sec: u64,
+    /// Whether the current machine/runtime is expected to support a pinned host tier.
+    #[serde(default)]
+    pub supports_host_pinning: bool,
+    /// Safe host-pinned budget for staging / warm slots.
+    #[serde(default)]
+    pub pinned_budget_bytes: u64,
     /// On Apple Silicon, unified memory is shared with GPU
     pub is_unified: bool,
 }

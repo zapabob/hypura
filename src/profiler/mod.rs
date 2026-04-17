@@ -6,7 +6,7 @@ pub mod types;
 
 use chrono::Utc;
 
-use crate::profiler::types::{HardwareProfile, SystemInfo};
+use crate::profiler::types::{GpuBackend, HardwareProfile, SystemInfo};
 
 /// Run the full hardware profiling suite.
 pub fn run_full_profile() -> anyhow::Result<HardwareProfile> {
@@ -14,10 +14,18 @@ pub fn run_full_profile() -> anyhow::Result<HardwareProfile> {
     let cpu_profile = cpu::profile_cpu()?;
 
     tracing::info!("Profiling memory...");
-    let memory_profile = memory::profile_memory()?;
+    let mut memory_profile = memory::profile_memory()?;
 
     tracing::info!("Profiling GPU...");
     let gpu = gpu::profile_gpu()?;
+
+    let supports_cuda_pinning = matches!(gpu.as_ref().map(|g| &g.backend), Some(GpuBackend::Cuda));
+    if !supports_cuda_pinning {
+        memory_profile.supports_host_pinning = false;
+        memory_profile.pinned_budget_bytes = 0;
+        memory_profile.h2d_pinned_bandwidth_bytes_per_sec =
+            memory_profile.h2d_pageable_bandwidth_bytes_per_sec;
+    }
 
     tracing::info!("Profiling storage...");
     let storage = storage::profile_storage()?;
@@ -67,7 +75,8 @@ pub fn load_cached_profile() -> anyhow::Result<Option<HardwareProfile>> {
         return Ok(None);
     }
     let json = std::fs::read_to_string(&path)?;
-    let profile: HardwareProfile = serde_json::from_str(&json)?;
+    let mut profile: HardwareProfile = serde_json::from_str(&json)?;
+    normalize_loaded_profile(&mut profile);
     Ok(Some(profile))
 }
 
@@ -129,6 +138,33 @@ fn machine_model() -> String {
     {
         // Could query WMI here; for now return a static string
         "Windows PC".to_string()
+    }
+}
+
+fn normalize_loaded_profile(profile: &mut HardwareProfile) {
+    if profile.memory.h2d_pageable_bandwidth_bytes_per_sec == 0 {
+        profile.memory.h2d_pageable_bandwidth_bytes_per_sec =
+            profile.memory.bandwidth_bytes_per_sec;
+    }
+    if profile.memory.h2d_pinned_bandwidth_bytes_per_sec == 0 {
+        let pageable = profile.memory.h2d_pageable_bandwidth_bytes_per_sec.max(1);
+        profile.memory.h2d_pinned_bandwidth_bytes_per_sec = pageable.saturating_mul(4) / 3;
+    }
+
+    let cuda_backend = matches!(profile.gpu.as_ref().map(|g| &g.backend), Some(GpuBackend::Cuda));
+    let inferred_pinning =
+        cuda_backend && !profile.memory.is_unified && profile.memory.pinned_budget_bytes == 0;
+    if inferred_pinning {
+        profile.memory.supports_host_pinning = true;
+        profile.memory.pinned_budget_bytes =
+            (profile.memory.available_bytes / 8).min(2 * (1 << 30));
+    }
+
+    if !cuda_backend {
+        profile.memory.supports_host_pinning = false;
+        profile.memory.pinned_budget_bytes = 0;
+        profile.memory.h2d_pinned_bandwidth_bytes_per_sec =
+            profile.memory.h2d_pageable_bandwidth_bytes_per_sec;
     }
 }
 
