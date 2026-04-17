@@ -1,23 +1,24 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf};
-use std::collections::{HashMap, VecDeque};
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::Html;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum::response::Html;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::compute::inference::{
-    GenerateFromLoadedParams, GenerationResult, LoadedModel, LlamaTurboquantCliBridge,
+    GenerateFromLoadedParams, GenerationResult, LlamaTurboquantCliBridge, LoadedModel,
 };
 use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
+use crate::scheduler::types::ResidencyPolicyConfig;
 use crate::server::chat::format_chat_prompt;
 use crate::server::ollama_types::*;
 use crate::server::streaming;
@@ -37,6 +38,7 @@ pub struct AppState {
     pub serve_turboquant_mode: TurboQuantMode,
     pub serve_turboquant_config_path: Option<PathBuf>,
     pub serve_llama_bridge: LlamaTurboquantCliBridge,
+    pub serve_residency_policy: ResidencyPolicyConfig,
     pub active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub generation_in_progress: Arc<AtomicBool>,
     pub gui_presets: Arc<Mutex<HashMap<String, GuiPresetItem>>>,
@@ -56,7 +58,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/extra/model/switch", post(model_switch_handler))
         .route("/api/extra/presets/list", get(gui_presets_list_handler))
         .route("/api/extra/presets/save", post(gui_presets_save_handler))
-        .route("/api/extra/presets/delete", post(gui_presets_delete_handler))
+        .route(
+            "/api/extra/presets/delete",
+            post(gui_presets_delete_handler),
+        )
         .route("/api/extra/history", get(gui_history_handler))
         .route("/api/extra/events", get(gui_events_handler))
         .route("/api/extra/ui-theme", get(ui_theme_get_handler))
@@ -65,8 +70,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/chat", post(chat_handler))
         .route("/api/v1/model", get(kobold_model_handler))
         .route("/api/v1/generate", post(kobold_generate_handler))
-        .route("/api/extra/generate/stream", post(kobold_generate_stream_handler))
-        .route("/api/extra/generate/check", get(kobold_generate_check_handler))
+        .route(
+            "/api/extra/generate/stream",
+            post(kobold_generate_stream_handler),
+        )
+        .route(
+            "/api/extra/generate/check",
+            get(kobold_generate_check_handler),
+        )
         .route("/api/extra/abort", post(kobold_abort_handler))
         .route(
             "/api/extra/true_max_context_length",
@@ -913,12 +924,13 @@ async fn show_handler(
 
 async fn kobold_model_handler(State(state): State<Arc<AppState>>) -> Json<KoboldModelResponse> {
     let model_name = state.model_name.lock().unwrap().clone();
-    Json(KoboldModelResponse {
-        result: model_name,
-    })
+    Json(KoboldModelResponse { result: model_name })
 }
 
-fn collect_gguf_models(model_dir: &PathBuf, active_path: &str) -> anyhow::Result<Vec<AvailableModelItem>> {
+fn collect_gguf_models(
+    model_dir: &PathBuf,
+    active_path: &str,
+) -> anyhow::Result<Vec<AvailableModelItem>> {
     let mut models = Vec::new();
     for entry in fs::read_dir(model_dir)? {
         let entry = entry?;
@@ -950,7 +962,12 @@ fn collect_gguf_models(model_dir: &PathBuf, active_path: &str) -> anyhow::Result
 }
 
 async fn models_handler(State(state): State<Arc<AppState>>) -> Response {
-    let active_path = state.model_path.lock().unwrap().to_string_lossy().to_string();
+    let active_path = state
+        .model_path
+        .lock()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     match collect_gguf_models(&state.model_dir, &active_path) {
         Ok(models) => Json(AvailableModelsResponse {
             models,
@@ -970,7 +987,11 @@ async fn model_switch_handler(
     Json(req): Json<ModelSwitchRequest>,
 ) -> Response {
     if state.generation_in_progress.load(Ordering::Relaxed) {
-        push_gui_event(&state, "warn", "model switch rejected: generation in progress");
+        push_gui_event(
+            &state,
+            "warn",
+            "model switch rejected: generation in progress",
+        );
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "generation in progress; abort first" })),
@@ -980,7 +1001,11 @@ async fn model_switch_handler(
 
     let next_model_path = PathBuf::from(req.path.trim());
     if !next_model_path.exists() {
-        push_gui_event(&state, "error", "model switch failed: model path does not exist");
+        push_gui_event(
+            &state,
+            "error",
+            "model switch failed: model path does not exist",
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "model path does not exist" })),
@@ -993,6 +1018,7 @@ async fn model_switch_handler(
     let tq_mode = state.serve_turboquant_mode;
     let tq_config = state.serve_turboquant_config_path.clone();
     let bridge = state.serve_llama_bridge.clone();
+    let residency_policy = state.serve_residency_policy;
     let setup = match tokio::task::spawn_blocking(move || {
         crate::compute::inference::resolve_runtime_setup(
             &path_for_setup,
@@ -1000,6 +1026,7 @@ async fn model_switch_handler(
             tq_mode,
             tq_config.as_deref(),
             bridge,
+            residency_policy,
         )
     })
     .await
@@ -1098,7 +1125,11 @@ async fn model_switch_handler(
     *state.gguf_info.lock().unwrap() = gguf_info;
 
     let model_name = state.model_name.lock().unwrap().clone();
-    push_gui_event(&state, "info", format!("model switched: {model_name} (ctx={context})"));
+    push_gui_event(
+        &state,
+        "info",
+        format!("model switched: {model_name} (ctx={context})"),
+    );
     Json(ModelSwitchResponse {
         success: true,
         model: model_name,
@@ -1143,8 +1174,16 @@ fn push_gui_history(
     }
 }
 
-async fn gui_presets_list_handler(State(state): State<Arc<AppState>>) -> Json<GuiPresetListResponse> {
-    let mut presets: Vec<GuiPresetItem> = state.gui_presets.lock().unwrap().values().cloned().collect();
+async fn gui_presets_list_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<GuiPresetListResponse> {
+    let mut presets: Vec<GuiPresetItem> = state
+        .gui_presets
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
     presets.sort_by(|a, b| a.name.cmp(&b.name));
     Json(GuiPresetListResponse { presets })
 }
@@ -1218,7 +1257,7 @@ async fn ui_theme_set_handler(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "theme must be light|dark|classic" })),
             )
-                .into_response()
+                .into_response();
         }
     };
     *state.ui_theme.lock().unwrap() = next.clone();
@@ -1402,7 +1441,11 @@ async fn kobold_generate_handler(
             );
             let _ = result_tx.send(gen_result);
         } else if let Err(e) = result {
-            push_gui_event(&state_for_task, "error", format!("kobold generate failed: {e}"));
+            push_gui_event(
+                &state_for_task,
+                "error",
+                format!("kobold generate failed: {e}"),
+            );
         }
     });
 
@@ -1495,7 +1538,11 @@ async fn kobold_generate_stream_handler(
             );
             let _ = result_tx.send(gen_result);
         } else if let Err(e) = result {
-            push_gui_event(&state_for_task, "error", format!("kobold stream failed: {e}"));
+            push_gui_event(
+                &state_for_task,
+                "error",
+                format!("kobold stream failed: {e}"),
+            );
         }
     });
 
@@ -1538,7 +1585,9 @@ async fn kobold_generate_stream_handler(
         .into_response()
 }
 
-async fn kobold_generate_check_handler(State(state): State<Arc<AppState>>) -> Json<KoboldGenerateResponse> {
+async fn kobold_generate_check_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<KoboldGenerateResponse> {
     let status = if state.generation_in_progress.load(Ordering::Relaxed) {
         "busy"
     } else {

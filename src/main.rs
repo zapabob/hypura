@@ -2,6 +2,7 @@ mod cli;
 
 use clap::{Parser, Subcommand};
 use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
+use hypura::scheduler::types::{HostPinnedPolicy, ResidencyProfile};
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +56,12 @@ enum Commands {
         /// Rotation seed for deterministic rotation
         #[arg(long, default_value = "0")]
         rotation_seed: u32,
+        /// Residency comparison profile
+        #[arg(long, value_enum, default_value_t = ResidencyProfile::FourTier)]
+        residency_profile: ResidencyProfile,
+        /// Host pinned tier policy
+        #[arg(long, value_enum, default_value_t = HostPinnedPolicy::Auto)]
+        host_pinned: HostPinnedPolicy,
     },
     /// Start Ollama-compatible API server
     Serve {
@@ -105,6 +112,12 @@ enum Commands {
         /// Optional Kobold-lite theme hint (stored in env for UI)
         #[arg(long, default_value = "classic")]
         ui_theme: String,
+        /// Residency comparison profile
+        #[arg(long, value_enum, default_value_t = ResidencyProfile::FourTier)]
+        residency_profile: ResidencyProfile,
+        /// Host pinned tier policy
+        #[arg(long, value_enum, default_value_t = HostPinnedPolicy::Auto)]
+        host_pinned: HostPinnedPolicy,
     },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
@@ -137,6 +150,12 @@ enum Commands {
         /// Rotation seed for deterministic rotation
         #[arg(long, default_value = "0")]
         rotation_seed: u32,
+        /// Run a single residency profile instead of the default comparison trio
+        #[arg(long, value_enum)]
+        residency_profile: Option<ResidencyProfile>,
+        /// Override the host pinned policy for the selected benchmark profile
+        #[arg(long, value_enum)]
+        host_pinned: Option<HostPinnedPolicy>,
     },
     /// Print model metadata, tensor list, and placement plan
     Inspect {
@@ -184,6 +203,8 @@ fn main() -> anyhow::Result<()> {
             turboquant_config,
             rotation_policy,
             rotation_seed,
+            residency_profile,
+            host_pinned,
         } => cli::run::run(
             &model,
             context,
@@ -194,6 +215,8 @@ fn main() -> anyhow::Result<()> {
             turboquant_config.as_deref(),
             rotation_policy,
             rotation_seed,
+            residency_profile,
+            host_pinned,
         ),
         Commands::Serve {
             model,
@@ -212,6 +235,8 @@ fn main() -> anyhow::Result<()> {
             tq_artifact,
             model_dir,
             ui_theme,
+            residency_profile,
+            host_pinned,
         } => cli::serve::run(
             &model,
             &host,
@@ -229,6 +254,8 @@ fn main() -> anyhow::Result<()> {
             tq_artifact.as_deref(),
             model_dir.as_deref(),
             &ui_theme,
+            residency_profile,
+            host_pinned,
         ),
         Commands::Bench {
             model,
@@ -241,6 +268,8 @@ fn main() -> anyhow::Result<()> {
             turboquant_config,
             rotation_policy,
             rotation_seed,
+            residency_profile,
+            host_pinned,
         } => cli::bench::run(
             &model,
             baseline,
@@ -252,6 +281,8 @@ fn main() -> anyhow::Result<()> {
             turboquant_config.as_deref(),
             rotation_policy,
             rotation_seed,
+            residency_profile,
+            host_pinned,
         ),
         Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
         Commands::Iobench { model, read_gb } => cli::iobench::run(&model, read_gb),

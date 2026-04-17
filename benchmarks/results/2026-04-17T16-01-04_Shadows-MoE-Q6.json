@@ -1,0 +1,140 @@
+{
+  "timestamp": "2026-04-17T16:01:04.076223700+00:00",
+  "model": {
+    "name": "Shadows-MoE-Q6",
+    "architecture": "llama",
+    "params": "12.9B",
+    "quant": "Q6K",
+    "size_gb": 9.840911865234375
+  },
+  "hardware": {
+    "cpu": "AMD Ryzen 5 4500 6-Core Processor              ",
+    "ram_gb": 31.87804412841797,
+    "gpu": "NVIDIA GeForce RTX 3060",
+    "nvme_seq_gbps": 2.504404342
+  },
+  "config": {
+    "context": 32768,
+    "max_tokens": 4,
+    "prompt": "Write a short paragraph about artificial intelligence.",
+    "baseline_requested": true,
+    "residency_matrix": [
+      "legacy-3tier+off",
+      "four-tier+off",
+      "four-tier+auto"
+    ],
+    "turboquant_mode": "exact",
+    "turboquant_schema": "none",
+    "turboquant_runtime_status": "inactive"
+  },
+  "baseline": {
+    "prompt_eval_ms": 92476.9075,
+    "prompt_tokens": 9,
+    "tok_per_sec": 1.1368759087724158,
+    "tokens_generated": 4,
+    "wall_time_ms": 167438.9728
+  },
+  "hypura_runs": [
+    {
+      "label": "hypura legacy-3tier + off",
+      "residency_profile": "legacy-3tier",
+      "host_pinned_policy": "off",
+      "n_gpu_layers": 20,
+      "placement": {
+        "gpu_gb": 7.4307403564453125,
+        "host_pageable_gb": 0.0000152587890625,
+        "host_pinned_gb": 0.0,
+        "nvme_gb": 2.41015625,
+        "inference_mode": "FullStreaming",
+        "pinned_tier_active": false,
+        "pinned_budget_gb": 0.14087581634521484
+      },
+      "result": {
+        "prompt_eval_ms": 63191.1301,
+        "prompt_tokens": 9,
+        "tok_per_sec": 1.1065437289206879,
+        "tokens_generated": 4,
+        "wall_time_ms": 71201.0269
+      },
+      "telemetry": {
+        "hit_rate": 0.0,
+        "nvme_mbps": 0.0,
+        "gpu_slot_hit_rate": 0.0,
+        "pinned_slot_hit_rate": 0.0,
+        "pageable_fallback_rate": 0.0,
+        "h2d_pinned_mbps": 0.0,
+        "h2d_pageable_mbps": 0.0,
+        "eviction_churn_per_token": 0.0,
+        "first_token_stall_ms": 0.0
+      }
+    },
+    {
+      "label": "hypura four-tier + off",
+      "residency_profile": "four-tier",
+      "host_pinned_policy": "off",
+      "n_gpu_layers": 20,
+      "placement": {
+        "gpu_gb": 7.4307403564453125,
+        "host_pageable_gb": 0.0000152587890625,
+        "host_pinned_gb": 0.0,
+        "nvme_gb": 2.41015625,
+        "inference_mode": "FullStreaming",
+        "pinned_tier_active": false,
+        "pinned_budget_gb": 0.14087581634521484
+      },
+      "result": {
+        "prompt_eval_ms": 77042.2712,
+        "prompt_tokens": 9,
+        "tok_per_sec": 1.2369436729867274,
+        "tokens_generated": 4,
+        "wall_time_ms": 113623.7718
+      },
+      "telemetry": {
+        "hit_rate": 0.0,
+        "nvme_mbps": 0.0,
+        "gpu_slot_hit_rate": 0.0,
+        "pinned_slot_hit_rate": 0.0,
+        "pageable_fallback_rate": 0.0,
+        "h2d_pinned_mbps": 0.0,
+        "h2d_pageable_mbps": 0.0,
+        "eviction_churn_per_token": 0.0,
+        "first_token_stall_ms": 0.0
+      }
+    },
+    {
+      "label": "hypura four-tier + auto",
+      "residency_profile": "four-tier",
+      "host_pinned_policy": "auto",
+      "n_gpu_layers": 20,
+      "placement": {
+        "gpu_gb": 7.4307403564453125,
+        "host_pageable_gb": 0.0000152587890625,
+        "host_pinned_gb": 0.0,
+        "nvme_gb": 2.41015625,
+        "inference_mode": "FullStreaming",
+        "pinned_tier_active": false,
+        "pinned_budget_gb": 0.14087581634521484
+      },
+      "result": {
+        "prompt_eval_ms": 7846.5072,
+        "prompt_tokens": 9,
+        "tok_per_sec": 1.2198140991114812,
+        "tokens_generated": 4,
+        "wall_time_ms": 27001.9755
+      },
+      "telemetry": {
+        "hit_rate": 0.0,
+        "nvme_mbps": 0.0,
+        "gpu_slot_hit_rate": 0.0,
+        "pinned_slot_hit_rate": 0.0,
+        "pageable_fallback_rate": 0.0,
+        "h2d_pinned_mbps": 0.0,
+        "h2d_pageable_mbps": 0.0,
+        "eviction_churn_per_token": 0.0,
+        "first_token_stall_ms": 0.0
+      }
+    }
+  ],
+  "primary_run_label": "hypura four-tier + auto",
+  "primary_speedup_vs_baseline": 1.0729527204324534
+}

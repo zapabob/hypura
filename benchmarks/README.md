@@ -241,3 +241,4 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 | 2026-03-22 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 45.2 GB | 0.0 GB | 0.0 GB | — | 3.2 | — |
 | 2026-03-22 | mixtral-8x7b-instruct-v0.1.Q5_K_M Q5K | Apple M1 Max 32GB | 1.1 GB | 0.0 GB | 29.8 GB | — | 1.8 | — |
 | 2026-03-22 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 45.2 GB | 0.0 GB | 0.0 GB | 2.6 | 2.9 | 1.1x |
+| 2026-04-17 | Shadows-MoE-Q6 Q6K | AMD Ryzen 5 4500 6-Core Processor               31GB | 7.4 GB | 0.0 GB | 2.4 GB | 1.1 | 1.2 | 1.1x |

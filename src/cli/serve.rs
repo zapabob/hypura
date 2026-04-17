@@ -1,17 +1,18 @@
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
-use std::sync::atomic::AtomicBool;
-use std::collections::{HashMap, VecDeque};
 
 use hypura::compute::inference::{self, LlamaTurboquantCliBridge};
 use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
+use hypura::scheduler::types::{HostPinnedPolicy, ResidencyPolicyConfig, ResidencyProfile};
 use hypura::server::ollama_types::GgufInfo;
 use hypura::server::routes::{self, AppState};
 use hypura::telemetry::metrics::TelemetryEmitter;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use super::fmt_util::cli_progress_enabled;
+use super::fmt_util::{cli_progress_enabled, format_bytes};
 
 fn set_process_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
     unsafe {
@@ -36,6 +37,8 @@ pub fn run(
     tq_artifact: Option<&str>,
     model_dir: Option<&str>,
     ui_theme: &str,
+    residency_profile: ResidencyProfile,
+    host_pinned: HostPinnedPolicy,
 ) -> anyhow::Result<()> {
     let llama_bridge = LlamaTurboquantCliBridge {
         rotation_policy,
@@ -59,13 +62,8 @@ pub fn run(
         turboquant_config,
         model_dir,
         llama_bridge,
+        ResidencyPolicyConfig::new(residency_profile, host_pinned),
     ))
-}
-async fn api_key() -> Option<String> {
-    std::env::var("HYPURA_API_KEY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 async fn run_async(
     model_path: &str,
@@ -76,6 +74,7 @@ async fn run_async(
     turboquant_config: Option<&str>,
     model_dir: Option<&str>,
     llama_bridge: LlamaTurboquantCliBridge,
+    residency_policy: ResidencyPolicyConfig,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
 
@@ -99,6 +98,7 @@ async fn run_async(
         turboquant_mode,
         turboquant_config.map(Path::new),
         llama_bridge.clone(),
+        residency_policy,
     )?;
     if cli_progress_enabled() {
         pb_setup.finish_and_clear();
@@ -178,8 +178,7 @@ async fn run_async(
         .filter(|s| matches!(s.as_str(), "light" | "dark" | "classic"))
         .unwrap_or_else(|| "classic".to_string());
 
-    let serve_turboquant_config_path =
-        turboquant_config.map(|s| std::path::PathBuf::from(s));
+    let serve_turboquant_config_path = turboquant_config.map(|s| std::path::PathBuf::from(s));
 
     let state = Arc::new(AppState {
         loaded_model: Arc::new(std::sync::Mutex::new(loaded)),
@@ -197,6 +196,7 @@ async fn run_async(
         serve_turboquant_mode: turboquant_mode,
         serve_turboquant_config_path,
         serve_llama_bridge: llama_bridge,
+        serve_residency_policy: residency_policy.normalized(),
         active_cancel: Arc::new(std::sync::Mutex::new(None)),
         generation_in_progress: Arc::new(AtomicBool::new(false)),
         gui_presets: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -218,7 +218,9 @@ async fn run_async(
         .filter(|s| !s.trim().is_empty())
         .is_some()
     {
-        println!("  API key: required (HYPURA_API_KEY); use Authorization: Bearer <key> or X-API-Key");
+        println!(
+            "  API key: required (HYPURA_API_KEY); use Authorization: Bearer <key> or X-API-Key"
+        );
     }
     println!(
         "  TurboQuant: mode={}, schema={}, config={}, runtime_status={}",
@@ -234,6 +236,23 @@ async fn run_async(
         } else {
             "faithful-attached"
         }
+    );
+    println!(
+        "  Placement: {} GPU | {} host pageable | {} host pinned | {} NVMe",
+        format_bytes(runtime.placement_summary.total_gpu_bytes),
+        format_bytes(runtime.placement_summary.total_host_pageable_bytes),
+        format_bytes(runtime.placement_summary.total_host_pinned_bytes),
+        format_bytes(runtime.placement_summary.total_nvme_bytes),
+    );
+    println!(
+        "  Residency: mode={}, pinned_tier={}, pinned_policy={}",
+        runtime.plan.residency_policy.residency_profile.label(),
+        if runtime.placement_summary.host_pinned_active {
+            "active"
+        } else {
+            "collapsed"
+        },
+        runtime.plan.residency_policy.host_pinned_policy.label(),
     );
     println!();
 

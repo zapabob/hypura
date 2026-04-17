@@ -5,7 +5,7 @@ use good_lp::{constraint, default_solver, variable, variables, Expression, Solut
 use crate::model::gguf::{GgufFile, TensorInfo};
 use crate::model::metadata::ModelMetadata;
 use crate::model::tensor_role::TensorRole;
-use crate::profiler::types::HardwareProfile;
+use crate::profiler::types::{GpuBackend, HardwareProfile};
 use crate::scheduler::prefetch::build_prefetch_schedule;
 use crate::scheduler::types::*;
 
@@ -36,7 +36,7 @@ pub fn compute_placement(
     model: &GgufFile,
     hardware: &HardwareProfile,
 ) -> anyhow::Result<PlacementPlan> {
-    compute_placement_with_context(model, hardware, 0)
+    compute_placement_with_context_and_policy(model, hardware, 0, ResidencyPolicyConfig::default())
 }
 
 /// Compute placement with a specific context length for KV cache headroom.
@@ -47,6 +47,20 @@ pub fn compute_placement_with_context(
     hardware: &HardwareProfile,
     context_length: u32,
 ) -> anyhow::Result<PlacementPlan> {
+    compute_placement_with_context_and_policy(
+        model,
+        hardware,
+        context_length,
+        ResidencyPolicyConfig::default(),
+    )
+}
+
+pub fn compute_placement_with_context_and_policy(
+    model: &GgufFile,
+    hardware: &HardwareProfile,
+    context_length: u32,
+    residency_policy: ResidencyPolicyConfig,
+) -> anyhow::Result<PlacementPlan> {
     let metadata = ModelMetadata::from_gguf(model)?;
     // Cap KV headroom context — the model's max context (e.g., 131K) is the ceiling,
     // not the operating point. Use a practical default for placement planning.
@@ -55,7 +69,8 @@ pub fn compute_placement_with_context(
     } else {
         metadata.context_length.max(2048).min(8192)
     };
-    let capacities = compute_tier_capacities(hardware, &metadata, context_length);
+    let residency_policy = residency_policy.normalized();
+    let capacities = compute_tier_capacities(hardware, &metadata, context_length, residency_policy);
 
     // Score and sort tensors
     let scored = score_tensors(&model.tensors, &metadata);
@@ -95,21 +110,30 @@ pub fn compute_placement_with_context(
             (assignments, mode)
         };
 
+    let tensor_placements = build_tensor_placements(
+        &tier_assignments,
+        &model.tensors,
+        inference_mode,
+        &capacities,
+        residency_policy,
+    );
+
     // Build prefetch schedule
     let prefetch_schedule =
-        build_prefetch_schedule(&tier_assignments, &model.tensors, &metadata, hardware);
+        build_prefetch_schedule(&tensor_placements, &model.tensors, &metadata, hardware, inference_mode);
 
     // KV cache plan
     let kv_cache_plan =
-        compute_kv_cache_plan(&metadata, context_length, &tier_assignments, &capacities);
+        compute_kv_cache_plan(&metadata, context_length, &tensor_placements, &capacities);
 
     // Quick tok/s estimate for the plan
     let estimated_tok_per_sec = quick_estimate(
-        &tier_assignments,
+        &tensor_placements,
         &model.tensors,
         &metadata,
         hardware,
         &prefetch_schedule,
+        inference_mode,
     );
 
     let experience_tier = ExperienceTier::from_tok_per_sec(estimated_tok_per_sec);
@@ -133,28 +157,32 @@ pub fn compute_placement_with_context(
     Ok(PlacementPlan {
         model_id,
         hardware_profile_hash: profile_hash,
-        tier_assignments,
+        tensor_placements,
         prefetch_schedule,
         estimated_tok_per_sec,
         estimated_time_to_first_token: 0.5, // rough estimate
         kv_cache_plan,
         experience_tier,
         inference_mode,
+        residency_policy,
     })
 }
 
 struct TierCapacities {
     gpu_bytes: u64,
-    ram_bytes: u64,
+    host_pageable_bytes: u64,
+    host_pinned_bytes: u64,
     /// Total unified limit (gpu + ram must not exceed this)
     unified_limit: u64,
     nvme_peak_bw: u64,
+    supports_host_pinning: bool,
 }
 
 fn compute_tier_capacities(
     hw: &HardwareProfile,
     metadata: &ModelMetadata,
     context_length: u32,
+    residency_policy: ResidencyPolicyConfig,
 ) -> TierCapacities {
     let total_ram = hw.memory.total_bytes;
     let usable = total_ram.saturating_sub(OS_OVERHEAD);
@@ -169,7 +197,26 @@ fn compute_tier_capacities(
         .min(usable)
         .saturating_sub(kv_headroom)
         .saturating_sub(GPU_RUNTIME_OVERHEAD);
-    let ram_bytes = usable.saturating_sub(gpu_bytes).saturating_sub(kv_headroom);
+    let host_bytes = usable.saturating_sub(gpu_bytes).saturating_sub(kv_headroom);
+    let cuda_backend = matches!(hw.gpu.as_ref().map(|g| &g.backend), Some(GpuBackend::Cuda));
+    let supports_host_pinning = match residency_policy.host_pinned_policy {
+        HostPinnedPolicy::Off => false,
+        HostPinnedPolicy::Auto => hw.memory.supports_host_pinning && cuda_backend,
+        HostPinnedPolicy::Force => cuda_backend,
+    };
+    let host_pinned_bytes = if supports_host_pinning {
+        let requested = match residency_policy.host_pinned_policy {
+            HostPinnedPolicy::Force => {
+                let fallback = (host_bytes / 8).min(2 * (1 << 30));
+                hw.memory.pinned_budget_bytes.max(fallback)
+            }
+            _ => hw.memory.pinned_budget_bytes,
+        };
+        requested.min(host_bytes)
+    } else {
+        0
+    };
+    let host_pageable_bytes = host_bytes.saturating_sub(host_pinned_bytes);
     let unified_limit = usable.saturating_sub(kv_headroom);
 
     let nvme_peak_bw = hw
@@ -180,9 +227,11 @@ fn compute_tier_capacities(
 
     TierCapacities {
         gpu_bytes,
-        ram_bytes,
+        host_pageable_bytes,
+        host_pinned_bytes,
         unified_limit,
         nvme_peak_bw,
+        supports_host_pinning,
     }
 }
 
@@ -250,6 +299,105 @@ fn score_tensors(tensors: &[TensorInfo], metadata: &ModelMetadata) -> Vec<Scored
                 layer_index: t.layer_index,
                 role,
             }
+        })
+        .collect()
+}
+
+fn is_dense_ffn_role(role: &TensorRole) -> bool {
+    matches!(
+        role,
+        TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown
+    )
+}
+
+fn warm_streaming_residence(
+    role: &TensorRole,
+    inference_mode: InferenceMode,
+    caps: &TierCapacities,
+    residency_policy: ResidencyPolicyConfig,
+) -> Option<TensorResidence> {
+    if residency_policy.residency_profile == ResidencyProfile::Legacy3Tier {
+        return None;
+    }
+
+    match inference_mode {
+        InferenceMode::ExpertStreaming if matches!(role, TensorRole::MoeFusedExperts) => {
+            Some(if caps.supports_host_pinning {
+                TensorResidence::HostPinned
+            } else {
+                TensorResidence::HostPageable
+            })
+        }
+        InferenceMode::DenseFfnStreaming if is_dense_ffn_role(role) => {
+            Some(TensorResidence::HostPageable)
+        }
+        _ => None,
+    }
+}
+
+pub fn backing_residence(
+    placement: &TensorPlacement,
+    role: &TensorRole,
+    inference_mode: InferenceMode,
+) -> TensorResidence {
+    match inference_mode {
+        InferenceMode::ExpertStreaming if matches!(role, TensorRole::MoeFusedExperts) => {
+            TensorResidence::NvmeBacked
+        }
+        InferenceMode::DenseFfnStreaming if is_dense_ffn_role(role) => TensorResidence::NvmeBacked,
+        _ => placement.residence,
+    }
+}
+
+fn build_tensor_placements(
+    assignments: &HashMap<String, TensorResidence>,
+    tensors: &[TensorInfo],
+    inference_mode: InferenceMode,
+    caps: &TierCapacities,
+    residency_policy: ResidencyPolicyConfig,
+) -> HashMap<String, TensorPlacement> {
+    tensors
+        .iter()
+        .map(|tensor| {
+            let role = TensorRole::from_name(&tensor.name);
+            let default_residence = assignments
+                .get(&tensor.name)
+                .copied()
+                .unwrap_or(TensorResidence::NvmeBacked);
+            let residence = warm_streaming_residence(&role, inference_mode, caps, residency_policy)
+                .unwrap_or(default_residence);
+            let compute_target = if inference_mode == InferenceMode::SparseMoeMmap
+                && residence != TensorResidence::GpuResident
+            {
+                ComputeTarget::CpuFallback
+            } else {
+                ComputeTarget::Gpu
+            };
+            let prefetch_priority = match role {
+                TensorRole::Norm
+                | TensorRole::Embedding
+                | TensorRole::OutputHead
+                | TensorRole::AttentionQuery
+                | TensorRole::AttentionKey
+                | TensorRole::AttentionValue
+                | TensorRole::AttentionOutput
+                | TensorRole::MoeRouter => PrefetchPriority::Critical,
+                TensorRole::MoeFusedExperts if inference_mode == InferenceMode::ExpertStreaming => {
+                    PrefetchPriority::Warm
+                }
+                _ if is_dense_ffn_role(&role)
+                    && inference_mode == InferenceMode::DenseFfnStreaming =>
+                {
+                    PrefetchPriority::Warm
+                }
+                _ if residence == TensorResidence::NvmeBacked => PrefetchPriority::Warm,
+                _ => PrefetchPriority::Opportunistic,
+            };
+
+            (
+                tensor.name.clone(),
+                TensorPlacement::new(residence, compute_target, prefetch_priority),
+            )
         })
         .collect()
 }
@@ -749,7 +897,9 @@ fn lp_assign(
     for (i, t) in tensors.iter().enumerate() {
         ram_sum += x_ram[i] * t.size_bytes as f64;
     }
-    problem = problem.with(constraint!(ram_sum <= caps.ram_bytes as f64));
+    problem = problem.with(constraint!(
+        ram_sum <= (caps.host_pageable_bytes + caps.host_pinned_bytes) as f64
+    ));
 
     // Unified memory constraint: GPU + RAM combined
     let mut unified_sum = Expression::from(0.0);
@@ -798,7 +948,7 @@ fn lp_assign(
 fn compute_kv_cache_plan(
     metadata: &ModelMetadata,
     context_length: u32,
-    _assignments: &HashMap<String, StorageTier>,
+    _placements: &HashMap<String, TensorPlacement>,
     caps: &TierCapacities,
 ) -> KvCachePlan {
     let kv_per_token_fp16 = estimate_kv_bytes(metadata, 1);
@@ -806,10 +956,12 @@ fn compute_kv_cache_plan(
         return KvCachePlan {
             hot_window_tokens: context_length,
             warm_window_tokens: 0,
-            hot_tier: StorageTier::Gpu,
-            warm_tier: StorageTier::Ram,
+            hot_tier: TensorResidence::GpuResident,
+            warm_tier: TensorResidence::HostPageable,
             hot_bytes: 0,
             warm_bytes: 0,
+            pinned_bytes: 0,
+            pageable_bytes: 0,
             kv_quantization: None,
         };
     }
@@ -849,26 +1001,31 @@ fn compute_kv_cache_plan(
     KvCachePlan {
         hot_window_tokens: hot_tokens,
         warm_window_tokens: warm_tokens,
-        hot_tier: StorageTier::Gpu,
-        warm_tier: StorageTier::Ram,
+        hot_tier: TensorResidence::GpuResident,
+        warm_tier: TensorResidence::HostPageable,
         hot_bytes: hot_tokens as u64 * kv_per_token,
         warm_bytes: warm_tokens as u64 * kv_per_token_q8,
+        pinned_bytes: 0,
+        pageable_bytes: warm_tokens as u64 * kv_per_token_q8,
         kv_quantization,
     }
 }
 
 fn quick_estimate(
-    assignments: &HashMap<String, StorageTier>,
+    assignments: &HashMap<String, TensorPlacement>,
     tensors: &[TensorInfo],
     metadata: &ModelMetadata,
     hw: &HardwareProfile,
     _prefetch: &PrefetchSchedule,
+    inference_mode: InferenceMode,
 ) -> f64 {
     let gpu_bw = hw
         .gpu
         .as_ref()
         .map_or(1e9, |g| g.bandwidth_bytes_per_sec as f64);
     let ram_bw = hw.memory.bandwidth_bytes_per_sec as f64;
+    let h2d_pageable_bw = hw.memory.h2d_pageable_bandwidth_bytes_per_sec.max(1) as f64;
+    let h2d_pinned_bw = hw.memory.h2d_pinned_bandwidth_bytes_per_sec.max(1) as f64;
     let nvme_bw = hw
         .storage
         .first()
@@ -889,12 +1046,33 @@ fn quick_estimate(
         for t in tensors.iter().filter(|t| t.layer_index == Some(layer_idx)) {
             let role = TensorRole::from_name(&t.name);
             let freq = role.access_frequency(experts_per_token, total_experts);
-            let tier = assignments.get(&t.name).unwrap_or(&StorageTier::Nvme);
+            let placement = assignments
+                .get(&t.name)
+                .copied()
+                .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
+            let backing = backing_residence(&placement, &role, inference_mode);
 
-            match tier {
-                StorageTier::Gpu => layer_compute += t.size_bytes as f64 * freq / gpu_bw,
-                StorageTier::Ram => layer_compute += t.size_bytes as f64 * freq / ram_bw,
-                StorageTier::Nvme => {
+            match placement.residence {
+                TensorResidence::GpuResident => {
+                    layer_compute += t.size_bytes as f64 * freq / gpu_bw;
+                }
+                TensorResidence::HostPinned => {
+                    let bw = h2d_pinned_bw.min(gpu_bw).max(1.0);
+                    layer_compute += t.size_bytes as f64 * freq / bw;
+                    if backing == TensorResidence::NvmeBacked {
+                        let eff = effective_io_freq(&role, freq, metadata.is_moe);
+                        layer_io += t.size_bytes as f64 * eff / nvme_bw;
+                    }
+                }
+                TensorResidence::HostPageable => {
+                    let bw = h2d_pageable_bw.min(ram_bw).max(1.0);
+                    layer_compute += t.size_bytes as f64 * freq / bw;
+                    if backing == TensorResidence::NvmeBacked {
+                        let eff = effective_io_freq(&role, freq, metadata.is_moe);
+                        layer_io += t.size_bytes as f64 * eff / nvme_bw;
+                    }
+                }
+                TensorResidence::NvmeBacked => {
                     let eff = effective_io_freq(&role, freq, metadata.is_moe);
                     layer_io += t.size_bytes as f64 * eff / nvme_bw;
                 }
@@ -911,12 +1089,29 @@ fn quick_estimate(
     for t in tensors.iter().filter(|t| t.layer_index.is_none()) {
         let role = TensorRole::from_name(&t.name);
         let freq = role.access_frequency(experts_per_token, total_experts);
-        let tier = assignments.get(&t.name).unwrap_or(&StorageTier::Nvme);
+        let placement = assignments
+            .get(&t.name)
+            .copied()
+            .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
+        let backing = backing_residence(&placement, &role, inference_mode);
 
-        let transfer = match tier {
-            StorageTier::Gpu => t.size_bytes as f64 * freq / gpu_bw,
-            StorageTier::Ram => t.size_bytes as f64 * freq / ram_bw,
-            StorageTier::Nvme => t.size_bytes as f64 * freq / nvme_bw,
+        let transfer = match placement.residence {
+            TensorResidence::GpuResident => t.size_bytes as f64 * freq / gpu_bw,
+            TensorResidence::HostPinned => {
+                let mut total = t.size_bytes as f64 * freq / h2d_pinned_bw.max(1.0);
+                if backing == TensorResidence::NvmeBacked {
+                    total += t.size_bytes as f64 * freq / nvme_bw;
+                }
+                total
+            }
+            TensorResidence::HostPageable => {
+                let mut total = t.size_bytes as f64 * freq / h2d_pageable_bw.max(1.0);
+                if backing == TensorResidence::NvmeBacked {
+                    total += t.size_bytes as f64 * freq / nvme_bw;
+                }
+                total
+            }
+            TensorResidence::NvmeBacked => t.size_bytes as f64 * freq / nvme_bw,
         };
         total_latency_secs += transfer;
     }
@@ -930,39 +1125,59 @@ fn quick_estimate(
 
 /// Compute a summary of where tensors are placed.
 pub fn summarize_placement(
-    assignments: &HashMap<String, StorageTier>,
+    assignments: &HashMap<String, TensorPlacement>,
     tensors: &[TensorInfo],
+    inference_mode: InferenceMode,
+    host_pinned_budget_bytes: u64,
 ) -> PlacementSummary {
     let mut summary = PlacementSummary {
         layers_on_gpu: 0,
-        layers_in_ram: 0,
+        layers_in_host_pinned: 0,
+        layers_in_host_pageable: 0,
         layers_on_nvme: 0,
         total_gpu_bytes: 0,
-        total_ram_bytes: 0,
+        total_host_pinned_bytes: 0,
+        total_host_pageable_bytes: 0,
         total_nvme_bytes: 0,
+        host_pinned_active: false,
+        host_pinned_budget_bytes,
     };
 
     // Count unique layers per tier
     let mut gpu_layers = std::collections::HashSet::new();
-    let mut ram_layers = std::collections::HashSet::new();
+    let mut pinned_layers = std::collections::HashSet::new();
+    let mut pageable_layers = std::collections::HashSet::new();
     let mut nvme_layers = std::collections::HashSet::new();
 
     for t in tensors {
-        let tier = assignments.get(&t.name).unwrap_or(&StorageTier::Nvme);
-        match tier {
-            StorageTier::Gpu => {
+        let role = TensorRole::from_name(&t.name);
+        let placement = assignments
+            .get(&t.name)
+            .copied()
+            .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
+        summary.host_pinned_active |= placement.residence == TensorResidence::HostPinned;
+        let residence = backing_residence(&placement, &role, inference_mode);
+
+        match residence {
+            TensorResidence::GpuResident => {
                 summary.total_gpu_bytes += t.size_bytes;
                 if let Some(l) = t.layer_index {
                     gpu_layers.insert(l);
                 }
             }
-            StorageTier::Ram => {
-                summary.total_ram_bytes += t.size_bytes;
+            TensorResidence::HostPinned => {
+                summary.total_host_pinned_bytes += t.size_bytes;
                 if let Some(l) = t.layer_index {
-                    ram_layers.insert(l);
+                    pinned_layers.insert(l);
                 }
             }
-            StorageTier::Nvme => {
+            TensorResidence::HostPageable => {
+                summary.total_host_pageable_bytes += t.size_bytes;
+                if let Some(l) = t.layer_index {
+                    pageable_layers.insert(l);
+                }
+            }
+            TensorResidence::NvmeBacked => {
                 summary.total_nvme_bytes += t.size_bytes;
                 if let Some(l) = t.layer_index {
                     nvme_layers.insert(l);
@@ -972,7 +1187,8 @@ pub fn summarize_placement(
     }
 
     summary.layers_on_gpu = gpu_layers.len() as u32;
-    summary.layers_in_ram = ram_layers.len() as u32;
+    summary.layers_in_host_pinned = pinned_layers.len() as u32;
+    summary.layers_in_host_pageable = pageable_layers.len() as u32;
     summary.layers_on_nvme = nvme_layers.len() as u32;
 
     summary
@@ -1031,6 +1247,10 @@ mod tests {
                 total_bytes: 32 << 30,
                 available_bytes: 28 << 30,
                 bandwidth_bytes_per_sec: 200_000_000_000,
+                h2d_pageable_bandwidth_bytes_per_sec: 48_000_000_000,
+                h2d_pinned_bandwidth_bytes_per_sec: 64_000_000_000,
+                supports_host_pinning: false,
+                pinned_budget_bytes: 0,
                 is_unified: true,
             },
             storage: vec![StorageProfile {
@@ -1065,9 +1285,11 @@ mod tests {
 
         let caps = TierCapacities {
             gpu_bytes: 3 << 30,     // 3 GB GPU
-            ram_bytes: 4 << 30,     // 4 GB RAM
+            host_pageable_bytes: 4 << 30,     // 4 GB RAM
+            host_pinned_bytes: 0,
             unified_limit: 7 << 30, // 7 GB unified
             nvme_peak_bw: 5_000_000_000,
+            supports_host_pinning: false,
         };
 
         let hw = make_hw();
@@ -1107,9 +1329,11 @@ mod tests {
 
         let caps = TierCapacities {
             gpu_bytes: 3 << 30,
-            ram_bytes: 4 << 30,
+            host_pageable_bytes: 4 << 30,
+            host_pinned_bytes: 0,
             unified_limit: 7 << 30,
             nvme_peak_bw: 5_000_000_000,
+            supports_host_pinning: false,
         };
 
         let hw = make_hw();
@@ -1179,5 +1403,145 @@ mod tests {
 
         // Norm should have higher score (small + 10x bonus)
         assert!(scored[1].score > scored[0].score);
+    }
+
+    #[test]
+    fn test_expert_streaming_prefers_pageable_without_pinning() {
+        let tensors = vec![TensorInfo {
+            name: "blk.0.ffn_gate_exps.weight".into(),
+            dimensions: vec![4096, 4096, 8],
+            dtype: GgmlType::Q4K,
+            offset: 0,
+            size_bytes: 1 << 28,
+            layer_index: Some(0),
+        }];
+        let assignments =
+            HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
+        let mut metadata = make_metadata(1);
+        metadata.is_moe = true;
+        metadata.num_experts = Some(8);
+        metadata.num_experts_used = Some(2);
+        let caps = TierCapacities {
+            gpu_bytes: 8 << 30,
+            host_pageable_bytes: 8 << 30,
+            host_pinned_bytes: 0,
+            unified_limit: 16 << 30,
+            nvme_peak_bw: 5_000_000_000,
+            supports_host_pinning: false,
+        };
+
+        let placements = build_tensor_placements(
+            &assignments,
+            &tensors,
+            InferenceMode::ExpertStreaming,
+            &caps,
+            ResidencyPolicyConfig::new(ResidencyProfile::FourTier, HostPinnedPolicy::Auto),
+        );
+        let placement = placements.get(&tensors[0].name).unwrap();
+        assert_eq!(placement.residence, TensorResidence::HostPageable);
+        assert_eq!(
+            backing_residence(placement, &TensorRole::MoeFusedExperts, InferenceMode::ExpertStreaming),
+            TensorResidence::NvmeBacked
+        );
+    }
+
+    #[test]
+    fn test_legacy_three_tier_keeps_streaming_experts_nvme_backed() {
+        let tensors = vec![TensorInfo {
+            name: "blk.0.ffn_gate_exps.weight".into(),
+            dimensions: vec![4096, 4096, 8],
+            dtype: GgmlType::Q4K,
+            offset: 0,
+            size_bytes: 1 << 28,
+            layer_index: Some(0),
+        }];
+        let assignments =
+            HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
+        let caps = TierCapacities {
+            gpu_bytes: 8 << 30,
+            host_pageable_bytes: 8 << 30,
+            host_pinned_bytes: 2 << 30,
+            unified_limit: 16 << 30,
+            nvme_peak_bw: 5_000_000_000,
+            supports_host_pinning: true,
+        };
+
+        let placements = build_tensor_placements(
+            &assignments,
+            &tensors,
+            InferenceMode::ExpertStreaming,
+            &caps,
+            ResidencyPolicyConfig::new(ResidencyProfile::Legacy3Tier, HostPinnedPolicy::Auto),
+        );
+        let placement = placements.get(&tensors[0].name).unwrap();
+        assert_eq!(placement.residence, TensorResidence::NvmeBacked);
+    }
+
+    #[test]
+    fn test_expert_streaming_prefers_pinned_with_support() {
+        let tensors = vec![TensorInfo {
+            name: "blk.0.ffn_gate_exps.weight".into(),
+            dimensions: vec![4096, 4096, 8],
+            dtype: GgmlType::Q4K,
+            offset: 0,
+            size_bytes: 1 << 28,
+            layer_index: Some(0),
+        }];
+        let assignments =
+            HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
+        let mut metadata = make_metadata(1);
+        metadata.is_moe = true;
+        metadata.num_experts = Some(8);
+        metadata.num_experts_used = Some(2);
+        let caps = TierCapacities {
+            gpu_bytes: 8 << 30,
+            host_pageable_bytes: 6 << 30,
+            host_pinned_bytes: 2 << 30,
+            unified_limit: 16 << 30,
+            nvme_peak_bw: 5_000_000_000,
+            supports_host_pinning: true,
+        };
+
+        let placements = build_tensor_placements(
+            &assignments,
+            &tensors,
+            InferenceMode::ExpertStreaming,
+            &caps,
+            ResidencyPolicyConfig::new(ResidencyProfile::FourTier, HostPinnedPolicy::Auto),
+        );
+        let placement = placements.get(&tensors[0].name).unwrap();
+        assert_eq!(placement.residence, TensorResidence::HostPinned);
+    }
+
+    #[test]
+    fn test_dense_ffn_streaming_never_defaults_to_pinned() {
+        let tensors = vec![TensorInfo {
+            name: "blk.0.ffn_gate.weight".into(),
+            dimensions: vec![4096, 4096],
+            dtype: GgmlType::Q4K,
+            offset: 0,
+            size_bytes: 1 << 28,
+            layer_index: Some(0),
+        }];
+        let assignments =
+            HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
+        let caps = TierCapacities {
+            gpu_bytes: 8 << 30,
+            host_pageable_bytes: 6 << 30,
+            host_pinned_bytes: 2 << 30,
+            unified_limit: 16 << 30,
+            nvme_peak_bw: 5_000_000_000,
+            supports_host_pinning: true,
+        };
+
+        let placements = build_tensor_placements(
+            &assignments,
+            &tensors,
+            InferenceMode::DenseFfnStreaming,
+            &caps,
+            ResidencyPolicyConfig::new(ResidencyProfile::FourTier, HostPinnedPolicy::Auto),
+        );
+        let placement = placements.get(&tensors[0].name).unwrap();
+        assert_eq!(placement.residence, TensorResidence::HostPageable);
     }
 }

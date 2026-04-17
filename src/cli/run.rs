@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use hypura::compute::inference::*;
 use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
-use hypura::scheduler::types::{PlacementSummary, StorageTier};
+use hypura::scheduler::types::{
+    HostPinnedPolicy, PlacementSummary, ResidencyPolicyConfig, ResidencyProfile,
+};
 use hypura::telemetry::metrics::TelemetryEmitter;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -20,6 +22,8 @@ pub fn run(
     turboquant_config: Option<&str>,
     rotation_policy: RotationPolicy,
     rotation_seed: u32,
+    residency_profile: ResidencyProfile,
+    host_pinned: HostPinnedPolicy,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
@@ -32,6 +36,8 @@ pub fn run(
         turboquant_config,
         rotation_policy,
         rotation_seed,
+        residency_profile,
+        host_pinned,
     ))
 }
 
@@ -45,6 +51,8 @@ async fn run_async(
     turboquant_config: Option<&str>,
     rotation_policy: RotationPolicy,
     rotation_seed: u32,
+    residency_profile: ResidencyProfile,
+    host_pinned: HostPinnedPolicy,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     let llama_bridge = LlamaTurboquantCliBridge {
@@ -58,22 +66,14 @@ async fn run_async(
         turboquant_mode,
         turboquant_config.map(Path::new),
         llama_bridge,
+        ResidencyPolicyConfig::new(residency_profile, host_pinned),
     )?;
 
-    let has_nvme = runtime
-        .plan
-        .tier_assignments
-        .values()
-        .any(|t| *t == StorageTier::Nvme);
+    let has_nvme = runtime.placement_summary.total_nvme_bytes > 0;
     if has_nvme {
         println!(
             "  NVMe scheduling: ENABLED ({} tensors on SSD)",
-            runtime
-                .plan
-                .tier_assignments
-                .values()
-                .filter(|t| **t == StorageTier::Nvme)
-                .count()
+            runtime.placement_summary.layers_on_nvme
         );
     }
 
@@ -84,7 +84,9 @@ async fn run_async(
         runtime.turboquant.source_label(),
         if runtime.turboquant.gguf_metadata.is_some() {
             "gguf-metadata-bridge"
-        } else if runtime.turboquant.mode == hypura::model::turboquant_sidecar::TurboQuantMode::Exact {
+        } else if runtime.turboquant.mode
+            == hypura::model::turboquant_sidecar::TurboQuantMode::Exact
+        {
             "inactive"
         } else if runtime.turboquant.mode
             == hypura::model::turboquant_sidecar::TurboQuantMode::PaperFullKv
@@ -338,11 +340,19 @@ fn print_placement_header(
             n_gpu_layers
         );
     }
-    if summary.total_ram_bytes > 0 {
+    if summary.total_host_pageable_bytes > 0 {
         println!(
-            "  RAM:          {} ({} layers)",
-            format_bytes(summary.total_ram_bytes),
-            summary.layers_in_ram
+            "  Host pageable:{} ({} layers)",
+            format_bytes(summary.total_host_pageable_bytes),
+            summary.layers_in_host_pageable
+        );
+    }
+    if summary.total_host_pinned_bytes > 0 || summary.host_pinned_active {
+        println!(
+            "  Host pinned:  {} ({} layers, budget {})",
+            format_bytes(summary.total_host_pinned_bytes),
+            summary.layers_in_host_pinned,
+            format_bytes(summary.host_pinned_budget_bytes)
         );
     }
     if summary.total_nvme_bytes > 0 {
@@ -356,6 +366,16 @@ fn print_placement_header(
         "  Experience:   {} — {}",
         plan.experience_tier.label(),
         plan.experience_tier.description()
+    );
+    println!(
+        "  Residency:    mode={}, pinned_tier={}, pinned_policy={}",
+        plan.residency_policy.residency_profile.label(),
+        if summary.host_pinned_active {
+            "active"
+        } else {
+            "collapsed"
+        },
+        plan.residency_policy.host_pinned_policy.label(),
     );
 }
 
