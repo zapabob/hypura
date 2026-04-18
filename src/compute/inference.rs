@@ -69,6 +69,16 @@ pub struct GenerationResult {
     pub tok_per_sec_avg: f64,
     pub prompt_eval_ms: f64,
     pub perf: PerfData,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub context_state: Option<ContextStateSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextStateSnapshot {
+    pub token_ids: Vec<i32>,
+    pub token_count: u32,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub state_bytes: Vec<u8>,
 }
 
 /// A loaded model that can serve multiple generation requests.
@@ -81,6 +91,7 @@ pub struct LoadedModel {
     pub config: InferenceConfig,
     pub n_gpu_layers: i32,
     pub model_name: String,
+    pub active_context_state: Option<ContextStateSnapshot>,
     pub turboquant: ResolvedTurboQuantConfig,
     turboquant_layout: Option<TurboQuantRuntimeLayout>,
     // NVMe scheduling state (None when all tensors fit in GPU+RAM)
@@ -110,6 +121,306 @@ pub struct GenerateFromLoadedParams<'a> {
     pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub token_tx: mpsc::UnboundedSender<GeneratedToken>,
     pub telemetry: Arc<TelemetryEmitter>,
+}
+
+/// A compat-only persistent runtime session used by KoboldCpp worker mode.
+///
+/// Native `hypura serve` keeps using request-scoped contexts. Compat mode keeps a
+/// live context so admin state load/save can operate directly on the active llama
+/// session instead of relying on prompt-prefix restoration.
+pub struct CompatRuntimeSession {
+    loaded: Arc<Mutex<LoadedModel>>,
+    ctx: LlamaContext,
+    callback_state: Option<Box<InferenceCallbackState>>,
+    turboquant_session: Option<Arc<TurboQuantRuntimeSession>>,
+    token_ids: Vec<i32>,
+}
+
+// SAFETY: Access to CompatRuntimeSession is serialized under std::sync::Mutex in AppState.
+unsafe impl Send for CompatRuntimeSession {}
+
+impl CompatRuntimeSession {
+    pub fn new(loaded: Arc<Mutex<LoadedModel>>) -> anyhow::Result<Self> {
+        let (ctx, callback_state, turboquant_session) = Self::build_context(&loaded)?;
+        Ok(Self {
+            loaded,
+            ctx,
+            callback_state,
+            turboquant_session,
+            token_ids: Vec::new(),
+        })
+    }
+
+    fn build_context(
+        loaded: &Arc<Mutex<LoadedModel>>,
+    ) -> anyhow::Result<(
+        LlamaContext,
+        Option<Box<InferenceCallbackState>>,
+        Option<Arc<TurboQuantRuntimeSession>>,
+    )> {
+        let loaded = loaded.lock().unwrap();
+        let turboquant_session =
+            build_turboquant_runtime_session(&loaded.turboquant, loaded.turboquant_layout)?;
+        let config = &loaded.config;
+        let callback_state = if loaded.prefetch_state.is_some() || turboquant_session.is_some() {
+            Some(Box::new(InferenceCallbackState {
+                prefetch_state: loaded.prefetch_state.clone(),
+                turboquant: turboquant_session.clone(),
+            }))
+        } else {
+            None
+        };
+        let callback_ptr = callback_state
+            .as_ref()
+            .map(|state| state.as_ref() as *const InferenceCallbackState as *mut c_void);
+        let ctx = if let Some(state_ptr) = callback_ptr {
+            LlamaContext::new_with_callback_and_options(
+                &loaded.model,
+                config.n_ctx,
+                config.n_batch,
+                config.n_threads,
+                Some(eval_callback_with_runtime),
+                state_ptr,
+                turboquant_session.is_some(),
+            )?
+        } else {
+            LlamaContext::new(
+                &loaded.model,
+                config.n_ctx,
+                config.n_batch,
+                config.n_threads,
+            )?
+        };
+        Ok((ctx, callback_state, turboquant_session))
+    }
+
+    pub fn reset_context(&mut self) -> anyhow::Result<()> {
+        let (ctx, callback_state, turboquant_session) = Self::build_context(&self.loaded)?;
+        self.ctx = ctx;
+        self.callback_state = callback_state;
+        self.turboquant_session = turboquant_session;
+        self.token_ids.clear();
+        self.loaded.lock().unwrap().active_context_state = None;
+        Ok(())
+    }
+
+    fn capture_snapshot(&mut self) -> anyhow::Result<ContextStateSnapshot> {
+        let state_bytes = self.ctx.save_state_bytes()?;
+        let snapshot = ContextStateSnapshot {
+            token_ids: self.token_ids.clone(),
+            token_count: self.token_ids.len() as u32,
+            state_bytes,
+        };
+        self.loaded.lock().unwrap().active_context_state = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub fn current_runtime_metadata(&mut self) -> anyhow::Result<Option<ContextStateSnapshot>> {
+        if self.token_ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.capture_snapshot()?))
+    }
+
+    pub fn load_state_snapshot(&mut self, snapshot: ContextStateSnapshot) -> anyhow::Result<()> {
+        self.reset_context()?;
+        self.ctx.load_state_bytes(&snapshot.state_bytes)?;
+        self.token_ids = snapshot.token_ids.clone();
+        self.loaded.lock().unwrap().active_context_state = Some(snapshot);
+        Ok(())
+    }
+
+    pub fn generate(
+        &mut self,
+        params: GenerateFromLoadedParams<'_>,
+    ) -> anyhow::Result<GenerationResult> {
+        let GenerateFromLoadedParams {
+            prompt,
+            sampling,
+            sampler_order,
+            stop_sequences,
+            cancel_flag,
+            token_tx,
+            telemetry,
+        } = params;
+
+        let has_prompt = !prompt.is_empty();
+        if has_prompt {
+            self.reset_context()?;
+        } else {
+            anyhow::ensure!(
+                !self.token_ids.is_empty(),
+                "no live compat session state is loaded; prompt is required"
+            );
+        }
+
+        let loaded = self.loaded.lock().unwrap();
+        let mut sampler = LlamaSampler::new_with_order(sampling, sampler_order);
+        let prompt_tokens = if has_prompt {
+            let tokens = loaded.model.tokenize(prompt, true, true);
+            anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
+            tokens
+        } else {
+            Vec::new()
+        };
+
+        if has_prompt {
+            self.token_ids = prompt_tokens.clone();
+            if let Some(ref state) = loaded.prefetch_state {
+                state.prefetch_all_nvme();
+            }
+            let prompt_batch_size = loaded.config.n_batch as usize;
+            let prompt_start = Instant::now();
+            for chunk in prompt_tokens.chunks(prompt_batch_size) {
+                if let Some(ref session) = self.turboquant_session {
+                    session.begin_batch(chunk);
+                }
+                if !chunk.is_empty() {
+                    self.ctx.decode(chunk)?;
+                }
+                if let Some(ref session) = self.turboquant_session {
+                    session.end_batch();
+                }
+            }
+            let _ = prompt_start;
+        }
+
+        let prompt_ms = if has_prompt {
+            self.ctx.perf().t_p_eval_ms
+        } else {
+            0.0
+        };
+        let mut generated_text = String::new();
+        let mut n_generated: u32 = 0;
+        let gen_start = Instant::now();
+
+        for _ in 0..sampling.max_tokens {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+            let token_id = sampler.sample(&mut self.ctx, -1);
+            let is_eog = loaded.model.is_eog(token_id);
+            let piece = loaded.model.token_to_piece(token_id);
+
+            n_generated += 1;
+            generated_text.push_str(&piece);
+            self.token_ids.push(token_id);
+
+            let elapsed = gen_start.elapsed().as_secs_f64();
+            let tok_per_sec = if elapsed > 0.0 {
+                n_generated as f64 / elapsed
+            } else {
+                0.0
+            };
+
+            telemetry.emit(TelemetryEvent::TokenGenerated {
+                tok_per_sec,
+                token: piece.clone(),
+            });
+            if let Some(ref state) = loaded.prefetch_state {
+                emit_prefetch_telemetry(telemetry.as_ref(), state, n_generated);
+            }
+
+            if token_tx
+                .send(GeneratedToken {
+                    text: piece,
+                    token_id,
+                    tok_per_sec,
+                    is_eog,
+                })
+                .is_err()
+            {
+                break;
+            }
+
+            if is_eog {
+                break;
+            }
+
+            if let Some(matched) = stop_sequences
+                .iter()
+                .find(|seq| !seq.is_empty() && generated_text.ends_with(seq.as_str()))
+            {
+                let trim_len = generated_text.len().saturating_sub(matched.len());
+                generated_text.truncate(trim_len);
+                break;
+            }
+
+            if !loaded.keep_resident {
+                if let Some(ref state) = loaded.prefetch_state {
+                    state.prefetch_all_nvme();
+                }
+            }
+
+            if let Some(ref session) = self.turboquant_session {
+                session.begin_batch(&[token_id]);
+            }
+            self.ctx.decode(&[token_id])?;
+            if let Some(ref session) = self.turboquant_session {
+                session.end_batch();
+            }
+        }
+
+        if let Some(ref session) = self.turboquant_session {
+            let stats = session.callback_hits();
+            tracing::info!(
+                "TurboQuant compat session complete: path={}, mode={}, q_hits={}, k_hits={}, v_hits={}, kq_hits={}, kq_soft_max_hits={}, kqv_hits={}, kq_overwrites={}, kqv_overwrites={}",
+                session.runtime_path().as_str(),
+                session.mode(),
+                stats.q_hits,
+                stats.k_hits,
+                stats.v_hits,
+                stats.kq_hits,
+                stats.kq_soft_max_hits,
+                stats.kqv_hits,
+                stats.kq_overwrites,
+                stats.kqv_overwrites,
+            );
+        }
+
+        let perf = self.ctx.perf();
+        let total_gen_time = gen_start.elapsed().as_secs_f64();
+        let avg_tps = if total_gen_time > 0.0 {
+            n_generated as f64 / total_gen_time
+        } else {
+            0.0
+        };
+        drop(loaded);
+        let context_state = match self.capture_snapshot() {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::warn!("failed to capture compat runtime state snapshot: {error}");
+                self.loaded.lock().unwrap().active_context_state = None;
+                None
+            }
+        };
+
+        Ok(GenerationResult {
+            text: generated_text,
+            tokens_generated: n_generated,
+            prompt_tokens: prompt_tokens.len() as u32,
+            tok_per_sec_avg: avg_tps,
+            prompt_eval_ms: prompt_ms,
+            perf,
+            context_state,
+        })
+    }
+}
+
+fn restored_prefix_len(snapshot: Option<&ContextStateSnapshot>, prompt_tokens: &[i32]) -> usize {
+    let Some(snapshot) = snapshot else {
+        return 0;
+    };
+    if snapshot.token_ids.is_empty() || snapshot.state_bytes.is_empty() {
+        return 0;
+    }
+    if prompt_tokens.starts_with(&snapshot.token_ids) {
+        snapshot.token_ids.len()
+    } else {
+        0
+    }
 }
 
 #[derive(Debug)]
@@ -1002,6 +1313,7 @@ pub fn load_model(
             config: config.clone(),
             n_gpu_layers,
             model_name,
+            active_context_state: None,
             turboquant: turboquant.clone(),
             turboquant_layout,
             _controller: None,
@@ -1117,6 +1429,7 @@ pub fn load_model(
         config: config.clone(),
         n_gpu_layers,
         model_name,
+        active_context_state: None,
         turboquant: turboquant.clone(),
         turboquant_layout,
         _controller: Some(controller),
@@ -1183,6 +1496,23 @@ pub fn generate_from_loaded(
     let tokens = loaded.model.tokenize(prompt, true, true);
     let prompt_len = tokens.len() as u32;
     anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
+    let restored_prefix = restored_prefix_len(loaded.active_context_state.as_ref(), &tokens);
+    if restored_prefix > 0 {
+        let snapshot = loaded
+            .active_context_state
+            .as_ref()
+            .expect("restored_prefix_len requires snapshot");
+        ctx.load_state_bytes(&snapshot.state_bytes)?;
+    }
+    let mut context_token_ids = if restored_prefix > 0 {
+        loaded
+            .active_context_state
+            .as_ref()
+            .map(|snapshot| snapshot.token_ids.clone())
+            .unwrap_or_else(|| tokens.clone())
+    } else {
+        tokens.clone()
+    };
 
     // Prefetch NVMe layers before prompt eval
     if let Some(ref state) = loaded.prefetch_state {
@@ -1192,11 +1522,13 @@ pub fn generate_from_loaded(
     // Process prompt
     let prompt_start = Instant::now();
     let batch_size = config.n_batch as usize;
-    for chunk in tokens.chunks(batch_size) {
+    for chunk in tokens[restored_prefix..].chunks(batch_size) {
         if let Some(ref session) = turboquant_session {
             session.begin_batch(chunk);
         }
-        ctx.decode(chunk)?;
+        if !chunk.is_empty() {
+            ctx.decode(chunk)?;
+        }
         if let Some(ref session) = turboquant_session {
             session.end_batch();
         }
@@ -1220,6 +1552,7 @@ pub fn generate_from_loaded(
 
         n_generated += 1;
         generated_text.push_str(&piece);
+        context_token_ids.push(token_id);
 
         let elapsed = gen_start.elapsed().as_secs_f64();
         let tok_per_sec = if elapsed > 0.0 {
@@ -1300,6 +1633,18 @@ pub fn generate_from_loaded(
     } else {
         0.0
     };
+    let context_state = match ctx.save_state_bytes() {
+        Ok(state_bytes) => Some(ContextStateSnapshot {
+            token_count: context_token_ids.len() as u32,
+            token_ids: context_token_ids,
+            state_bytes,
+        }),
+        Err(error) => {
+            tracing::warn!("failed to capture llama runtime state snapshot: {error}");
+            None
+        }
+    };
+    loaded.active_context_state = context_state.clone();
 
     Ok(GenerationResult {
         text: generated_text,
@@ -1308,6 +1653,7 @@ pub fn generate_from_loaded(
         tok_per_sec_avg: avg_tps,
         prompt_eval_ms: prompt_ms,
         perf,
+        context_state,
     })
 }
 
@@ -1685,6 +2031,7 @@ fn generate_blocking_internal(
         tok_per_sec_avg: avg_tps,
         prompt_eval_ms: prompt_ms,
         perf,
+        context_state: None,
     })
 }
 
@@ -2251,6 +2598,7 @@ pub fn generate_with_nvme_scheduling(
         tok_per_sec_avg: avg_tps,
         prompt_eval_ms: prompt_ms,
         perf,
+        context_state: None,
     })
 }
 
@@ -2509,5 +2857,27 @@ mod tests {
         };
 
         assert!(!should_delegate_turboquant_runtime_to_llama(&resolved));
+    fn restored_prefix_len_requires_matching_prefix_and_state_bytes() {
+        let snapshot = ContextStateSnapshot {
+            token_ids: vec![1, 2, 3],
+            token_count: 3,
+            state_bytes: vec![9, 9, 9],
+        };
+
+        assert_eq!(restored_prefix_len(Some(&snapshot), &[1, 2, 3, 4, 5]), 3);
+        assert_eq!(restored_prefix_len(Some(&snapshot), &[1, 2]), 0);
+        assert_eq!(restored_prefix_len(Some(&snapshot), &[1, 4, 3, 5]), 0);
+    }
+
+    #[test]
+    fn restored_prefix_len_ignores_empty_snapshots() {
+        let snapshot = ContextStateSnapshot {
+            token_ids: vec![1, 2, 3],
+            token_count: 3,
+            state_bytes: Vec::new(),
+        };
+
+        assert_eq!(restored_prefix_len(Some(&snapshot), &[1, 2, 3, 4]), 0);
+        assert_eq!(restored_prefix_len(None, &[1, 2, 3, 4]), 0);
     }
 }

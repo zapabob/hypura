@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::compute::ffi::SamplingParams;
 use crate::compute::inference::GenerationResult;
@@ -11,7 +12,7 @@ pub const KOBOLDCPP_COMPAT_RELEASE_TAG: &str = "v1.111.2";
 pub const KOBOLDCPP_API_SCHEMA_VERSION: &str = "2025.06.03";
 pub const KOBOLDAI_API_VERSION: &str = "1.2.5";
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct CompatFeatureFlags {
     pub txt2img: bool,
     pub vision: bool,
@@ -20,6 +21,14 @@ pub struct CompatFeatureFlags {
     pub websearch: bool,
     pub tts: bool,
     pub embeddings: bool,
+    pub audio: bool,
+    pub savedata: bool,
+    pub guidance: bool,
+    pub jinja: bool,
+    pub mcp: bool,
+    pub music: bool,
+    pub router: bool,
+    pub admin: u8,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,6 +61,14 @@ pub fn build_version_response(
         websearch: features.websearch,
         tts: features.tts,
         embeddings: features.embeddings,
+        audio: features.audio,
+        savedata: features.savedata,
+        guidance: features.guidance,
+        jinja: features.jinja,
+        mcp: features.mcp,
+        music: features.music,
+        router: features.router,
+        admin: features.admin,
     }
 }
 
@@ -207,6 +224,8 @@ mod tests {
         assert_eq!(response.result, "KoboldCpp");
         assert_eq!(response.version, KOBOLDCPP_API_SCHEMA_VERSION);
         assert!(!response.embeddings);
+        assert!(!response.savedata);
+        assert_eq!(response.admin, 0);
     }
 
     #[test]
@@ -235,6 +254,7 @@ mod tests {
                 t_eval_ms: 2_000.0,
                 ..PerfData::default()
             },
+            context_state: None,
         };
 
         record_text_generation(&mut snapshot, &sampling, &result);

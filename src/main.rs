@@ -122,6 +122,103 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = HostPinnedPolicy::Auto)]
         host_pinned: HostPinnedPolicy,
     },
+    /// Start a KoboldCpp-compatible server profile with Kobold-style defaults
+    #[command(name = "koboldcpp", visible_alias = "compat")]
+    Koboldcpp {
+        /// Path to model file
+        model: String,
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind to
+        #[arg(long, default_value = "5001")]
+        port: u16,
+        /// Maximum context length
+        #[arg(long, default_value = "4096")]
+        context: u32,
+        /// Default max_length reported through Kobold compatibility routes
+        #[arg(long, default_value = "256")]
+        max_length: u32,
+        /// TurboQuant runtime mode
+        #[arg(long, value_enum, default_value_t = TurboQuantMode::ResearchKvSplit)]
+        turboquant_mode: TurboQuantMode,
+        /// Optional TurboQuant sidecar config path
+        #[arg(long)]
+        turboquant_config: Option<String>,
+        /// Rotation policy for TurboQuant (default: Triality + SO(8) vector view)
+        #[arg(long, value_enum, default_value_t = RotationPolicy::TrialityVector)]
+        rotation_policy: RotationPolicy,
+        /// Rotation seed for deterministic rotation
+        #[arg(long, default_value = "0")]
+        rotation_seed: u32,
+        /// Disable SO8 runtime path for TurboQuant env bridge
+        #[arg(long)]
+        tq_so8_off: bool,
+        /// Enable learned SO8 runtime path for TurboQuant env bridge
+        #[arg(long)]
+        tq_so8_learned: bool,
+        /// Disable Triality runtime path for TurboQuant env bridge
+        #[arg(long)]
+        tq_triality_off: bool,
+        /// Triality mix coefficient for TurboQuant env bridge [0,1]
+        #[arg(long, default_value = "0.5")]
+        tq_triality_mix: f32,
+        /// Rotation seed for TurboQuant runtime env bridge
+        #[arg(long, default_value = "0")]
+        tq_rotation_seed: u32,
+        /// Optional TurboQuant artifact path for runtime env bridge
+        #[arg(long)]
+        tq_artifact: Option<String>,
+        /// Optional model directory used by Kobold-lite model selector
+        #[arg(long)]
+        model_dir: Option<String>,
+        /// Optional KoboldCpp-style remote SaveData bridge file (.jsondb)
+        #[arg(long)]
+        savedatafile: Option<String>,
+        /// Optional dedicated embeddings GGUF model used by /v1/embeddings
+        #[arg(long)]
+        embeddings_model: Option<String>,
+        /// Optional Kobold story JSON exposed through /api/extra/preloadstory
+        #[arg(long)]
+        preloadstory: Option<String>,
+        /// Optional directory containing .kcpps/.kcppt/.gguf admin profiles
+        #[arg(long)]
+        admindir: Option<String>,
+        /// Optional .kcpps config imported into the active compat profile
+        #[arg(long)]
+        config: Option<String>,
+        /// Optional output path to export the active compat launcher config
+        #[arg(long)]
+        exportconfig: Option<String>,
+        /// Optional directory used to import existing KoboldCpp assets on startup
+        #[arg(long)]
+        migration_dir: Option<String>,
+        /// Optional asset root override for first-run bootstrap placement
+        #[arg(long)]
+        asset_root: Option<String>,
+        /// Optional Kobold-lite theme hint
+        #[arg(long, default_value = "classic")]
+        ui_theme: String,
+        /// Do not auto-open Kobold-lite in the browser
+        #[arg(long)]
+        no_show_gui: bool,
+        /// Resolve Triality/TurboQuant runtime wiring without loading the model server
+        #[arg(long)]
+        dry_run: bool,
+        /// Residency comparison profile
+        #[arg(long, value_enum, default_value_t = ResidencyProfile::FourTier)]
+        residency_profile: ResidencyProfile,
+        /// Host pinned tier policy
+        #[arg(long, value_enum, default_value_t = HostPinnedPolicy::Auto)]
+        host_pinned: HostPinnedPolicy,
+    },
+    /// Internal hidden worker mode for the KoboldCpp supervisor process
+    #[command(name = "__koboldcpp_worker", hide = true)]
+    KoboldcppWorker {
+        /// Path to the serialized worker bootstrap payload
+        #[arg(long)]
+        bootstrap_file: String,
+    },
     /// Benchmark tok/s: Hypura scheduling vs naive mmap
     Bench {
         /// Path to model file
@@ -264,7 +361,77 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             residency_profile,
             host_pinned,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
+        Commands::Koboldcpp {
+            model,
+            host,
+            port,
+            context,
+            max_length,
+            turboquant_mode,
+            turboquant_config,
+            rotation_policy,
+            rotation_seed,
+            tq_so8_off,
+            tq_so8_learned,
+            tq_triality_off,
+            tq_triality_mix,
+            tq_rotation_seed,
+            tq_artifact,
+            model_dir,
+            savedatafile,
+            embeddings_model,
+            preloadstory,
+            admindir,
+            config,
+            exportconfig,
+            migration_dir,
+            asset_root,
+            ui_theme,
+            no_show_gui,
+            dry_run,
+            residency_profile,
+            host_pinned,
+        } => cli::koboldcpp::run(
+            &model,
+            &host,
+            port,
+            context,
+            max_length,
+            turboquant_mode,
+            turboquant_config.as_deref(),
+            rotation_policy,
+            rotation_seed,
+            tq_so8_off,
+            tq_so8_learned,
+            tq_triality_off,
+            tq_triality_mix,
+            tq_rotation_seed,
+            tq_artifact.as_deref(),
+            model_dir.as_deref(),
+            savedatafile.as_deref(),
+            embeddings_model.as_deref(),
+            preloadstory.as_deref(),
+            admindir.as_deref(),
+            config.as_deref(),
+            exportconfig.as_deref(),
+            migration_dir.as_deref(),
+            asset_root.as_deref(),
+            &ui_theme,
+            no_show_gui,
+            dry_run,
+            residency_profile,
+            host_pinned,
+        ),
+        Commands::KoboldcppWorker { bootstrap_file } => {
+            cli::serve::run_worker_bootstrap(&bootstrap_file)
+        }
         Commands::Bench {
             model,
             baseline,

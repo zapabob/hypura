@@ -1,0 +1,91 @@
+{
+  "manifest_version": "1",
+  "release_tag": "v1.111.2",
+  "assets": [
+    {
+      "id": "embeddings_model",
+      "kind": "model",
+      "target_rel_path": "models/Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "version": "Qwen3-Embedding-0.6B-Q8_0",
+      "download_url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
+      "size_bytes": 639150592,
+      "optional": true
+    },
+    {
+      "id": "transcribe_exe",
+      "kind": "runtime",
+      "target_rel_path": "runtimes/transcribe/gowhisper-windows-amd64.exe",
+      "version": "v0.0.39",
+      "download_url": "https://github.com/mutablelogic/go-whisper/releases/download/v0.0.39/gowhisper-windows-amd64.exe",
+      "sha256": "468681685c509f5b987d0340360b785bf1ad7416a8621ab5bf364279a265cfd4",
+      "size_bytes": 15500288,
+      "optional": true
+    },
+    {
+      "id": "transcribe_model",
+      "kind": "model",
+      "target_rel_path": "runtimes/transcribe/models/ggml-base.en.bin",
+      "version": "ggml-base.en",
+      "download_url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+      "sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+      "size_bytes": 147964211,
+      "optional": true
+    },
+    {
+      "id": "tts_exe",
+      "kind": "runtime",
+      "target_rel_path": "runtimes/tts/sherpa-onnx-non-streaming-tts-x64-v1.12.39.exe",
+      "version": "v1.12.39",
+      "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.39/sherpa-onnx-non-streaming-tts-x64-v1.12.39.exe",
+      "sha256": "1f6debda02d611171bd75b4bb784d631f921c8ac032a8db2997016075e48fcb9",
+      "size_bytes": 21401088,
+      "optional": true
+    },
+    {
+      "id": "tts_model",
+      "kind": "model",
+      "target_rel_path": "runtimes/tts/kitten/model.fp16.onnx",
+      "version": "kitten-nano-en-v0_2-fp16",
+      "download_url": "https://huggingface.co/csukuangfj/kitten-nano-en-v0_2-fp16/resolve/main/model.fp16.onnx",
+      "sha256": "f24264d818087e643828da7a992e892e703c412bf147e152b825da567031d5ce",
+      "size_bytes": 23804897,
+      "optional": true
+    },
+    {
+      "id": "tts_voice",
+      "kind": "voice",
+      "target_rel_path": "runtimes/tts/kitten/voices.bin",
+      "version": "kitten-nano-en-v0_2-fp16",
+      "download_url": "https://huggingface.co/csukuangfj/kitten-nano-en-v0_2-fp16/resolve/main/voices.bin",
+      "sha256": "42a40a24a352a38657d6cb86ceee51bbc2b7780b29e04fb60bcdf959adccea01",
+      "size_bytes": 8192,
+      "optional": true
+    },
+    {
+      "id": "tts_tokens",
+      "kind": "voice",
+      "target_rel_path": "runtimes/tts/kitten/tokens.txt",
+      "version": "kitten-nano-en-v0_2-fp16",
+      "download_url": "https://huggingface.co/csukuangfj/kitten-nano-en-v0_2-fp16/resolve/main/tokens.txt",
+      "sha256": "934a4188addc7665dd3410256bb622169242357fbb99d840d9351209b486dabb",
+      "size_bytes": 1064,
+      "optional": true
+    },
+    {
+      "id": "tts_data",
+      "kind": "data_tree",
+      "target_rel_path": "runtimes/tts/kitten/espeak-ng-data",
+      "version": "kitten-nano-en-v0_2-fp16-espeak-ng-data",
+      "download_url": "https://huggingface.co/api/models/csukuangfj/kitten-nano-en-v0_2-fp16/tree/main/espeak-ng-data?recursive=1",
+      "optional": true
+    },
+    {
+      "id": "sd_runtime",
+      "kind": "runtime",
+      "target_rel_path": "runtimes/sd/stable-diffusion-runtime.bin",
+      "version": "packaged-by-distributor",
+      "optional": true
+    }
+  ]
+}

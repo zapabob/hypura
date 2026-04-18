@@ -1,3 +1,4 @@
+pub mod compat_assets;
 pub mod cache;
 pub mod compute;
 pub mod io;

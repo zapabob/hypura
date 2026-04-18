@@ -30,10 +30,15 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let use_metal = target_os == "macos";
     let use_cuda = !use_metal && cuda_is_available();
+    let cuda_root = if use_cuda { get_cuda_root() } else { None };
 
     let mut cmake_config = cmake::Config::new(&llama_dir);
     if target_os == "windows" && env::var("CMAKE_GENERATOR").is_err() {
         cmake_config.generator("Visual Studio 17 2022");
+        if let Some(cuda_root) = cuda_root.as_ref() {
+            // Visual Studio generators otherwise pick the newest installed CUDA toolset.
+            cmake_config.generator_toolset(format!("cuda={}", cuda_root.display()));
+        }
     }
     if target_os == "windows" {
         if let Some(masm) = find_masm() {
@@ -72,7 +77,7 @@ fn main() {
         if let Some(nvcc) = find_nvcc() {
             cmake_config.define("CMAKE_CUDA_COMPILER", nvcc.display().to_string());
         }
-        if let Some(cuda_root) = get_cuda_root() {
+        if let Some(cuda_root) = cuda_root.as_ref() {
             cmake_config.define("CUDAToolkit_ROOT", cuda_root.display().to_string());
         }
     } else {
@@ -240,6 +245,15 @@ fn get_cuda_lib_path() -> Option<PathBuf> {
 }
 
 fn find_nvcc() -> Option<PathBuf> {
+    if let Some(root) = get_cuda_root_from_env() {
+        for nvcc_name in &["nvcc.exe", "nvcc"] {
+            let candidate = root.join("bin").join(nvcc_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
     let candidates = ["/usr/local/cuda/bin/nvcc", "/usr/cuda/bin/nvcc"];
     for c in &candidates {
         let p = PathBuf::from(c);
@@ -262,6 +276,14 @@ fn find_nvcc() -> Option<PathBuf> {
     None
 }
 
+fn get_cuda_root_from_env() -> Option<PathBuf> {
+    let root = env::var_os("CUDA_PATH").map(PathBuf::from)?;
+    if root.exists() {
+        Some(root)
+    } else {
+        None
+    }
+}
 
 fn find_masm() -> Option<PathBuf> {
     if let Ok(dir) = env::var("VCToolsInstallDir") {

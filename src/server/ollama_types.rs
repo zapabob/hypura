@@ -266,6 +266,14 @@ pub struct KcppVersionResponse {
     pub websearch: bool,
     pub tts: bool,
     pub embeddings: bool,
+    pub audio: bool,
+    pub savedata: bool,
+    pub guidance: bool,
+    pub jinja: bool,
+    pub mcp: bool,
+    pub music: bool,
+    pub router: bool,
+    pub admin: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -445,6 +453,8 @@ pub struct OpenAiEmbeddingsRequest {
     #[serde(default)]
     pub model: Option<String>,
     pub input: OpenAiPromptInput,
+    #[serde(default)]
+    pub truncate: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -497,7 +507,7 @@ pub struct GuiPresetDeleteRequest {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiHistoryItem {
     pub ts: String,
     pub mode: String,
@@ -513,7 +523,7 @@ pub struct GuiHistoryResponse {
     pub items: Vec<GuiHistoryItem>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiEventItem {
     pub ts: String,
     pub level: String,

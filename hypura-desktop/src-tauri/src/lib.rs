@@ -1,23 +1,10 @@
-use serde::Deserialize;
-use serde_json::json;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
 use tauri::Manager;
-use tauri::State;
 
-#[derive(Default)]
-struct ServeChildState {
-    child: Option<std::process::Child>,
-}
+mod packaged;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServeCmd {
-    pub model_path: String,
-    pub host: String,
-    pub port: u16,
-}
-
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchModelCmd {
     pub path: String,
@@ -35,67 +22,35 @@ fn pick_gguf(app: tauri::AppHandle) -> Result<Option<String>, String> {
         .file()
         .add_filter("GGUF", &["gguf"])
         .blocking_pick_file();
-    Ok(file.map(|p| p.to_string()))
-}
-
-fn resolve_hypura_exe() -> Result<std::path::PathBuf, String> {
-    if let Ok(p) = std::env::var("HYPURA_EXE") {
-        let pb = std::path::PathBuf::from(p.trim());
-        if pb.exists() {
-            return Ok(pb);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sidecar = dir.join("hypura.exe");
-            if sidecar.exists() {
-                return Ok(sidecar);
-            }
-            let sidecar = dir.join("hypura");
-            if sidecar.exists() {
-                return Ok(sidecar);
-            }
-        }
-    }
-    Ok(std::path::PathBuf::from(if cfg!(windows) {
-        "hypura.exe"
-    } else {
-        "hypura"
-    }))
+    Ok(file.map(|value| value.to_string()))
 }
 
 #[tauri::command]
-fn stop_hypura_serve(state: State<'_, Mutex<ServeChildState>>) -> Result<(), String> {
-    let mut g = state.lock().map_err(|e| e.to_string())?;
-    if let Some(mut c) = g.child.take() {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-    Ok(())
+fn pick_asset_root(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    packaged::pick_asset_root(app)
 }
 
 #[tauri::command]
-fn spawn_hypura_serve(
-    cmd: ServeCmd,
-    state: State<'_, Mutex<ServeChildState>>,
+fn get_runtime_status(
+    state: tauri::State<'_, Arc<Mutex<packaged::DesktopState>>>,
+) -> Result<packaged::RuntimeStatus, String> {
+    packaged::get_runtime_status(state)
+}
+
+#[tauri::command]
+fn stop_managed_runtime(
+    state: tauri::State<'_, Arc<Mutex<packaged::DesktopState>>>,
+) -> Result<(), String> {
+    packaged::stop_managed_runtime(state)
+}
+
+#[tauri::command]
+fn launch_packaged_koboldcpp(
+    cmd: packaged::PackagedLaunchCmd,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Mutex<packaged::DesktopState>>>,
 ) -> Result<String, String> {
-    let mut g = state.lock().map_err(|e| e.to_string())?;
-    if let Some(mut c) = g.child.take() {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-
-    let exe = resolve_hypura_exe()?;
-    let mut c = std::process::Command::new(&exe);
-    c.arg("serve")
-        .arg(&cmd.model_path)
-        .arg("--host")
-        .arg(&cmd.host)
-        .arg("--port")
-        .arg(cmd.port.to_string());
-    let child = c.spawn().map_err(|e| format!("spawn hypura: {e}"))?;
-    g.child = Some(child);
-    Ok(format!("http://{}:{}", cmd.host, cmd.port))
+    packaged::launch_packaged_koboldcpp(cmd, app, state)
 }
 
 #[tauri::command]
@@ -104,26 +59,24 @@ fn switch_model_http(cmd: SwitchModelCmd) -> Result<String, String> {
         "http://{}:{}/api/extra/model/switch",
         cmd.host, cmd.port
     );
-    let body = json!({ "path": cmd.path.trim() });
-
-    let resp = match cmd
+    let body = serde_json::json!({ "path": cmd.path.trim() });
+    let response = match cmd
         .api_key
         .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
     {
-        Some(k) => ureq::post(&url)
+        Some(key) => ureq::post(&url)
             .set("Content-Type", "application/json")
-            .set("Authorization", &format!("Bearer {k}"))
+            .set("Authorization", &format!("Bearer {key}"))
             .send_json(body),
         None => ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_json(body),
     }
-    .map_err(|e| format!("HTTP request failed: {e}"))?;
-
-    let status = resp.status();
-    let text = resp.into_string().unwrap_or_default();
+    .map_err(|error| format!("HTTP request failed: {error}"))?;
+    let status = response.status();
+    let text = response.into_string().unwrap_or_default();
     if !(200..300).contains(&status) {
         return Err(format!("model switch failed ({status}): {text}"));
     }
@@ -134,16 +87,18 @@ fn switch_model_http(cmd: SwitchModelCmd) -> Result<String, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Mutex::new(ServeChildState::default()))
+        .manage(Arc::new(Mutex::new(packaged::DesktopState::default())))
         .invoke_handler(tauri::generate_handler![
             pick_gguf,
-            spawn_hypura_serve,
-            stop_hypura_serve,
+            pick_asset_root,
+            get_runtime_status,
+            stop_managed_runtime,
+            launch_packaged_koboldcpp,
             switch_model_http
         ])
         .setup(|app| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.set_title("Hypura Desktop");
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title("Hypura Desktop");
             }
             Ok(())
         })

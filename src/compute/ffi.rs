@@ -135,6 +135,14 @@ impl LlamaModel {
         unsafe { hypura_sys::llama_model_n_layer(self.ptr) }
     }
 
+    pub fn n_ctx_train(&self) -> i32 {
+        unsafe { hypura_sys::llama_model_n_ctx_train(self.ptr) }
+    }
+
+    pub fn n_embd_out(&self) -> i32 {
+        unsafe { hypura_sys::llama_model_n_embd_out(self.ptr) }
+    }
+
     /// Get the model's embedded chat template, if any.
     pub fn chat_template(&self) -> Option<String> {
         let ptr = unsafe { hypura_sys::llama_model_chat_template(self.ptr, ptr::null()) };
@@ -258,6 +266,32 @@ impl LlamaContext {
             None,
             false,
         )
+    }
+
+    pub fn new_for_embeddings(
+        model: &LlamaModel,
+        n_ctx: u32,
+        n_batch: u32,
+        n_threads: i32,
+    ) -> anyhow::Result<Self> {
+        let mut params = unsafe { hypura_sys::llama_context_default_params() };
+        params.n_ctx = n_ctx;
+        params.n_batch = n_batch;
+        params.n_ubatch = n_batch;
+        params.n_threads = n_threads;
+        params.n_threads_batch = n_threads;
+        params.pooling_type = hypura_sys::llama_pooling_type_LLAMA_POOLING_TYPE_MEAN;
+        params.attention_type = hypura_sys::llama_attention_type_LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+        params.embeddings = true;
+        params.offload_kqv = true;
+
+        let ptr = unsafe { hypura_sys::llama_init_from_model(model.as_ptr(), params) };
+        anyhow::ensure!(!ptr.is_null(), "Failed to create embedding llama context");
+        unsafe {
+            hypura_sys::llama_set_embeddings(ptr, true);
+            hypura_sys::llama_set_causal_attn(ptr, false);
+        }
+        Ok(Self { ptr })
     }
 
     /// Create a context with a cb_eval callback for layer tracking.
@@ -417,8 +451,58 @@ impl LlamaContext {
         }
     }
 
+    pub fn state_size(&self) -> usize {
+        unsafe { hypura_sys::llama_state_get_size(self.ptr) }
+    }
+
+    pub fn save_state_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        let size = self.state_size();
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buffer = vec![0u8; size];
+        let written =
+            unsafe { hypura_sys::llama_state_get_data(self.ptr, buffer.as_mut_ptr(), size) };
+        anyhow::ensure!(
+            written <= size,
+            "llama_state_get_data returned oversized state"
+        );
+        buffer.truncate(written);
+        Ok(buffer)
+    }
+
+    pub fn load_state_bytes(&mut self, state: &[u8]) -> anyhow::Result<usize> {
+        if state.is_empty() {
+            return Ok(0);
+        }
+        let consumed =
+            unsafe { hypura_sys::llama_state_set_data(self.ptr, state.as_ptr(), state.len()) };
+        anyhow::ensure!(consumed > 0, "llama_state_set_data failed");
+        anyhow::ensure!(
+            consumed <= state.len(),
+            "llama_state_set_data over-consumed input"
+        );
+        Ok(consumed)
+    }
+
     pub fn as_ptr(&self) -> *mut hypura_sys::llama_context {
         self.ptr
+    }
+
+    pub fn synchronize(&mut self) {
+        unsafe { hypura_sys::llama_synchronize(self.ptr) }
+    }
+
+    pub fn seq_embeddings(&mut self, seq_id: i32, embedding_dim: usize) -> anyhow::Result<Vec<f32>> {
+        let ptr = unsafe { hypura_sys::llama_get_embeddings_seq(self.ptr, seq_id) };
+        let ptr = if ptr.is_null() {
+            unsafe { hypura_sys::llama_get_embeddings(self.ptr) }
+        } else {
+            ptr
+        };
+        anyhow::ensure!(!ptr.is_null(), "embedding pointer is null");
+        let slice = unsafe { std::slice::from_raw_parts(ptr as *const f32, embedding_dim) };
+        Ok(slice.to_vec())
     }
 }
 
