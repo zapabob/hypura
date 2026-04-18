@@ -1,0 +1,97 @@
+{
+  "snapshot": {
+    "product": "KoboldCpp",
+    "release_tag": "v1.111.2",
+    "api_schema_version": "2025.06.03",
+    "pinned_on": "2026-04-18",
+    "owner": "Hypura compatibility layer"
+  },
+  "cli_profiles": [
+    {
+      "name": "serve",
+      "status": "existing",
+      "defaults": {
+        "port": 8080,
+        "ui_theme": "classic"
+      },
+      "notes": "Native Hypura server profile."
+    },
+    {
+      "name": "koboldcpp",
+      "status": "implemented",
+      "defaults": {
+        "port": 5001,
+        "context": 4096,
+        "max_length": 256,
+        "show_gui": true,
+        "ui_theme": "classic",
+        "savedatafile": "optional .jsondb bridge",
+        "preloadstory": "optional story JSON",
+        "admindir": "optional .kcpps/.kcppt/.gguf directory"
+      },
+      "notes": "Compatibility profile with Hypura-owned SQLite canonical storage plus KoboldCpp savedata/config bridge import-export."
+    }
+  ],
+  "http_surface": [
+    { "method": "GET", "path": "/api/v1/model", "status": "implemented" },
+    { "method": "POST", "path": "/api/v1/generate", "status": "implemented" },
+    { "method": "POST", "path": "/api/extra/generate/stream", "status": "implemented" },
+    { "method": "GET", "path": "/api/extra/generate/check", "status": "implemented" },
+    { "method": "POST", "path": "/api/extra/abort", "status": "implemented" },
+    { "method": "GET", "path": "/api/extra/true_max_context_length", "status": "implemented" },
+    { "method": "GET", "path": "/api/extra/version", "status": "implemented" },
+    { "method": "GET", "path": "/api/extra/perf", "status": "implemented" },
+    { "method": "POST", "path": "/api/extra/tokencount", "status": "implemented" },
+    { "method": "POST", "path": "/api/extra/tokenize", "status": "implemented" },
+    { "method": "GET", "path": "/api/extra/preloadstory", "status": "implemented" },
+    { "method": "POST", "path": "/api/extra/data/list", "status": "implemented" },
+    { "method": "POST", "path": "/api/extra/data/save", "status": "implemented" },
+    { "method": "POST", "path": "/api/extra/data/load", "status": "implemented" },
+    { "method": "GET", "path": "/api/admin/list_options", "status": "implemented" },
+    { "method": "POST", "path": "/api/admin/reload_config", "status": "implemented_supervisor_control_plane_worker_restart" },
+    { "method": "POST", "path": "/api/admin/save_state", "status": "implemented_live_compat_session_state_slot_bridge" },
+    { "method": "POST", "path": "/api/admin/load_state", "status": "implemented_live_compat_session_state_slot_bridge" },
+    { "method": "GET", "path": "/api/v1/info/version", "status": "implemented" },
+    { "method": "GET", "path": "/api/v1/config/max_length", "status": "implemented" },
+    { "method": "GET", "path": "/api/v1/config/max_context_length", "status": "implemented" },
+    { "method": "POST", "path": "/v1/completions", "status": "implemented" },
+    { "method": "POST", "path": "/v1/chat/completions", "status": "implemented" },
+    { "method": "POST", "path": "/lcpp/v1/chat/completions", "status": "implemented" },
+    { "method": "POST", "path": "/v1/embeddings", "status": "implemented_supervisor_secondary_embeddings_runtime_with_openai_shape_and_probe_gating" },
+    { "method": "POST", "path": "/api/extra/embeddings", "status": "implemented_supervisor_secondary_embeddings_runtime_with_openai_shape_and_probe_gating" },
+    { "method": "POST", "path": "/api/extra/websearch", "status": "implemented_builtin_duckduckgo_html_fetcher_with_worker_proxy" },
+    { "method": "POST", "path": "/sdapi/v1/txt2img", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "POST", "path": "/sdapi/v1/img2img", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "POST", "path": "/sdapi/v1/interrogate", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "POST", "path": "/sdapi/v1/upscale", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "GET", "path": "/sdapi/v1/options", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "GET", "path": "/sdapi/v1/sd-models", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "POST", "path": "/api/extra/transcribe", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "POST", "path": "/v1/audio/transcriptions", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "POST", "path": "/api/extra/tts", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "POST", "path": "/v1/audio/speech", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "GET", "path": "/speakers_list", "status": "implemented_supervisor_multimodal_proxy_with_structured_unavailable_fallback" },
+    { "method": "GET", "path": "/kobold-lite", "status": "implemented_vendored_upstream_lite" },
+    { "method": "GET", "path": "/api", "status": "implemented_vendored_upstream_docs" }
+  ],
+  "behavioral_contracts": {
+    "openai_streaming_sse": "implemented",
+    "kobold_streaming_ndjson": "implemented",
+    "compat_perf_tracking": "implemented",
+    "compat_feature_advertising": "implemented_from_supervisor_probe_state",
+    "auto_open_kobold_lite": "implemented_for_koboldcpp_cli_profile",
+    "savedata_roundtrip_bridge": "implemented_jsondb_bridge_with_hypura_sqlite_canonical_store",
+    "launcher_config_import_export": "implemented_via_kcpps_import_current_profile_export_and_admin_profile_listing",
+    "vendored_kobold_lite_surface": "implemented",
+    "launcher_full_parity": "implemented_supervisor_worker_split_with_private_loopback_control_plane",
+    "multimodal_bundle": "implemented_supervisor_managed_feature_probe_and_proxy_contract_with_structured_unavailable_fallback",
+    "windows_asset_bootstrap_manifest": "implemented_hybrid_localappdata_asset_root_plus_packaged_hf_and_github_payload_manifest_with_desktop_owned_restart_flow",
+    "ollama_parity_audit": "pending"
+  },
+  "acceptance_exceptions": [
+    "Packaged Windows bootstrap now ships concrete embeddings plus audio payload manifests and desktop-owned restart wiring; optional SD payloads still remain outside the v1 packaged-ready set.",
+    "Multimodal routes now proxy through the supervisor control plane, and packaged desktop mode auto-injects local loopback audio backends after first-run asset placement. Developer env overrides remain supported for custom backends.",
+    "When a multimodal backend is absent, compat mode now returns structured 503 unavailable responses instead of fixed 501 stubs.",
+    "The worker now owns a live compat llama session, but save_state/load_state continuation is guaranteed only for direct live-session continuation requests rather than full arbitrary prompt remapping after load_state."
+  ]
+}

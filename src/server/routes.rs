@@ -1,12 +1,12 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Html;
 use axum::response::{IntoResponse, Response};
@@ -15,15 +15,27 @@ use axum::{Json, Router};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::compute::inference::{
-    GenerateFromLoadedParams, GenerationResult, LlamaTurboquantCliBridge, LoadedModel,
+    CompatRuntimeSession, ContextStateSnapshot, GenerateFromLoadedParams, GenerationResult,
+    LlamaTurboquantCliBridge, LoadedModel,
 };
 use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
 use crate::scheduler::types::ResidencyPolicyConfig;
 use crate::server::chat::format_chat_prompt;
 use crate::server::compat::{self, CompatFeatureFlags, CompatPerfState};
+use crate::server::compat_storage::{CompatStorage, LauncherProfile, RuntimeStateSlotMetadata};
 use crate::server::ollama_types::*;
 use crate::server::streaming;
+use crate::server::supervisor::{CompatControlPlaneClient, CompatSupervisorCommand};
 use crate::telemetry::metrics::TelemetryEmitter;
+
+const VENDORED_KOBOLD_LITE_INDEX: &str = include_str!("../../vendor/kobold-lite/index.html");
+const VENDORED_KOBOLDCPP_API_HTML: &str =
+    include_str!("../../vendor/kobold-lite/koboldcpp_api.html");
+const VENDORED_KOBOLDCPP_API_JSON: &str =
+    include_str!("../../vendor/kobold-lite/koboldcpp_api.json");
+const VENDORED_KOBOLD_LITE_MANIFEST: &str = include_str!("../../vendor/kobold-lite/manifest.json");
+const VENDORED_KOBOLD_LITE_SW: &str = include_str!("../../vendor/kobold-lite/sw.js");
+const VENDORED_KOBOLD_LITE_NIKO_PNG: &[u8] = include_bytes!("../../vendor/kobold-lite/niko.png");
 
 pub struct AppState {
     pub loaded_model: Arc<std::sync::Mutex<LoadedModel>>,
@@ -31,7 +43,7 @@ pub struct AppState {
     pub model_path: Arc<Mutex<PathBuf>>,
     pub gguf_info: Arc<Mutex<GgufInfo>>,
     pub model_dir: PathBuf,
-    pub default_context: u32,
+    pub default_context: Arc<AtomicU32>,
     pub load_duration_ns: u64,
     pub telemetry: Arc<TelemetryEmitter>,
     pub turboquant: ResolvedTurboQuantConfig,
@@ -46,22 +58,51 @@ pub struct AppState {
     pub gui_history: Arc<Mutex<VecDeque<GuiHistoryItem>>>,
     pub gui_events: Arc<Mutex<VecDeque<GuiEventItem>>>,
     pub ui_theme: Arc<Mutex<String>>,
+    pub compat_storage: Option<Arc<CompatStorage>>,
     pub compat_started_at: Instant,
-    pub compat_default_max_length: u32,
-    pub compat_features: CompatFeatureFlags,
+    pub compat_default_max_length: Arc<AtomicU32>,
+    pub compat_features: Arc<Mutex<CompatFeatureFlags>>,
     pub compat_perf: Arc<Mutex<CompatPerfState>>,
+    pub compat_control_client: Option<CompatControlPlaneClient>,
+    pub compat_session: Option<Arc<Mutex<CompatRuntimeSession>>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(health_handler))
+        .route("/api", get(kobold_api_docs_handler))
+        .route("/koboldcpp_api.html", get(kobold_api_docs_handler))
+        .route("/koboldcpp_api.json", get(kobold_api_spec_handler))
+        .route("/manifest.json", get(kobold_lite_manifest_handler))
+        .route("/sw.js", get(kobold_lite_service_worker_handler))
+        .route("/niko.png", get(kobold_lite_niko_handler))
         .route("/api/version", get(version_handler))
         .route("/api/extra/version", get(kobold_extra_version_handler))
         .route("/api/extra/perf", get(kobold_perf_handler))
         .route("/api/extra/tokencount", post(kobold_token_count_handler))
         .route("/api/extra/tokenize", post(kobold_token_count_handler))
+        .route("/api/extra/preloadstory", get(kobold_preload_story_handler))
+        .route("/api/extra/data/list", post(kobold_savedata_list_handler))
+        .route("/api/extra/data/save", post(kobold_savedata_save_handler))
+        .route("/api/extra/data/load", post(kobold_savedata_load_handler))
         .route("/api/extra/websearch", post(kobold_websearch_handler))
         .route("/api/extra/embeddings", post(openai_embeddings_handler))
+        .route(
+            "/api/admin/list_options",
+            get(kobold_admin_list_options_handler),
+        )
+        .route(
+            "/api/admin/reload_config",
+            post(kobold_admin_reload_config_handler),
+        )
+        .route(
+            "/api/admin/save_state",
+            post(kobold_admin_save_state_handler),
+        )
+        .route(
+            "/api/admin/load_state",
+            post(kobold_admin_load_state_handler),
+        )
         .route("/api/v1/info/version", get(kobold_api_info_version_handler))
         .route("/api/v1/config/max_length", get(kobold_max_length_handler))
         .route(
@@ -88,21 +129,29 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/model", get(kobold_model_handler))
         .route("/api/v1/generate", post(kobold_generate_handler))
         .route("/v1/completions", post(openai_completions_handler))
-        .route("/v1/chat/completions", post(openai_chat_completions_handler))
+        .route(
+            "/v1/chat/completions",
+            post(openai_chat_completions_handler),
+        )
         .route(
             "/lcpp/v1/chat/completions",
             post(openai_chat_completions_handler),
         )
         .route("/v1/embeddings", post(openai_embeddings_handler))
-        .route("/sdapi/v1/txt2img", post(txt2img_unavailable_handler))
-        .route(
-            "/api/extra/transcribe",
-            post(transcribe_unavailable_handler),
-        )
+        .route("/sdapi/v1/txt2img", post(txt2img_proxy_handler))
+        .route("/sdapi/v1/img2img", post(img2img_proxy_handler))
+        .route("/sdapi/v1/interrogate", post(interrogate_proxy_handler))
+        .route("/sdapi/v1/upscale", post(upscale_proxy_handler))
+        .route("/sdapi/v1/options", get(sd_options_proxy_handler))
+        .route("/sdapi/v1/sd-models", get(sd_models_proxy_handler))
+        .route("/api/extra/transcribe", post(transcribe_proxy_handler))
         .route(
             "/v1/audio/transcriptions",
-            post(transcribe_unavailable_handler),
+            post(audio_transcriptions_proxy_handler),
         )
+        .route("/api/extra/tts", post(tts_proxy_handler))
+        .route("/v1/audio/speech", post(audio_speech_proxy_handler))
+        .route("/speakers_list", get(speakers_list_proxy_handler))
         .route(
             "/api/extra/generate/stream",
             post(kobold_generate_stream_handler),
@@ -122,7 +171,16 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn enforce_optional_api_key(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
-    if path == "/" || path == "/kobold-lite" {
+    if matches!(
+        path,
+        "/" | "/kobold-lite"
+            | "/api"
+            | "/koboldcpp_api.html"
+            | "/koboldcpp_api.json"
+            | "/manifest.json"
+            | "/sw.js"
+            | "/niko.png"
+    ) {
         return next.run(request).await;
     }
     let Ok(expected) = std::env::var("HYPURA_API_KEY") else {
@@ -164,14 +222,66 @@ async fn version_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({"version": env!("CARGO_PKG_VERSION")}))
 }
 
-async fn kobold_extra_version_handler(State(state): State<Arc<AppState>>) -> Json<KcppVersionResponse> {
+fn compat_ui_enabled() -> bool {
+    std::env::var("HYPURA_COMPAT_PROFILE")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "koboldcpp" | "kobold" | "compat"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn kobold_api_docs_handler() -> Html<&'static str> {
+    Html(VENDORED_KOBOLDCPP_API_HTML)
+}
+
+async fn kobold_api_spec_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        VENDORED_KOBOLDCPP_API_JSON,
+    )
+}
+
+async fn kobold_lite_manifest_handler() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/manifest+json; charset=utf-8",
+        )],
+        VENDORED_KOBOLD_LITE_MANIFEST,
+    )
+}
+
+async fn kobold_lite_service_worker_handler() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        VENDORED_KOBOLD_LITE_SW,
+    )
+}
+
+async fn kobold_lite_niko_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        VENDORED_KOBOLD_LITE_NIKO_PNG,
+    )
+}
+
+async fn kobold_extra_version_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<KcppVersionResponse> {
     let protected = std::env::var("HYPURA_API_KEY")
         .ok()
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
     Json(compat::build_version_response(
         protected,
-        state.compat_features,
+        compat_features_snapshot(&state),
     ))
 }
 
@@ -203,9 +313,11 @@ async fn kobold_api_info_version_handler() -> Json<KoboldInfoVersionResponse> {
     })
 }
 
-async fn kobold_max_length_handler(State(state): State<Arc<AppState>>) -> Json<ScalarValueResponse> {
+async fn kobold_max_length_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<ScalarValueResponse> {
     Json(ScalarValueResponse {
-        value: state.compat_default_max_length,
+        value: state.compat_default_max_length.load(Ordering::Relaxed),
     })
 }
 
@@ -213,11 +325,14 @@ async fn kobold_max_context_length_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<ScalarValueResponse> {
     Json(ScalarValueResponse {
-        value: state.default_context,
+        value: state.default_context.load(Ordering::Relaxed),
     })
 }
 
 async fn kobold_lite_gui_handler() -> Html<&'static str> {
+    if compat_ui_enabled() {
+        return Html(VENDORED_KOBOLD_LITE_INDEX);
+    }
     Html(
         r#"<!doctype html>
 <html lang="ja">
@@ -1047,6 +1162,203 @@ fn collect_gguf_models(
     Ok(models)
 }
 
+#[allow(dead_code)]
+fn parse_u32_value(value: Option<&serde_json::Value>) -> Option<u32> {
+    value
+        .and_then(|value| value.as_u64().and_then(|raw| u32::try_from(raw).ok()))
+        .or_else(|| {
+            value.and_then(|value| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+            })
+        })
+}
+
+#[allow(dead_code)]
+fn launcher_profile_context(profile: &LauncherProfile, fallback: u32) -> u32 {
+    parse_u32_value(profile.raw_config.get("contextsize"))
+        .or_else(|| parse_u32_value(profile.raw_config.get("max_context_length")))
+        .or_else(|| parse_u32_value(profile.raw_config.get("context")))
+        .or_else(|| parse_u32_value(profile.raw_config.get("n_ctx")))
+        .unwrap_or(fallback)
+        .max(256)
+}
+
+#[allow(dead_code)]
+fn launcher_profile_max_length(profile: &LauncherProfile, fallback: u32) -> u32 {
+    profile
+        .gendefaults
+        .as_ref()
+        .and_then(|defaults| parse_u32_value(defaults.get("max_length")))
+        .unwrap_or(fallback)
+        .max(1)
+}
+
+#[allow(dead_code)]
+fn resolve_profile_path(storage: Option<&CompatStorage>, raw_path: &str) -> PathBuf {
+    let candidate = PathBuf::from(raw_path);
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    if let Some(admindir) = storage.and_then(|storage| storage.admindir()) {
+        let joined = admindir.join(raw_path);
+        if joined.exists() {
+            return joined;
+        }
+    }
+    candidate
+}
+
+fn runtime_state_metadata_from_snapshot(
+    state: &Arc<AppState>,
+    slot: i64,
+    snapshot: &ContextStateSnapshot,
+) -> RuntimeStateSlotMetadata {
+    let model_path = state
+        .model_path
+        .lock()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let model_identity = state.model_name.lock().unwrap().clone();
+    let architecture = state.gguf_info.lock().unwrap().architecture.clone();
+    let now = now_rfc3339();
+    RuntimeStateSlotMetadata {
+        slot,
+        model_path,
+        model_identity,
+        architecture,
+        context_size: state.default_context.load(Ordering::Relaxed),
+        token_count: snapshot.token_count,
+        byte_size: snapshot.state_bytes.len() as u64,
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn validate_runtime_state_compatibility(
+    state: &Arc<AppState>,
+    metadata: &RuntimeStateSlotMetadata,
+) -> anyhow::Result<()> {
+    let current_model_path = state
+        .model_path
+        .lock()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let current_architecture = state.gguf_info.lock().unwrap().architecture.clone();
+    let current_context = state.default_context.load(Ordering::Relaxed);
+
+    anyhow::ensure!(
+        metadata
+            .model_path
+            .eq_ignore_ascii_case(&current_model_path),
+        "runtime state slot model path does not match the active model"
+    );
+    anyhow::ensure!(
+        metadata
+            .architecture
+            .eq_ignore_ascii_case(&current_architecture),
+        "runtime state slot architecture does not match the active model"
+    );
+    anyhow::ensure!(
+        metadata.context_size == current_context,
+        "runtime state slot context size does not match the active model context"
+    );
+    Ok(())
+}
+
+async fn switch_loaded_model_runtime(
+    state: Arc<AppState>,
+    next_model_path: PathBuf,
+    context: u32,
+) -> anyhow::Result<ModelSwitchResponse> {
+    anyhow::ensure!(
+        !state.generation_in_progress.load(Ordering::Relaxed),
+        "generation in progress; abort first"
+    );
+    anyhow::ensure!(next_model_path.exists(), "model path does not exist");
+
+    let context = context.max(256);
+    let path_for_setup = next_model_path.clone();
+    let tq_mode = state.serve_turboquant_mode;
+    let tq_config = state.serve_turboquant_config_path.clone();
+    let bridge = state.serve_llama_bridge.clone();
+    let residency_policy = state.serve_residency_policy;
+    let setup = tokio::task::spawn_blocking(move || {
+        crate::compute::inference::resolve_runtime_setup(
+            &path_for_setup,
+            context,
+            tq_mode,
+            tq_config.as_deref(),
+            bridge,
+            residency_policy,
+        )
+    })
+    .await??;
+
+    let file_size = fs::metadata(&next_model_path)?.len();
+    let gguf_info = GgufInfo {
+        file_size,
+        architecture: setup.metadata.architecture.clone(),
+        parameter_count: setup.metadata.parameter_count,
+        quantization: setup
+            .metadata
+            .quantization
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
+        context_length: setup.metadata.context_length,
+    };
+
+    let config = crate::compute::inference::InferenceConfig {
+        n_ctx: context,
+        ..crate::compute::inference::InferenceConfig::default()
+    };
+    let n_gpu_layers = setup.n_gpu_layers;
+    let plan = setup.plan.clone();
+    let gguf = setup.gguf.clone();
+    let turboquant = setup.turboquant.clone();
+    let path_for_load = next_model_path.clone();
+
+    let loaded_next = tokio::task::spawn_blocking(move || {
+        crate::compute::inference::load_model(
+            &path_for_load,
+            &config,
+            n_gpu_layers,
+            &plan,
+            &gguf,
+            &turboquant,
+        )
+    })
+    .await??;
+
+    let next_model_name = loaded_next.model_name.clone();
+    let mut loaded_guard = state.loaded_model.lock().unwrap();
+    *loaded_guard = loaded_next;
+    drop(loaded_guard);
+    if let Some(session) = state.compat_session.as_ref() {
+        session.lock().unwrap().reset_context()?;
+    }
+
+    state.default_context.store(context, Ordering::Relaxed);
+    *state.model_name.lock().unwrap() = next_model_name.clone();
+    *state.model_path.lock().unwrap() = next_model_path;
+    *state.gguf_info.lock().unwrap() = gguf_info;
+
+    push_gui_event(
+        &state,
+        "info",
+        format!("model switched to {next_model_name} (ctx {context})"),
+    );
+
+    Ok(ModelSwitchResponse {
+        success: true,
+        model: next_model_name,
+        context,
+    })
+}
+
 async fn models_handler(State(state): State<Arc<AppState>>) -> Response {
     let active_path = state
         .model_path
@@ -1072,165 +1384,38 @@ async fn model_switch_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ModelSwitchRequest>,
 ) -> Response {
-    if state.generation_in_progress.load(Ordering::Relaxed) {
-        push_gui_event(
-            &state,
-            "warn",
-            "model switch rejected: generation in progress",
-        );
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "generation in progress; abort first" })),
-        )
-            .into_response();
-    }
-
     let next_model_path = PathBuf::from(req.path.trim());
-    if !next_model_path.exists() {
-        push_gui_event(
-            &state,
-            "error",
-            "model switch failed: model path does not exist",
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "model path does not exist" })),
-        )
-            .into_response();
+    let context = req
+        .context
+        .unwrap_or_else(|| state.default_context.load(Ordering::Relaxed));
+    match switch_loaded_model_runtime(state.clone(), next_model_path, context).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("generation in progress") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            push_gui_event(&state, "error", format!("model switch failed: {message}"));
+            (status, Json(serde_json::json!({ "error": message }))).into_response()
+        }
     }
-
-    let context = req.context.unwrap_or(state.default_context).max(256);
-    let path_for_setup = next_model_path.clone();
-    let tq_mode = state.serve_turboquant_mode;
-    let tq_config = state.serve_turboquant_config_path.clone();
-    let bridge = state.serve_llama_bridge.clone();
-    let residency_policy = state.serve_residency_policy;
-    let setup = match tokio::task::spawn_blocking(move || {
-        crate::compute::inference::resolve_runtime_setup(
-            &path_for_setup,
-            context,
-            tq_mode,
-            tq_config.as_deref(),
-            bridge,
-            residency_policy,
-        )
-    })
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            push_gui_event(&state, "error", format!("model inspect failed: {e}"));
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("failed to inspect model: {e}") })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            push_gui_event(&state, "error", format!("model inspect task failed: {e}"));
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("runtime task failed: {e}") })),
-            )
-                .into_response();
-        }
-    };
-
-    let file_size = match fs::metadata(&next_model_path) {
-        Ok(m) => m.len(),
-        Err(e) => {
-            push_gui_event(&state, "error", format!("model metadata read failed: {e}"));
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("failed to read model metadata: {e}") })),
-            )
-                .into_response();
-        }
-    };
-
-    let gguf_info = GgufInfo {
-        file_size,
-        architecture: setup.metadata.architecture.clone(),
-        parameter_count: setup.metadata.parameter_count,
-        quantization: setup
-            .metadata
-            .quantization
-            .clone()
-            .unwrap_or_else(|| "unknown".into()),
-        context_length: setup.metadata.context_length,
-    };
-
-    let config = crate::compute::inference::InferenceConfig {
-        n_ctx: context,
-        ..crate::compute::inference::InferenceConfig::default()
-    };
-    let n_gpu_layers = setup.n_gpu_layers;
-    let plan = setup.plan.clone();
-    let gguf = setup.gguf.clone();
-    let turboquant = setup.turboquant.clone();
-    let path_for_load = next_model_path.clone();
-
-    let loaded_next = match tokio::task::spawn_blocking(move || {
-        crate::compute::inference::load_model(
-            &path_for_load,
-            &config,
-            n_gpu_layers,
-            &plan,
-            &gguf,
-            &turboquant,
-        )
-    })
-    .await
-    {
-        Ok(Ok(m)) => m,
-        Ok(Err(e)) => {
-            push_gui_event(&state, "error", format!("model load failed: {e}"));
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("failed to load model: {e}") })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            push_gui_event(&state, "error", format!("model load task failed: {e}"));
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("load task failed: {e}") })),
-            )
-                .into_response();
-        }
-    };
-
-    let mut loaded_guard = state.loaded_model.lock().unwrap();
-    *loaded_guard = loaded_next;
-    drop(loaded_guard);
-
-    let next_model_name = state.loaded_model.lock().unwrap().model_name.clone();
-    *state.model_name.lock().unwrap() = next_model_name;
-    *state.model_path.lock().unwrap() = next_model_path;
-    *state.gguf_info.lock().unwrap() = gguf_info;
-
-    let model_name = state.model_name.lock().unwrap().clone();
-    push_gui_event(
-        &state,
-        "info",
-        format!("model switched: {model_name} (ctx={context})"),
-    );
-    Json(ModelSwitchResponse {
-        success: true,
-        model: model_name,
-        context,
-    })
-    .into_response()
 }
 
 fn push_gui_event(state: &Arc<AppState>, level: &str, message: impl Into<String>) {
-    let mut events = state.gui_events.lock().unwrap();
-    events.push_front(GuiEventItem {
+    let item = GuiEventItem {
         ts: now_rfc3339(),
         level: level.to_string(),
         message: message.into(),
-    });
+    };
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Err(error) = storage.push_gui_event(&item) {
+            tracing::warn!("failed to persist compat GUI event: {error}");
+        }
+    }
+    let mut events = state.gui_events.lock().unwrap();
+    events.push_front(item);
     while events.len() > 200 {
         events.pop_back();
     }
@@ -1245,8 +1430,7 @@ fn push_gui_history(
     tok_per_sec_avg: Option<f64>,
     total_ms: u64,
 ) {
-    let mut history = state.gui_history.lock().unwrap();
-    history.push_front(GuiHistoryItem {
+    let item = GuiHistoryItem {
         ts: now_rfc3339(),
         mode: mode.to_string(),
         model,
@@ -1254,15 +1438,420 @@ fn push_gui_history(
         output_chars,
         tok_per_sec_avg,
         total_ms,
-    });
+    };
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Err(error) = storage.push_gui_history(&item) {
+            tracing::warn!("failed to persist compat GUI history: {error}");
+        }
+    }
+    let mut history = state.gui_history.lock().unwrap();
+    history.push_front(item);
     while history.len() > 200 {
         history.pop_back();
     }
 }
 
+fn parse_slot_value(value: Option<&serde_json::Value>) -> Option<i64> {
+    value.and_then(|slot| {
+        slot.as_i64().or_else(|| {
+            slot.as_str()
+                .and_then(|text| text.trim().parse::<i64>().ok())
+        })
+    })
+}
+
+async fn kobold_preload_story_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let payload = state
+        .compat_storage
+        .as_ref()
+        .and_then(|storage| storage.get_preload_story_json().ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    Json(payload)
+}
+
+async fn kobold_savedata_list_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let slots = state
+        .compat_storage
+        .as_ref()
+        .and_then(|storage| storage.list_save_slot_titles().ok())
+        .unwrap_or_default();
+    Json(serde_json::json!(slots))
+}
+
+async fn kobold_savedata_save_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let Some(storage) = state.compat_storage.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "SaveDataFile not enabled!" })),
+        )
+            .into_response();
+    };
+    if !storage.savedata_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "SaveDataFile not enabled!" })),
+        )
+            .into_response();
+    }
+
+    let slot = match parse_slot_value(req.get("slot")) {
+        Some(slot) => slot,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "success": false, "error": "No story submitted or invalid slot!" })),
+            )
+                .into_response();
+        }
+    };
+    let format = req
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let title = req
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let data = req
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    match storage.save_slot(slot, format, title, data) {
+        Ok(()) => Json(serde_json::json!({ "success": true, "error": "" })).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn kobold_savedata_load_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let Some(storage) = state.compat_storage.as_ref() else {
+        return Json(serde_json::json!({ "success": false, "data": serde_json::Value::Null }))
+            .into_response();
+    };
+    let Some(slot) = parse_slot_value(req.get("slot")) else {
+        return Json(serde_json::json!({ "success": false, "data": serde_json::Value::Null }))
+            .into_response();
+    };
+
+    match storage.load_save_slot(slot) {
+        Ok(Some(record)) => Json(serde_json::json!({
+            "success": true,
+            "data": {
+                "title": record.title,
+                "format": record.format,
+                "data": record.data,
+            }
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({ "success": false, "data": serde_json::Value::Null }))
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": error.to_string(), "data": serde_json::Value::Null })),
+        )
+            .into_response(),
+    }
+}
+
+async fn kobold_admin_list_options_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let items = state
+        .compat_storage
+        .as_ref()
+        .and_then(|storage| storage.list_admin_options().ok())
+        .unwrap_or_default();
+    Json(serde_json::json!(items))
+}
+
+async fn kobold_admin_reload_config_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    if compat_features_snapshot(&state).admin == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "admin mode is not enabled" })),
+        )
+            .into_response();
+    }
+    let Some(_storage) = state.compat_storage.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "admindir is not configured" })),
+        )
+            .into_response();
+    };
+    if state.generation_in_progress.load(Ordering::Relaxed) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "success": false, "error": "generation in progress; abort first" })),
+        )
+            .into_response();
+    }
+    let filename = req
+        .get("filename")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(filename) = filename else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "error": "filename is required" })),
+        )
+            .into_response();
+    };
+    let baseconfig = req
+        .get("baseconfig")
+        .or_else(|| req.get("overrideconfig"))
+        .and_then(serde_json::Value::as_str);
+    let Some(control_client) = state.compat_control_client.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": "compat control channel is not available" })),
+        )
+            .into_response();
+    };
+    match control_client
+        .send_command(CompatSupervisorCommand::ReloadConfig {
+            filename: filename.to_string(),
+            baseconfig: baseconfig.map(str::to_string),
+        })
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "error": format!("failed to dispatch reload: {error}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn kobold_admin_save_state_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    if compat_features_snapshot(&state).admin == 0 {
+        return Json(serde_json::json!({
+            "success": false,
+            "new_state_size": 0,
+            "new_tokens": 0,
+            "error": "admin mode is not enabled"
+        }))
+        .into_response();
+    }
+    if state.generation_in_progress.load(Ordering::Relaxed) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "new_state_size": 0,
+                "new_tokens": 0,
+                "error": "generation in progress; abort first"
+            })),
+        )
+            .into_response();
+    }
+    let Some(storage) = state.compat_storage.as_ref() else {
+        return Json(serde_json::json!({
+            "success": false,
+            "new_state_size": 0,
+            "new_tokens": 0,
+            "error": "compat storage is not configured"
+        }))
+        .into_response();
+    };
+    let slot = parse_slot_value(req.get("slot")).unwrap_or(0);
+    let Some(session) = state.compat_session.as_ref() else {
+        return Json(serde_json::json!({
+            "success": false,
+            "new_state_size": 0,
+            "new_tokens": 0,
+            "error": "compat runtime session is not configured"
+        }))
+        .into_response();
+    };
+    let snapshot = match session.lock().unwrap().current_runtime_metadata() {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return Json(serde_json::json!({
+                "success": false,
+                "new_state_size": 0,
+                "new_tokens": 0,
+                "error": "no runtime state is available yet; generate or load a state first"
+            }))
+            .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "new_state_size": 0,
+                    "new_tokens": 0,
+                    "error": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
+    let metadata = runtime_state_metadata_from_snapshot(&state, slot, &snapshot);
+    match storage.save_runtime_state_slot(
+        slot,
+        &metadata,
+        &snapshot.token_ids,
+        &snapshot.state_bytes,
+    ) {
+        Ok(()) => {
+            push_gui_event(
+                &state,
+                "info",
+                format!("runtime state saved to slot {slot}"),
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "new_state_size": snapshot.state_bytes.len(),
+                "new_tokens": snapshot.token_count,
+            }))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "new_state_size": 0,
+                "new_tokens": 0,
+                "error": error.to_string()
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn kobold_admin_load_state_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    if compat_features_snapshot(&state).admin == 0 {
+        return Json(serde_json::json!({
+            "success": false,
+            "new_tokens": 0,
+            "error": "admin mode is not enabled"
+        }))
+        .into_response();
+    }
+    if state.generation_in_progress.load(Ordering::Relaxed) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "new_tokens": 0,
+                "error": "generation in progress; abort first"
+            })),
+        )
+            .into_response();
+    }
+    let Some(storage) = state.compat_storage.as_ref() else {
+        return Json(serde_json::json!({
+            "success": false,
+            "new_tokens": 0,
+            "error": "compat storage is not configured"
+        }))
+        .into_response();
+    };
+    let slot = parse_slot_value(req.get("slot")).unwrap_or(0);
+    let record = match storage.load_runtime_state_slot(slot) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return Json(serde_json::json!({
+                "success": false,
+                "new_tokens": 0,
+                "error": "runtime state slot is empty"
+            }))
+            .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "new_tokens": 0,
+                    "error": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = validate_runtime_state_compatibility(&state, &record.metadata) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "new_tokens": 0,
+                "error": error.to_string()
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(session) = state.compat_session.as_ref() else {
+        return Json(serde_json::json!({
+            "success": false,
+            "new_tokens": 0,
+            "error": "compat runtime session is not configured"
+        }))
+        .into_response();
+    };
+    if let Err(error) = session.lock().unwrap().load_state_snapshot(ContextStateSnapshot {
+        token_ids: record.token_ids,
+        token_count: record.metadata.token_count,
+        state_bytes: record.state_bytes,
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "new_tokens": 0,
+                "error": error.to_string()
+            })),
+        )
+            .into_response();
+    }
+    push_gui_event(
+        &state,
+        "info",
+        format!("runtime state loaded from slot {slot}"),
+    );
+    Json(serde_json::json!({
+        "success": true,
+        "new_tokens": record.metadata.token_count,
+    }))
+    .into_response()
+}
+
 async fn gui_presets_list_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<GuiPresetListResponse> {
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Ok(presets) = storage.list_gui_presets() {
+            return Json(GuiPresetListResponse { presets });
+        }
+    }
     let mut presets: Vec<GuiPresetItem> = state
         .gui_presets
         .lock()
@@ -1286,14 +1875,25 @@ async fn gui_presets_save_handler(
         )
             .into_response();
     }
-    state.gui_presets.lock().unwrap().insert(
-        name.to_string(),
-        GuiPresetItem {
-            name: name.to_string(),
-            payload: req.payload,
-            updated_at: now_rfc3339(),
-        },
-    );
+    let preset = GuiPresetItem {
+        name: name.to_string(),
+        payload: req.payload,
+        updated_at: now_rfc3339(),
+    };
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Err(error) = storage.save_gui_preset(&preset) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    }
+    state
+        .gui_presets
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), preset);
     push_gui_event(&state, "info", format!("preset saved: {name}"));
     Json(serde_json::json!({ "success": true })).into_response()
 }
@@ -1310,22 +1910,46 @@ async fn gui_presets_delete_handler(
         )
             .into_response();
     }
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Err(error) = storage.delete_gui_preset(name) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    }
     state.gui_presets.lock().unwrap().remove(name);
     push_gui_event(&state, "info", format!("preset deleted: {name}"));
     Json(serde_json::json!({ "success": true })).into_response()
 }
 
 async fn gui_history_handler(State(state): State<Arc<AppState>>) -> Json<GuiHistoryResponse> {
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Ok(items) = storage.list_gui_history(200) {
+            return Json(GuiHistoryResponse { items });
+        }
+    }
     let items = state.gui_history.lock().unwrap().iter().cloned().collect();
     Json(GuiHistoryResponse { items })
 }
 
 async fn gui_events_handler(State(state): State<Arc<AppState>>) -> Json<GuiEventsResponse> {
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Ok(items) = storage.list_gui_events(200) {
+            return Json(GuiEventsResponse { items });
+        }
+    }
     let items = state.gui_events.lock().unwrap().iter().cloned().collect();
     Json(GuiEventsResponse { items })
 }
 
 async fn ui_theme_get_handler(State(state): State<Arc<AppState>>) -> Json<UiThemeResponse> {
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Ok(theme) = storage.get_ui_theme() {
+            return Json(UiThemeResponse { theme });
+        }
+    }
     Json(UiThemeResponse {
         theme: state.ui_theme.lock().unwrap().clone(),
     })
@@ -1346,6 +1970,15 @@ async fn ui_theme_set_handler(
                 .into_response();
         }
     };
+    if let Some(storage) = state.compat_storage.as_ref() {
+        if let Err(error) = storage.set_ui_theme(&next) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    }
     *state.ui_theme.lock().unwrap() = next.clone();
     set_process_env_var("HYPURA_UI_THEME", &next);
     push_gui_event(&state, "info", format!("ui theme changed: {next}"));
@@ -1368,6 +2001,150 @@ fn end_generation(state: &Arc<AppState>) {
     *slot = None;
 }
 
+fn compat_features_snapshot(state: &Arc<AppState>) -> CompatFeatureFlags {
+    *state.compat_features.lock().unwrap()
+}
+
+fn spawn_generation_task(
+    state: Arc<AppState>,
+    history_label: &'static str,
+    prompt: String,
+    sampling: crate::compute::ffi::SamplingParams,
+    sampler_order: Option<Vec<i32>>,
+    stop_sequences: Vec<String>,
+) -> (
+    mpsc::UnboundedReceiver<crate::compute::inference::GeneratedToken>,
+    oneshot::Receiver<GenerationResult>,
+) {
+    let (token_tx, token_rx) = mpsc::unbounded_channel();
+    let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
+    let loaded = state.loaded_model.clone();
+    let compat_session = state.compat_session.clone();
+    let telemetry = state.telemetry.clone();
+    let cancel_flag = begin_generation(&state);
+    let state_for_task = state.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let params = GenerateFromLoadedParams {
+            prompt: &prompt,
+            sampling: &sampling,
+            sampler_order: sampler_order.as_deref(),
+            stop_sequences: &stop_sequences,
+            cancel_flag: Some(cancel_flag),
+            token_tx,
+            telemetry,
+        };
+        let result = if let Some(session) = compat_session {
+            let mut session = session.lock().unwrap();
+            session.generate(params)
+        } else {
+            let mut model = loaded.lock().unwrap();
+            crate::compute::inference::generate_from_loaded(&mut model, params)
+        };
+        end_generation(&state_for_task);
+        match result {
+            Ok(gen_result) => {
+                let model_name = state_for_task.model_name.lock().unwrap().clone();
+                push_gui_history(
+                    &state_for_task,
+                    history_label,
+                    model_name,
+                    prompt.chars().count(),
+                    gen_result.text.chars().count(),
+                    Some(gen_result.tok_per_sec_avg),
+                    started.elapsed().as_millis() as u64,
+                );
+                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
+                let _ = result_tx.send(gen_result);
+            }
+            Err(error) => {
+                tracing::error!("generation error: {error}");
+                push_gui_event(&state_for_task, "error", format!("generation failed: {error}"));
+            }
+        }
+    });
+
+    (token_rx, result_rx)
+}
+
+async fn proxy_multimodal_request(
+    state: Arc<AppState>,
+    feature_name: &'static str,
+    internal_path: &'static str,
+    upstream_path: &'static str,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(client) = state.compat_control_client.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(compat::feature_unavailable_error(feature_name)),
+        )
+            .into_response();
+    };
+    let mut headers = headers;
+    if let Ok(value) = header::HeaderValue::from_str(upstream_path) {
+        headers.insert("x-hypura-upstream-path", value);
+    }
+    match client
+        .proxy_request(internal_path, method, &headers, body)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn proxy_embeddings_request(
+    state: Arc<AppState>,
+    internal_path: &'static str,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let features = compat_features_snapshot(&state);
+    if !features.embeddings {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(compat::openai_error(
+                "embeddings model is not available in the current compatibility runtime",
+                "unsupported_feature",
+                "embeddings_unavailable",
+            )),
+        )
+            .into_response();
+    }
+    let Some(client) = state.compat_control_client.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(compat::openai_error(
+                "embeddings control plane is not available in the current compatibility runtime",
+                "server_error",
+                "embeddings_control_plane_unavailable",
+            )),
+        )
+            .into_response();
+    };
+    match client.proxy_request(internal_path, method, &headers, body).await {
+        Ok(response) => response,
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(compat::openai_error(
+                &format!("failed to proxy embeddings request: {error}"),
+                "server_error",
+                "embeddings_proxy_failed",
+            )),
+        )
+            .into_response(),
+    }
+}
+
 async fn generate_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GenerateRequest>,
@@ -1380,51 +2157,15 @@ async fn generate_handler(
     let stop_sequences = req.options.stop.clone().unwrap_or_default();
     let prompt = req.prompt;
     let model_name = state.model_name.lock().unwrap().clone();
-
-    let (token_tx, token_rx) = mpsc::unbounded_channel();
-    let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
-
-    let loaded = state.loaded_model.clone();
-    let telemetry = state.telemetry.clone();
-    let cancel_flag = begin_generation(&state);
-    let state_for_task = state.clone();
     let sampler_order = req.options.sampler_order.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let mut model = loaded.lock().unwrap();
-        let params = GenerateFromLoadedParams {
-            prompt: &prompt,
-            sampling: &sampling,
-            sampler_order: sampler_order.as_deref(),
-            stop_sequences: &stop_sequences,
-            cancel_flag: Some(cancel_flag),
-            token_tx,
-            telemetry,
-        };
-        let result = crate::compute::inference::generate_from_loaded(&mut model, params);
-        end_generation(&state_for_task);
-        match result {
-            Ok(gen_result) => {
-                let model_name = state_for_task.model_name.lock().unwrap().clone();
-                push_gui_history(
-                    &state_for_task,
-                    "generate",
-                    model_name,
-                    prompt.chars().count(),
-                    gen_result.text.chars().count(),
-                    Some(gen_result.tok_per_sec_avg),
-                    started.elapsed().as_millis() as u64,
-                );
-                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
-                let _ = result_tx.send(gen_result);
-            }
-            Err(e) => {
-                tracing::error!("Generation error: {e}");
-                push_gui_event(&state_for_task, "error", format!("generate failed: {e}"));
-            }
-        }
-    });
+    let (token_rx, result_rx) = spawn_generation_task(
+        state.clone(),
+        "generate",
+        prompt.clone(),
+        sampling,
+        sampler_order,
+        stop_sequences,
+    );
 
     if req.stream {
         let body = streaming::ndjson_generate_stream(
@@ -1494,48 +2235,14 @@ async fn kobold_generate_handler(
     let stop_sequences = req.stop_sequence.unwrap_or_default();
 
     let prompt = req.prompt;
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
-    let (result_tx, _result_rx) = oneshot::channel::<GenerationResult>();
-    let loaded = state.loaded_model.clone();
-    let telemetry = state.telemetry.clone();
-    let cancel_flag = begin_generation(&state);
-    let state_for_task = state.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let mut model = loaded.lock().unwrap();
-        let params = GenerateFromLoadedParams {
-            prompt: &prompt,
-            sampling: &sampling,
-            sampler_order: sampler_order.as_deref(),
-            stop_sequences: &stop_sequences,
-            cancel_flag: Some(cancel_flag),
-            token_tx,
-            telemetry,
-        };
-        let result = crate::compute::inference::generate_from_loaded(&mut model, params);
-        end_generation(&state_for_task);
-        if let Ok(gen_result) = result {
-            let model_name = state_for_task.model_name.lock().unwrap().clone();
-            push_gui_history(
-                &state_for_task,
-                "kobold-generate",
-                model_name,
-                prompt.chars().count(),
-                gen_result.text.chars().count(),
-                Some(gen_result.tok_per_sec_avg),
-                started.elapsed().as_millis() as u64,
-            );
-            record_compat_text_generation(&state_for_task, &sampling, &gen_result);
-            let _ = result_tx.send(gen_result);
-        } else if let Err(e) = result {
-            push_gui_event(
-                &state_for_task,
-                "error",
-                format!("kobold generate failed: {e}"),
-            );
-        }
-    });
+    let (mut token_rx, _result_rx) = spawn_generation_task(
+        state.clone(),
+        "kobold-generate",
+        prompt,
+        sampling,
+        sampler_order,
+        stop_sequences,
+    );
 
     let mut full_response = String::new();
     while let Some(token) = token_rx.recv().await {
@@ -1589,51 +2296,17 @@ async fn kobold_generate_stream_handler(
     let stop_sequences = req.stop_sequence.unwrap_or_default();
     let prompt = req.prompt;
 
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
-    let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
-    let loaded = state.loaded_model.clone();
-    let telemetry = state.telemetry.clone();
-    let cancel_flag = begin_generation(&state);
-    let state_for_task = state.clone();
+    let (mut token_rx, result_rx) = spawn_generation_task(
+        state.clone(),
+        "kobold-stream",
+        prompt,
+        sampling,
+        sampler_order,
+        stop_sequences,
+    );
     let model_name = state.model_name.lock().unwrap().clone();
     let request_start = Instant::now();
     let load_duration_ns = state.load_duration_ns;
-
-    tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let mut model = loaded.lock().unwrap();
-        let params = GenerateFromLoadedParams {
-            prompt: &prompt,
-            sampling: &sampling,
-            sampler_order: sampler_order.as_deref(),
-            stop_sequences: &stop_sequences,
-            cancel_flag: Some(cancel_flag),
-            token_tx,
-            telemetry,
-        };
-        let result = crate::compute::inference::generate_from_loaded(&mut model, params);
-        end_generation(&state_for_task);
-        if let Ok(gen_result) = result {
-            let model_name_inner = state_for_task.model_name.lock().unwrap().clone();
-            push_gui_history(
-                &state_for_task,
-                "kobold-stream",
-                model_name_inner,
-                prompt.chars().count(),
-                gen_result.text.chars().count(),
-                Some(gen_result.tok_per_sec_avg),
-                started.elapsed().as_millis() as u64,
-            );
-            record_compat_text_generation(&state_for_task, &sampling, &gen_result);
-            let _ = result_tx.send(gen_result);
-        } else if let Err(e) = result {
-            push_gui_event(
-                &state_for_task,
-                "error",
-                format!("kobold stream failed: {e}"),
-            );
-        }
-    });
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -1702,48 +2375,231 @@ async fn kobold_true_max_context_length_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<KoboldTrueMaxContextLengthResponse> {
     Json(KoboldTrueMaxContextLengthResponse {
-        value: state.default_context,
+        value: state.default_context.load(Ordering::Relaxed),
     })
 }
 
-async fn kobold_websearch_handler() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(compat::feature_unavailable_error("websearch")),
+async fn kobold_websearch_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !compat_features_snapshot(&state).websearch {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(compat::feature_unavailable_error("websearch")),
+        )
+            .into_response();
+    }
+    proxy_multimodal_request(
+        state,
+        "websearch",
+        "/builtin/api/extra/websearch",
+        "/api/extra/websearch",
+        Method::POST,
+        headers,
+        body,
     )
-        .into_response()
+    .await
 }
 
-async fn txt2img_unavailable_handler() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(compat::feature_unavailable_error("txt2img")),
+async fn txt2img_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "txt2img",
+        "/multimodal/sdapi/v1/txt2img",
+        "/sdapi/v1/txt2img",
+        Method::POST,
+        headers,
+        body,
     )
-        .into_response()
+    .await
 }
 
-async fn transcribe_unavailable_handler() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(compat::openai_error(
-            "transcribe is not bundled in this Hypura compatibility slice yet",
-            "unsupported_feature",
-            "transcribe_unavailable",
-        )),
+async fn img2img_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "txt2img",
+        "/multimodal/sdapi/v1/img2img",
+        "/sdapi/v1/img2img",
+        Method::POST,
+        headers,
+        body,
     )
-        .into_response()
+    .await
 }
 
-async fn openai_embeddings_handler() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(compat::openai_error(
-            "embeddings are not bundled in this Hypura compatibility slice yet",
-            "unsupported_feature",
-            "embeddings_unavailable",
-        )),
+async fn interrogate_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "txt2img",
+        "/multimodal/sdapi/v1/interrogate",
+        "/sdapi/v1/interrogate",
+        Method::POST,
+        headers,
+        body,
     )
-        .into_response()
+    .await
+}
+
+async fn upscale_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "txt2img",
+        "/multimodal/sdapi/v1/upscale",
+        "/sdapi/v1/upscale",
+        Method::POST,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn sd_options_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "txt2img",
+        "/multimodal/sdapi/v1/options",
+        "/sdapi/v1/options",
+        Method::GET,
+        headers,
+        Bytes::new(),
+    )
+    .await
+}
+
+async fn sd_models_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "txt2img",
+        "/multimodal/sdapi/v1/sd-models",
+        "/sdapi/v1/sd-models",
+        Method::GET,
+        headers,
+        Bytes::new(),
+    )
+    .await
+}
+
+async fn transcribe_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "transcribe",
+        "/multimodal/api/extra/transcribe",
+        "/api/extra/transcribe",
+        Method::POST,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn audio_transcriptions_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "transcribe",
+        "/multimodal/v1/audio/transcriptions",
+        "/v1/audio/transcriptions",
+        Method::POST,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn tts_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "tts",
+        "/multimodal/api/extra/tts",
+        "/api/extra/tts",
+        Method::POST,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn audio_speech_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "tts",
+        "/multimodal/v1/audio/speech",
+        "/v1/audio/speech",
+        Method::POST,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn speakers_list_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    proxy_multimodal_request(
+        state,
+        "speakers_list",
+        "/multimodal/speakers_list",
+        "/speakers_list",
+        Method::GET,
+        headers,
+        Bytes::new(),
+    )
+    .await
+}
+
+async fn openai_embeddings_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_embeddings_request(
+        state,
+        "/embeddings/v1/embeddings",
+        Method::POST,
+        headers,
+        body,
+    )
+    .await
 }
 
 async fn openai_completions_handler(
@@ -1758,7 +2614,10 @@ async fn openai_completions_handler(
         .as_ref()
         .map(OpenAiStopInput::to_stop_sequences)
         .unwrap_or_default();
-    let sampling = build_sampling_from_openai_completion(&req, state.compat_default_max_length);
+    let sampling = build_sampling_from_openai_completion(
+        &req,
+        state.compat_default_max_length.load(Ordering::Relaxed),
+    );
     let sampler_order = req.sampler_order.clone();
     let model_name = req
         .model
@@ -1767,52 +2626,14 @@ async fn openai_completions_handler(
     let created = chrono::Utc::now().timestamp();
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
 
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
-    let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
-    let loaded = state.loaded_model.clone();
-    let telemetry = state.telemetry.clone();
-    let cancel_flag = begin_generation(&state);
-    let state_for_task = state.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let mut model = loaded.lock().unwrap();
-        let params = GenerateFromLoadedParams {
-            prompt: &prompt,
-            sampling: &sampling,
-            sampler_order: sampler_order.as_deref(),
-            stop_sequences: &stop_sequences,
-            cancel_flag: Some(cancel_flag),
-            token_tx,
-            telemetry,
-        };
-        let result = crate::compute::inference::generate_from_loaded(&mut model, params);
-        end_generation(&state_for_task);
-        match result {
-            Ok(gen_result) => {
-                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
-                let active_model = state_for_task.model_name.lock().unwrap().clone();
-                push_gui_history(
-                    &state_for_task,
-                    "openai-completion",
-                    active_model,
-                    prompt.chars().count(),
-                    gen_result.text.chars().count(),
-                    Some(gen_result.tok_per_sec_avg),
-                    started.elapsed().as_millis() as u64,
-                );
-                let _ = result_tx.send(gen_result);
-            }
-            Err(e) => {
-                tracing::error!("OpenAI completion error: {e}");
-                push_gui_event(
-                    &state_for_task,
-                    "error",
-                    format!("openai completion failed: {e}"),
-                );
-            }
-        }
-    });
+    let (mut token_rx, result_rx) = spawn_generation_task(
+        state.clone(),
+        "openai-completion",
+        prompt.clone(),
+        sampling,
+        sampler_order,
+        stop_sequences,
+    );
 
     if req.stream {
         let request_id_for_stream = request_id.clone();
@@ -1831,11 +2652,7 @@ async fn openai_completions_handler(
                         "finish_reason": serde_json::Value::Null,
                     }]
                 });
-                if tx
-                    .send(Ok(format!("data: {}\n\n", chunk)))
-                    .await
-                    .is_err()
-                {
+                if tx.send(Ok(format!("data: {}\n\n", chunk))).await.is_err() {
                     return;
                 }
             }
@@ -1898,7 +2715,10 @@ async fn openai_chat_completions_handler(
         .as_ref()
         .map(OpenAiStopInput::to_stop_sequences)
         .unwrap_or_default();
-    let sampling = build_sampling_from_openai_chat(&req, state.compat_default_max_length);
+    let sampling = build_sampling_from_openai_chat(
+        &req,
+        state.compat_default_max_length.load(Ordering::Relaxed),
+    );
     let sampler_order = req.sampler_order.clone();
     let model_name = req
         .model
@@ -1907,52 +2727,14 @@ async fn openai_chat_completions_handler(
     let created = chrono::Utc::now().timestamp();
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
 
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
-    let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
-    let loaded = state.loaded_model.clone();
-    let telemetry = state.telemetry.clone();
-    let cancel_flag = begin_generation(&state);
-    let state_for_task = state.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let mut model = loaded.lock().unwrap();
-        let params = GenerateFromLoadedParams {
-            prompt: &prompt,
-            sampling: &sampling,
-            sampler_order: sampler_order.as_deref(),
-            stop_sequences: &stop_sequences,
-            cancel_flag: Some(cancel_flag),
-            token_tx,
-            telemetry,
-        };
-        let result = crate::compute::inference::generate_from_loaded(&mut model, params);
-        end_generation(&state_for_task);
-        match result {
-            Ok(gen_result) => {
-                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
-                let active_model = state_for_task.model_name.lock().unwrap().clone();
-                push_gui_history(
-                    &state_for_task,
-                    "openai-chat",
-                    active_model,
-                    prompt.chars().count(),
-                    gen_result.text.chars().count(),
-                    Some(gen_result.tok_per_sec_avg),
-                    started.elapsed().as_millis() as u64,
-                );
-                let _ = result_tx.send(gen_result);
-            }
-            Err(e) => {
-                tracing::error!("OpenAI chat completion error: {e}");
-                push_gui_event(
-                    &state_for_task,
-                    "error",
-                    format!("openai chat completion failed: {e}"),
-                );
-            }
-        }
-    });
+    let (mut token_rx, result_rx) = spawn_generation_task(
+        state.clone(),
+        "openai-chat",
+        prompt.clone(),
+        sampling,
+        sampler_order,
+        stop_sequences,
+    );
 
     if req.stream {
         let request_id_for_stream = request_id.clone();
@@ -1989,11 +2771,7 @@ async fn openai_chat_completions_handler(
                         "finish_reason": serde_json::Value::Null,
                     }]
                 });
-                if tx
-                    .send(Ok(format!("data: {}\n\n", chunk)))
-                    .await
-                    .is_err()
-                {
+                if tx.send(Ok(format!("data: {}\n\n", chunk))).await.is_err() {
                     return;
                 }
             }
@@ -2051,51 +2829,15 @@ async fn chat_handler(
     let stop_sequences = req.options.stop.clone().unwrap_or_default();
     let prompt = format_chat_prompt(&req.messages);
     let model_name = state.model_name.lock().unwrap().clone();
-
-    let (token_tx, token_rx) = mpsc::unbounded_channel();
-    let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
-
-    let loaded = state.loaded_model.clone();
-    let telemetry = state.telemetry.clone();
-    let cancel_flag = begin_generation(&state);
-    let state_for_task = state.clone();
     let sampler_order = req.options.sampler_order.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let mut model = loaded.lock().unwrap();
-        let params = GenerateFromLoadedParams {
-            prompt: &prompt,
-            sampling: &sampling,
-            sampler_order: sampler_order.as_deref(),
-            stop_sequences: &stop_sequences,
-            cancel_flag: Some(cancel_flag),
-            token_tx,
-            telemetry,
-        };
-        let result = crate::compute::inference::generate_from_loaded(&mut model, params);
-        end_generation(&state_for_task);
-        match result {
-            Ok(gen_result) => {
-                let model_name = state_for_task.model_name.lock().unwrap().clone();
-                push_gui_history(
-                    &state_for_task,
-                    "chat",
-                    model_name,
-                    prompt.chars().count(),
-                    gen_result.text.chars().count(),
-                    Some(gen_result.tok_per_sec_avg),
-                    started.elapsed().as_millis() as u64,
-                );
-                record_compat_text_generation(&state_for_task, &sampling, &gen_result);
-                let _ = result_tx.send(gen_result);
-            }
-            Err(e) => {
-                tracing::error!("Chat generation error: {e}");
-                push_gui_event(&state_for_task, "error", format!("chat failed: {e}"));
-            }
-        }
-    });
+    let (token_rx, result_rx) = spawn_generation_task(
+        state.clone(),
+        "chat",
+        prompt,
+        sampling,
+        sampler_order,
+        stop_sequences,
+    );
 
     if req.stream {
         let body = streaming::ndjson_chat_stream(
@@ -2411,5 +3153,36 @@ fn format_parameter_size(params: u64) -> String {
         format!("{:.0}M", params as f64 / 1e6)
     } else {
         format!("{params}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn launcher_profile_context_reads_known_kcpps_fields() {
+        let profile = LauncherProfile::from_kcpps_value(
+            "demo.kcpps",
+            json!({
+                "contextsize": 8192,
+                "gendefaults": {
+                    "max_length": 640
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(launcher_profile_context(&profile, 4096), 8192);
+        assert_eq!(launcher_profile_max_length(&profile, 256), 640);
+    }
+
+    #[test]
+    fn launcher_profile_limits_fall_back_to_current_runtime_values() {
+        let profile = LauncherProfile::from_kcpps_value("demo.kcpps", json!({})).unwrap();
+
+        assert_eq!(launcher_profile_context(&profile, 4096), 4096);
+        assert_eq!(launcher_profile_max_length(&profile, 256), 256);
     }
 }
