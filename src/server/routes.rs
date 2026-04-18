@@ -2828,7 +2828,7 @@ async fn openai_chat_completions_handler(
     let (mut token_rx, result_rx) = if let Some(materialized_media) = pre_materialized_media {
         let (token_tx, token_rx) = mpsc::unbounded_channel();
         let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
-        let cancel_flag = begin_generation(&state);
+        let _cancel_flag = begin_generation(&state);
         let state_for_task = state.clone();
         let model_path = state.model_path.lock().unwrap().clone();
         let mmproj_path = state.mmproj_path.clone().unwrap_or_default();
@@ -3043,7 +3043,7 @@ async fn chat_handler(
     let (token_rx, result_rx) = if let Some(materialized_media) = pre_materialized_media {
         let (token_tx, token_rx) = mpsc::unbounded_channel();
         let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
-        let cancel_flag = begin_generation(&state);
+        let _cancel_flag = begin_generation(&state);
         let state_for_task = state.clone();
         let model_path = state.model_path.lock().unwrap().clone();
         let mmproj_path = state.mmproj_path.clone().unwrap_or_default();

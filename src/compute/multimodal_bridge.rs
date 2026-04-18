@@ -136,6 +136,7 @@ pub fn run_mtmd_single_turn(
         tok_per_sec_avg: completion_tokens as f64 / elapsed,
         prompt_eval_ms: 0.0,
         perf: PerfData::default(),
+        context_state: None,
     };
 
     Ok(MultimodalBridgeResponse {

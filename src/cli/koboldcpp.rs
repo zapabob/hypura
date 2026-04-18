@@ -315,6 +315,7 @@ pub fn run(
         }
         return super::serve::run(
             model_path,
+            None,
             host,
             port,
             context,

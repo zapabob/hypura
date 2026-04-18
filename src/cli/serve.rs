@@ -291,6 +291,7 @@ pub fn run_worker_bootstrap(bootstrap_file: &str) -> anyhow::Result<()> {
     }
     run(
         &bootstrap.model_path,
+        None,
         &bootstrap.public_host,
         bootstrap.public_port,
         bootstrap.context,
