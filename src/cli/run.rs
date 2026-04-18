@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hypura::compute::inference::*;
+use hypura::compute::multimodal_bridge::{run_mtmd_single_turn, MultimodalInvocation};
 use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
 use hypura::scheduler::types::{
     HostPinnedPolicy, PlacementSummary, ResidencyPolicyConfig, ResidencyProfile,
@@ -14,10 +15,13 @@ use super::fmt_util::{cli_progress_enabled, format_bytes};
 
 pub fn run(
     model_path: &str,
+    mmproj_path: Option<&str>,
     context: u32,
     prompt: Option<&str>,
     interactive: bool,
     max_tokens: u32,
+    image_inputs: &[String],
+    audio_inputs: &[String],
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&str>,
     rotation_policy: RotationPolicy,
@@ -28,10 +32,13 @@ pub fn run(
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
         model_path,
+        mmproj_path,
         context,
         prompt,
         interactive,
         max_tokens,
+        image_inputs,
+        audio_inputs,
         turboquant_mode,
         turboquant_config,
         rotation_policy,
@@ -43,10 +50,13 @@ pub fn run(
 
 async fn run_async(
     model_path: &str,
+    mmproj_path: Option<&str>,
     context: u32,
     prompt: Option<&str>,
     interactive: bool,
     max_tokens: u32,
+    image_inputs: &[String],
+    audio_inputs: &[String],
     turboquant_mode: TurboQuantMode,
     turboquant_config: Option<&str>,
     rotation_policy: RotationPolicy,
@@ -96,6 +106,15 @@ async fn run_async(
             "faithful-attached"
         }
     );
+    println!(
+        "  Multimodal:    mmproj_required={}, capabilities={}",
+        runtime.turboquant.mmproj_required(),
+        runtime.turboquant.modality_capabilities().join(","),
+    );
+    println!(
+        "  mmproj path:   {}",
+        mmproj_path.unwrap_or("(not provided)")
+    );
 
     print_placement_header(
         &runtime.placement_summary,
@@ -114,6 +133,41 @@ async fn run_async(
     let plan = Arc::new(runtime.plan.clone());
     let gguf = Arc::new(runtime.gguf.clone());
     let turboquant = Arc::new(runtime.turboquant.clone());
+    let has_multimodal_inputs = !image_inputs.is_empty() || !audio_inputs.is_empty();
+    if interactive && has_multimodal_inputs {
+        anyhow::bail!("interactive multimodal CLI is not supported; use --prompt with --image/--audio");
+    }
+    if has_multimodal_inputs {
+        let prompt_text = prompt.ok_or_else(|| {
+            anyhow::anyhow!("multimodal generation requires --prompt when using --image or --audio")
+        })?;
+        let resolved_mmproj = mmproj_path.ok_or_else(|| {
+            anyhow::anyhow!("multimodal generation requires --mmproj for paired Gemma artifacts")
+        })?;
+        let response = run_mtmd_single_turn(
+            &MultimodalInvocation {
+                model_path: path.to_path_buf(),
+                mmproj_path: Path::new(resolved_mmproj).to_path_buf(),
+                prompt: prompt_text.to_string(),
+                image_paths: image_inputs.iter().map(Path::new).map(Path::to_path_buf).collect(),
+                audio_paths: audio_inputs.iter().map(Path::new).map(Path::to_path_buf).collect(),
+                context,
+                max_tokens,
+                n_gpu_layers: runtime.n_gpu_layers.max(1),
+            },
+            std::env::var_os("HYPURA_LLAMA_CPP_PATH")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+        )?;
+        println!();
+        println!("{}", response.generated_text);
+        println!();
+        println!(
+            "Generation complete: {} chars via mtmd-cli bridge",
+            response.generated_text.chars().count()
+        );
+        return Ok(());
+    }
 
     if interactive {
         run_interactive(

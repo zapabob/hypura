@@ -15,14 +15,16 @@ use axum::{Json, Router};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::compute::inference::{
-    CompatRuntimeSession, ContextStateSnapshot, GenerateFromLoadedParams, GenerationResult,
-    LlamaTurboquantCliBridge, LoadedModel,
+    CompatRuntimeSession, ContextStateSnapshot, GenerateFromLoadedParams, GeneratedToken,
+    GenerationResult, LlamaTurboquantCliBridge, LoadedModel,
 };
+use crate::compute::multimodal_bridge::{run_mtmd_single_turn, MultimodalInvocation};
 use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
 use crate::scheduler::types::ResidencyPolicyConfig;
 use crate::server::chat::format_chat_prompt;
 use crate::server::compat::{self, CompatFeatureFlags, CompatPerfState};
 use crate::server::compat_storage::{CompatStorage, LauncherProfile, RuntimeStateSlotMetadata};
+use crate::server::multimodal::{collect_chat_media, has_chat_media};
 use crate::server::ollama_types::*;
 use crate::server::streaming;
 use crate::server::supervisor::{CompatControlPlaneClient, CompatSupervisorCommand};
@@ -43,6 +45,9 @@ pub struct AppState {
     pub model_path: Arc<Mutex<PathBuf>>,
     pub gguf_info: Arc<Mutex<GgufInfo>>,
     pub model_dir: PathBuf,
+    pub mmproj_path: Option<PathBuf>,
+    pub mmproj_required: bool,
+    pub multimodal_capabilities: Vec<String>,
     pub default_context: Arc<AtomicU32>,
     pub load_duration_ns: u64,
     pub telemetry: Arc<TelemetryEmitter>,
@@ -2145,6 +2150,45 @@ async fn proxy_embeddings_request(
     }
 }
 
+fn chat_has_audio(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| !message.audio.is_empty())
+}
+
+fn multimodal_bad_request(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
+
+fn openai_multimodal_bad_request(message: &str, code: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(compat::openai_error(
+            message,
+            "invalid_request_error",
+            code,
+        )),
+    )
+        .into_response()
+}
+
+fn send_completed_generation(
+    token_tx: mpsc::UnboundedSender<GeneratedToken>,
+    result_tx: oneshot::Sender<GenerationResult>,
+    result: GenerationResult,
+) {
+    let _ = token_tx.send(GeneratedToken {
+        text: result.text.clone(),
+        token_id: -1,
+        tok_per_sec: result.tok_per_sec_avg,
+        is_eog: true,
+    });
+    drop(token_tx);
+    let _ = result_tx.send(result);
+}
+
 async fn generate_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GenerateRequest>,
@@ -2726,15 +2770,134 @@ async fn openai_chat_completions_handler(
         .unwrap_or_else(|| state.model_name.lock().unwrap().clone());
     let created = chrono::Utc::now().timestamp();
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    let multimodal_context = state.default_context.load(Ordering::Relaxed);
+    let has_media = has_chat_media(&messages);
+    let has_audio = chat_has_audio(&messages);
 
-    let (mut token_rx, result_rx) = spawn_generation_task(
-        state.clone(),
-        "openai-chat",
-        prompt.clone(),
-        sampling,
-        sampler_order,
-        stop_sequences,
-    );
+    if has_media {
+        if !state.mmproj_required {
+            return openai_multimodal_bad_request(
+                "The currently loaded model does not advertise multimodal Triality capabilities.",
+                "multimodal_model_required",
+            );
+        }
+        if messages.iter().any(|message| !message.images.is_empty())
+            && !state
+                .multimodal_capabilities
+                .iter()
+                .any(|capability| capability == "image")
+        {
+            return openai_multimodal_bad_request(
+                "The currently loaded model does not support image inputs.",
+                "image_not_supported",
+            );
+        }
+        if has_audio
+            && !state
+                .multimodal_capabilities
+                .iter()
+                .any(|capability| capability == "audio")
+        {
+            return openai_multimodal_bad_request(
+                "The currently loaded model does not support audio inputs.",
+                "audio_not_supported",
+            );
+        }
+        if state.mmproj_path.is_none() {
+            return openai_multimodal_bad_request(
+                "This request requires a paired mmproj GGUF. Start Hypura with --mmproj <path>.",
+                "mmproj_required",
+            );
+        }
+    }
+
+    let pre_materialized_media = if has_media {
+        match collect_chat_media(&messages) {
+            Ok(media) => Some(media),
+            Err(error) => {
+                return openai_multimodal_bad_request(
+                    &format!("Failed to materialize multimodal inputs: {error}"),
+                    "invalid_multimodal_input",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let (mut token_rx, result_rx) = if let Some(materialized_media) = pre_materialized_media {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
+        let cancel_flag = begin_generation(&state);
+        let state_for_task = state.clone();
+        let model_path = state.model_path.lock().unwrap().clone();
+        let mmproj_path = state.mmproj_path.clone().unwrap_or_default();
+        let n_gpu_layers = state.loaded_model.lock().unwrap().n_gpu_layers;
+        let llama_root = std::env::var("HYPURA_LLAMA_CPP_PATH")
+            .ok()
+            .map(PathBuf::from);
+        let prompt_for_task = prompt.clone();
+        let sampling_for_task = sampling.clone();
+        let max_tokens = sampling.max_tokens.max(1);
+
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let response = run_mtmd_single_turn(
+                &MultimodalInvocation {
+                    model_path,
+                    mmproj_path,
+                    prompt: prompt_for_task.clone(),
+                    image_paths: materialized_media.image_paths.clone(),
+                    audio_paths: materialized_media.audio_paths.clone(),
+                    context: multimodal_context,
+                    max_tokens,
+                    n_gpu_layers,
+                },
+                llama_root.as_deref().map(std::path::Path::new),
+            );
+            end_generation(&state_for_task);
+            match response {
+                Ok(response) => {
+                    record_compat_text_generation(
+                        &state_for_task,
+                        &sampling_for_task,
+                        &response.result,
+                    );
+                    let active_model = state_for_task.model_name.lock().unwrap().clone();
+                    push_gui_history(
+                        &state_for_task,
+                        "openai-chat",
+                        active_model,
+                        prompt_for_task.chars().count(),
+                        response.generated_text.chars().count(),
+                        Some(response.result.tok_per_sec_avg),
+                        started.elapsed().as_millis() as u64,
+                    );
+                    send_completed_generation(token_tx, result_tx, response.result);
+                }
+                Err(error) => {
+                    tracing::error!("OpenAI multimodal chat completion error: {error}");
+                    push_gui_event(
+                        &state_for_task,
+                        "error",
+                        format!("openai multimodal chat completion failed: {error}"),
+                    );
+                    drop(token_tx);
+                }
+            }
+        });
+
+        (token_rx, result_rx)
+    } else {
+        spawn_generation_task(
+            state.clone(),
+            "openai-chat",
+            prompt.clone(),
+            sampling,
+            sampler_order,
+            stop_sequences,
+        )
+    };
 
     if req.stream {
         let request_id_for_stream = request_id.clone();
@@ -2830,14 +2993,126 @@ async fn chat_handler(
     let prompt = format_chat_prompt(&req.messages);
     let model_name = state.model_name.lock().unwrap().clone();
     let sampler_order = req.options.sampler_order.clone();
-    let (token_rx, result_rx) = spawn_generation_task(
-        state.clone(),
-        "chat",
-        prompt,
-        sampling,
-        sampler_order,
-        stop_sequences,
-    );
+    let has_media = has_chat_media(&req.messages);
+    let multimodal_context = req
+        .options
+        .num_ctx
+        .unwrap_or_else(|| state.default_context.load(Ordering::Relaxed));
+
+    if chat_has_audio(&req.messages) {
+        return multimodal_bad_request(
+            "Audio inputs are only supported on the OpenAI-compatible /v1/chat/completions route in this Hypura M1 slice.",
+        );
+    }
+
+    if has_media {
+        if !state.mmproj_required {
+            return multimodal_bad_request(
+                "The currently loaded model does not advertise multimodal Triality capabilities.",
+            );
+        }
+        if !state
+            .multimodal_capabilities
+            .iter()
+            .any(|capability| capability == "image")
+        {
+            return multimodal_bad_request(
+                "The currently loaded model does not support image inputs.",
+            );
+        }
+        if state.mmproj_path.is_none() {
+            return multimodal_bad_request(
+                "This request requires a paired mmproj GGUF. Start Hypura with --mmproj <path>.",
+            );
+        }
+    }
+
+    let pre_materialized_media = if has_media {
+        match collect_chat_media(&req.messages) {
+            Ok(media) => Some(media),
+            Err(error) => {
+                return multimodal_bad_request(&format!(
+                    "Failed to materialize multimodal inputs: {error}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let (token_rx, result_rx) = if let Some(materialized_media) = pre_materialized_media {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (result_tx, result_rx) = oneshot::channel::<GenerationResult>();
+        let cancel_flag = begin_generation(&state);
+        let state_for_task = state.clone();
+        let model_path = state.model_path.lock().unwrap().clone();
+        let mmproj_path = state.mmproj_path.clone().unwrap_or_default();
+        let n_gpu_layers = state.loaded_model.lock().unwrap().n_gpu_layers;
+        let llama_root = std::env::var("HYPURA_LLAMA_CPP_PATH")
+            .ok()
+            .map(PathBuf::from);
+        let prompt_for_task = prompt.clone();
+        let sampling_for_task = sampling.clone();
+        let max_tokens = sampling.max_tokens.max(1);
+
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let response = run_mtmd_single_turn(
+                &MultimodalInvocation {
+                    model_path,
+                    mmproj_path,
+                    prompt: prompt_for_task.clone(),
+                    image_paths: materialized_media.image_paths.clone(),
+                    audio_paths: materialized_media.audio_paths.clone(),
+                    context: multimodal_context,
+                    max_tokens,
+                    n_gpu_layers,
+                },
+                llama_root.as_deref().map(std::path::Path::new),
+            );
+            end_generation(&state_for_task);
+            match response {
+                Ok(response) => {
+                    let model_name = state_for_task.model_name.lock().unwrap().clone();
+                    push_gui_history(
+                        &state_for_task,
+                        "chat",
+                        model_name,
+                        prompt_for_task.chars().count(),
+                        response.generated_text.chars().count(),
+                        Some(response.result.tok_per_sec_avg),
+                        started.elapsed().as_millis() as u64,
+                    );
+                    record_compat_text_generation(
+                        &state_for_task,
+                        &sampling_for_task,
+                        &response.result,
+                    );
+                    send_completed_generation(token_tx, result_tx, response.result);
+                }
+                Err(error) => {
+                    tracing::error!("Chat multimodal generation error: {error}");
+                    push_gui_event(
+                        &state_for_task,
+                        "error",
+                        format!("chat multimodal failed: {error}"),
+                    );
+                    drop(token_tx);
+                }
+            }
+        });
+
+        (token_rx, result_rx)
+    } else {
+        spawn_generation_task(
+            state.clone(),
+            "chat",
+            prompt,
+            sampling,
+            sampler_order,
+            stop_sequences,
+        )
+    };
 
     if req.stream {
         let body = streaming::ndjson_chat_stream(
@@ -3126,6 +3401,8 @@ async fn collect_chat(
         message: ChatMessage {
             role: "assistant".into(),
             content: full_response,
+            images: Vec::new(),
+            audio: Vec::new(),
         },
         done: true,
         done_reason: Some("stop".into()),

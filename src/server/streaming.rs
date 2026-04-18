@@ -90,6 +90,8 @@ pub fn ndjson_chat_stream(
                 message: ChatMessage {
                     role: "assistant".into(),
                     content: token.text,
+                    images: Vec::new(),
+                    audio: Vec::new(),
                 },
                 done: false,
                 done_reason: None,
@@ -115,6 +117,8 @@ pub fn ndjson_chat_stream(
             message: ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
+                images: Vec::new(),
+                audio: Vec::new(),
             },
             done: true,
             done_reason: Some("stop".into()),

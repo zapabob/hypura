@@ -32,6 +32,44 @@ pub struct ChatRequest {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<String>,
+}
+
+impl ChatMessage {
+    pub fn media_attachments(&self) -> Vec<ChatMediaAttachment> {
+        let mut attachments = Vec::new();
+        for image in &self.images {
+            attachments.push(ChatMediaAttachment {
+                kind: ChatMediaKind::Image,
+                value: image.clone(),
+                format_hint: None,
+            });
+        }
+        for audio in &self.audio {
+            attachments.push(ChatMediaAttachment {
+                kind: ChatMediaKind::Audio,
+                value: audio.clone(),
+                format_hint: None,
+            });
+        }
+        attachments
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatMediaKind {
+    Image,
+    Audio,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMediaAttachment {
+    pub kind: ChatMediaKind,
+    pub value: String,
+    pub format_hint: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -331,11 +369,27 @@ impl OpenAiStopInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiImageUrlPart {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiInputAudioPart {
+    pub data: String,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct OpenAiContentPart {
     #[serde(default)]
     pub r#type: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<OpenAiImageUrlPart>,
+    #[serde(default)]
+    pub input_audio: Option<OpenAiInputAudioPart>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -351,9 +405,78 @@ impl OpenAiMessageContent {
             OpenAiMessageContent::Text(text) => text.clone(),
             OpenAiMessageContent::Parts(parts) => parts
                 .iter()
-                .filter_map(|part| part.text.as_deref())
+                .filter_map(|part| {
+                    let part_type = part.r#type.as_deref().unwrap_or("text");
+                    if matches!(part_type, "text" | "input_text") {
+                        part.text.as_deref()
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(""),
+        }
+    }
+
+    pub fn media_attachments(&self) -> Vec<ChatMediaAttachment> {
+        match self {
+            OpenAiMessageContent::Text(_) => Vec::new(),
+            OpenAiMessageContent::Parts(parts) => {
+                let mut attachments = Vec::new();
+                for part in parts {
+                    let part_type = part.r#type.as_deref().unwrap_or_default();
+                    if matches!(part_type, "image_url" | "input_image")
+                        || (part.image_url.is_some() && part.input_audio.is_none())
+                    {
+                        if let Some(ref image_url) = part.image_url {
+                            attachments.push(ChatMediaAttachment {
+                                kind: ChatMediaKind::Image,
+                                value: image_url.url.clone(),
+                                format_hint: None,
+                            });
+                        }
+                    }
+                    if matches!(part_type, "input_audio" | "audio")
+                        || part.input_audio.is_some()
+                    {
+                        if let Some(ref input_audio) = part.input_audio {
+                            attachments.push(ChatMediaAttachment {
+                                kind: ChatMediaKind::Audio,
+                                value: input_audio.data.clone(),
+                                format_hint: input_audio.format.clone(),
+                            });
+                        }
+                    }
+                }
+                attachments
+            }
+        }
+    }
+
+    pub fn image_values(&self) -> Vec<String> {
+        self.media_attachments()
+            .into_iter()
+            .filter(|attachment| attachment.kind == ChatMediaKind::Image)
+            .map(|attachment| attachment.value)
+            .collect()
+    }
+
+    pub fn audio_values(&self) -> Vec<String> {
+        match self {
+            OpenAiMessageContent::Text(_) => Vec::new(),
+            OpenAiMessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| {
+                    let input_audio = part.input_audio.as_ref()?;
+                    let format = input_audio
+                        .format
+                        .as_deref()
+                        .unwrap_or("wav")
+                        .trim()
+                        .trim_start_matches('.');
+                    Some(format!("data:audio/{format};base64,{}", input_audio.data))
+                })
+                .collect(),
         }
     }
 }
@@ -367,13 +490,14 @@ pub struct OpenAiChatMessage {
 
 impl OpenAiChatMessage {
     pub fn to_chat_message(&self) -> ChatMessage {
+        let content = self.content.as_ref();
         ChatMessage {
             role: self.role.clone(),
-            content: self
-                .content
-                .as_ref()
+            content: content
                 .map(OpenAiMessageContent::flatten_text)
                 .unwrap_or_default(),
+            images: content.map(OpenAiMessageContent::image_values).unwrap_or_default(),
+            audio: content.map(OpenAiMessageContent::audio_values).unwrap_or_default(),
         }
     }
 }

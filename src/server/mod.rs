@@ -2,6 +2,7 @@ pub mod chat;
 pub mod compat;
 pub mod compat_storage;
 pub mod embeddings;
+pub mod multimodal;
 pub mod ollama_types;
 pub mod routes;
 pub mod streaming;

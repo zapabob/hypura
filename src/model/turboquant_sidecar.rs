@@ -281,6 +281,20 @@ impl ResolvedTurboQuantConfig {
     pub fn paper_config(&self) -> Option<&PaperTurboQuantConfig> {
         self.config.as_ref()?.paper()
     }
+
+    pub fn modality_capabilities(&self) -> Vec<&'static str> {
+        self.gguf_metadata
+            .as_ref()
+            .map(GgufTurboQuantConfig::modality_capabilities)
+            .unwrap_or_else(|| vec!["text"])
+    }
+
+    pub fn mmproj_required(&self) -> bool {
+        self.gguf_metadata
+            .as_ref()
+            .map(GgufTurboQuantConfig::mmproj_required)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +314,15 @@ pub struct GgufTurboQuantConfig {
     pub payload_format: Option<String>,
     pub payload_bytes: u64,
     pub payload_json: Option<String>,
+    pub weight_enabled: bool,
+    pub weight_source_ftype: Option<String>,
+    pub weight_policy: Option<String>,
+    pub weight_protected_roles: Option<String>,
+    pub weight_protected_layers: Option<String>,
+    pub weight_modality_scope: Option<String>,
+    pub weight_payload_format: Option<String>,
+    pub weight_payload_bytes: u64,
+    pub weight_payload_json: Option<String>,
     pub rotation_seed: u32,
     pub artifact_path: Option<String>,
     pub head_dim: u32,
@@ -311,6 +334,21 @@ pub struct GgufTurboQuantConfig {
 impl GgufTurboQuantConfig {
     pub fn source_label(&self) -> &'static str {
         "gguf-embedded"
+    }
+
+    pub fn modality_scope_label(&self) -> &str {
+        self.weight_modality_scope.as_deref().unwrap_or("text-only")
+    }
+
+    pub fn modality_capabilities(&self) -> Vec<&'static str> {
+        match self.modality_scope_label() {
+            "full-multimodal" => vec!["text", "image", "audio"],
+            _ => vec!["text"],
+        }
+    }
+
+    pub fn mmproj_required(&self) -> bool {
+        self.modality_capabilities().len() > 1
     }
 
     pub fn llama_runtime_mode(&self) -> &'static str {
@@ -334,9 +372,9 @@ fn parse_embedded_mode(raw_mode: &str) -> Option<(TurboQuantMode, String, String
             "paper-faithful".to_string(),
             "paper-key-only".to_string(),
         )),
-        "triality-so8-pareto" => Some((
+        "triality-proxy-so8-pareto" | "triality-so8-pareto" => Some((
             TurboQuantMode::ResearchKvSplit,
-            "triality-so8-pareto".to_string(),
+            "triality-proxy-so8-pareto".to_string(),
             "research-kv-split".to_string(),
         )),
         "paper-key-only" => Some((
@@ -351,7 +389,7 @@ fn parse_embedded_mode(raw_mode: &str) -> Option<(TurboQuantMode, String, String
         )),
         "research-kv-split" => Some((
             TurboQuantMode::ResearchKvSplit,
-            "triality-so8-pareto".to_string(),
+            "triality-proxy-so8-pareto".to_string(),
             "research-kv-split".to_string(),
         )),
         _ => None,
@@ -440,7 +478,9 @@ fn parse_turboquant_mode(raw: &str) -> anyhow::Result<TurboQuantMode> {
         "exact" => Ok(TurboQuantMode::Exact),
         "paper-faithful" | "paper-key-only" => Ok(TurboQuantMode::PaperKeyOnly),
         "paper-full-kv" => Ok(TurboQuantMode::PaperFullKv),
-        "triality-so8-pareto" | "research-kv-split" => Ok(TurboQuantMode::ResearchKvSplit),
+        "triality-proxy-so8-pareto" | "triality-so8-pareto" | "research-kv-split" => {
+            Ok(TurboQuantMode::ResearchKvSplit)
+        }
         other => Err(anyhow::anyhow!(
             "Unsupported GGUF TurboQuant mode `{other}`"
         )),
@@ -564,6 +604,33 @@ fn parse_legacy_gguf_turboquant_config(
         payload_json: gguf
             .get_string("hypura.turboquant.payload_json")
             .map(ToOwned::to_owned),
+        weight_enabled: gguf
+            .get_bool("hypura.turboquant.weight.enabled")
+            .unwrap_or(false),
+        weight_source_ftype: gguf
+            .get_string("hypura.turboquant.weight.source_ftype")
+            .map(ToOwned::to_owned),
+        weight_policy: gguf
+            .get_string("hypura.turboquant.weight.policy")
+            .map(ToOwned::to_owned),
+        weight_protected_roles: gguf
+            .get_string("hypura.turboquant.weight.protected_roles")
+            .map(ToOwned::to_owned),
+        weight_protected_layers: gguf
+            .get_string("hypura.turboquant.weight.protected_layers")
+            .map(ToOwned::to_owned),
+        weight_modality_scope: gguf
+            .get_string("hypura.turboquant.weight.modality_scope")
+            .map(ToOwned::to_owned),
+        weight_payload_format: gguf
+            .get_string("hypura.turboquant.weight.payload_format")
+            .map(ToOwned::to_owned),
+        weight_payload_bytes: gguf
+            .get_u64("hypura.turboquant.weight.payload_bytes")
+            .unwrap_or(0),
+        weight_payload_json: gguf
+            .get_string("hypura.turboquant.weight.payload_json")
+            .map(ToOwned::to_owned),
         rotation_seed: gguf.get_u32("hypura.turboquant.rotation_seed").unwrap_or(0),
         artifact_path: gguf
             .get_string("hypura.turboquant.artifact")
@@ -685,6 +752,33 @@ fn parse_strict_gguf_turboquant_config(
         payload_bytes: gguf.get_u64("hypura.turboquant.payload_bytes").unwrap_or(0),
         payload_json: gguf
             .get_string("hypura.turboquant.payload_json")
+            .map(ToOwned::to_owned),
+        weight_enabled: gguf
+            .get_bool("hypura.turboquant.weight.enabled")
+            .unwrap_or(false),
+        weight_source_ftype: gguf
+            .get_string("hypura.turboquant.weight.source_ftype")
+            .map(ToOwned::to_owned),
+        weight_policy: gguf
+            .get_string("hypura.turboquant.weight.policy")
+            .map(ToOwned::to_owned),
+        weight_protected_roles: gguf
+            .get_string("hypura.turboquant.weight.protected_roles")
+            .map(ToOwned::to_owned),
+        weight_protected_layers: gguf
+            .get_string("hypura.turboquant.weight.protected_layers")
+            .map(ToOwned::to_owned),
+        weight_modality_scope: gguf
+            .get_string("hypura.turboquant.weight.modality_scope")
+            .map(ToOwned::to_owned),
+        weight_payload_format: gguf
+            .get_string("hypura.turboquant.weight.payload_format")
+            .map(ToOwned::to_owned),
+        weight_payload_bytes: gguf
+            .get_u64("hypura.turboquant.weight.payload_bytes")
+            .unwrap_or(0),
+        weight_payload_json: gguf
+            .get_string("hypura.turboquant.weight.payload_json")
             .map(ToOwned::to_owned),
         rotation_seed: first_layer.rotation_seed,
         artifact_path: gguf
@@ -1032,14 +1126,14 @@ mod tests {
         let payload_json = serde_json::json!({
             "schema_kind": "triality_gguf_payload",
             "schema_version": 1,
-            "mode": "triality-so8-pareto"
+            "mode": "triality-proxy-so8-pareto"
         })
         .to_string();
         gguf.metadata
             .insert("hypura.turboquant.enabled".into(), GgufValue::Bool(true));
         gguf.metadata.insert(
             "hypura.turboquant.mode".into(),
-            GgufValue::String("triality-so8-pareto".into()),
+            GgufValue::String("triality-proxy-so8-pareto".into()),
         );
         gguf.metadata.insert(
             "hypura.turboquant.schema_version".into(),
@@ -1077,6 +1171,42 @@ mod tests {
             "hypura.turboquant.payload_json".into(),
             GgufValue::String(payload_json),
         );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.enabled".into(),
+            GgufValue::Bool(true),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.source_ftype".into(),
+            GgufValue::String("q8_0".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.policy".into(),
+            GgufValue::String("qwen35-full-attention-ffn".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.protected_roles".into(),
+            GgufValue::String("[\"embedding\",\"norm\",\"output_head\"]".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.protected_layers".into(),
+            GgufValue::String("[0,1,30,31]".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.modality_scope".into(),
+            GgufValue::String("text-only".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.payload_format".into(),
+            GgufValue::String("json-inline-v1".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.payload_bytes".into(),
+            GgufValue::Uint64(32),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.payload_json".into(),
+            GgufValue::String("{\"enabled\":true}".into()),
+        );
 
         let resolved = resolve_turboquant_config(
             Path::new("model.gguf"),
@@ -1091,7 +1221,7 @@ mod tests {
             .gguf_metadata
             .expect("gguf metadata should be attached");
         assert_eq!(gguf_cfg.mode, TurboQuantMode::ResearchKvSplit);
-        assert_eq!(gguf_cfg.public_mode_label, "triality-so8-pareto");
+        assert_eq!(gguf_cfg.public_mode_label, "triality-proxy-so8-pareto");
         assert_eq!(gguf_cfg.runtime_mode, "research-kv-split");
         assert_eq!(gguf_cfg.schema_version, 1);
         assert_eq!(
@@ -1104,6 +1234,47 @@ mod tests {
         assert_eq!(
             gguf_cfg.payload_bytes,
             gguf_cfg.payload_json.as_ref().unwrap().len() as u64
+        );
+        assert!(gguf_cfg.weight_enabled);
+        assert_eq!(gguf_cfg.weight_source_ftype.as_deref(), Some("q8_0"));
+        assert_eq!(
+            gguf_cfg.weight_policy.as_deref(),
+            Some("qwen35-full-attention-ffn")
+        );
+        assert_eq!(gguf_cfg.weight_modality_scope.as_deref(), Some("text-only"));
+    }
+
+    #[test]
+    fn gguf_triality_legacy_alias_still_resolves() {
+        let mut gguf = sample_gguf();
+        gguf.metadata
+            .insert("hypura.turboquant.enabled".into(), GgufValue::Bool(true));
+        gguf.metadata.insert(
+            "hypura.turboquant.mode".into(),
+            GgufValue::String("triality-so8-pareto".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.schema_version".into(),
+            GgufValue::Uint32(1),
+        );
+
+        let resolved = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &sample_metadata(),
+            &gguf,
+            TurboQuantMode::ResearchKvSplit,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.mode, TurboQuantMode::ResearchKvSplit);
+        assert_eq!(
+            resolved
+                .gguf_metadata
+                .as_ref()
+                .expect("gguf metadata should be attached")
+                .public_mode_label,
+            "triality-proxy-so8-pareto"
         );
     }
 

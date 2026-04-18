@@ -939,6 +939,7 @@ version = "0.9.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "byteorder",
  "chrono",
  "clap",

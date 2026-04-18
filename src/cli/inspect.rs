@@ -7,20 +7,20 @@ use hypura::model::{
 
 use super::fmt_util::{format_bytes, format_params};
 
-pub fn run(model_path: &str, show_tensors: bool) -> anyhow::Result<()> {
+pub fn run(model_path: &str, mmproj_path: Option<&str>, show_tensors: bool) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     anyhow::ensure!(path.exists(), "Model file not found: {model_path}");
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
-        "gguf" => inspect_gguf(path, show_tensors),
+        "gguf" => inspect_gguf(path, mmproj_path, show_tensors),
         "safetensors" => anyhow::bail!("Safetensors inspect not yet implemented"),
         _ => anyhow::bail!("Unsupported model format: .{ext}"),
     }
 }
 
-fn inspect_gguf(path: &Path, show_tensors: bool) -> anyhow::Result<()> {
+fn inspect_gguf(path: &Path, mmproj_path: Option<&str>, show_tensors: bool) -> anyhow::Result<()> {
     let gguf = GgufFile::open(path)?;
     let metadata = ModelMetadata::from_gguf(&gguf)?;
 
@@ -82,6 +82,47 @@ fn inspect_gguf(path: &Path, show_tensors: bool) -> anyhow::Result<()> {
                 "no"
             }
         );
+        println!(
+            "    Weight plan: enabled={} source_ftype={} policy={} modality_scope={}",
+            tq.weight_enabled,
+            tq.weight_source_ftype.as_deref().unwrap_or("none"),
+            tq.weight_policy.as_deref().unwrap_or("none"),
+            tq.weight_modality_scope.as_deref().unwrap_or("none"),
+        );
+        println!(
+            "    Weight protection: roles={} layers={}",
+            tq.weight_protected_roles.as_deref().unwrap_or("[]"),
+            tq.weight_protected_layers.as_deref().unwrap_or("[]"),
+        );
+        println!(
+            "    Weight payload: format={} bytes={} inline_json={}",
+            tq.weight_payload_format.as_deref().unwrap_or("none"),
+            tq.weight_payload_bytes,
+            if tq.weight_payload_json.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "    mmproj required: {}",
+            tq.mmproj_required()
+        );
+        println!(
+            "    Multimodal capabilities: {}",
+            tq.modality_capabilities().join(",")
+        );
+        println!(
+            "    mmproj path: {}",
+            mmproj_path.unwrap_or("(not provided)")
+        );
+        if let Some(mmproj) = mmproj_path {
+            let mmproj_file = Path::new(mmproj);
+            println!(
+                "    mmproj exists: {}",
+                if mmproj_file.is_file() { "yes" } else { "no" }
+            );
+        }
     }
 
     if show_tensors {

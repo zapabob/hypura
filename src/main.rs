@@ -32,6 +32,9 @@ enum Commands {
     Run {
         /// Path to model file
         model: String,
+        /// Required mmproj GGUF companion for multimodal models
+        #[arg(long)]
+        mmproj: Option<String>,
         /// Maximum context length
         #[arg(long, default_value = "4096")]
         context: u32,
@@ -44,6 +47,12 @@ enum Commands {
         /// Maximum tokens to generate
         #[arg(long, default_value = "512")]
         max_tokens: u32,
+        /// One or more image inputs for multimodal generation
+        #[arg(long)]
+        image: Vec<String>,
+        /// One or more audio inputs for multimodal generation
+        #[arg(long)]
+        audio: Vec<String>,
         /// TurboQuant runtime mode
         #[arg(long, value_enum, default_value_t = TurboQuantMode::ResearchKvSplit)]
         turboquant_mode: TurboQuantMode,
@@ -67,6 +76,9 @@ enum Commands {
     Serve {
         /// Path to model file
         model: String,
+        /// Required mmproj GGUF companion for multimodal models
+        #[arg(long)]
+        mmproj: Option<String>,
         /// Host to bind to
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -264,6 +276,9 @@ enum Commands {
     Inspect {
         /// Path to model file
         model: String,
+        /// Optional mmproj GGUF companion to validate paired-artifact wiring
+        #[arg(long)]
+        mmproj: Option<String>,
         /// Show individual tensor details
         #[arg(long)]
         tensors: bool,
@@ -298,10 +313,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Estimate { model } => cli::estimate::run(&model),
         Commands::Run {
             model,
+            mmproj,
             context,
             prompt,
             interactive,
             max_tokens,
+            image,
+            audio,
             turboquant_mode,
             turboquant_config,
             rotation_policy,
@@ -310,10 +328,13 @@ fn main() -> anyhow::Result<()> {
             host_pinned,
         } => cli::run::run(
             &model,
+            mmproj.as_deref(),
             context,
             prompt.as_deref(),
             interactive,
             max_tokens,
+            &image,
+            &audio,
             turboquant_mode,
             turboquant_config.as_deref(),
             rotation_policy,
@@ -323,6 +344,7 @@ fn main() -> anyhow::Result<()> {
         ),
         Commands::Serve {
             model,
+            mmproj,
             host,
             port,
             context,
@@ -343,6 +365,7 @@ fn main() -> anyhow::Result<()> {
             host_pinned,
         } => cli::serve::run(
             &model,
+            mmproj.as_deref(),
             &host,
             port,
             context,
@@ -461,7 +484,11 @@ fn main() -> anyhow::Result<()> {
             residency_profile,
             host_pinned,
         ),
-        Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
+        Commands::Inspect {
+            model,
+            mmproj,
+            tensors,
+        } => cli::inspect::run(&model, mmproj.as_deref(), tensors),
         Commands::Iobench { model, read_gb } => cli::iobench::run(&model, read_gb),
         Commands::Optimize { model } => cli::optimize::run(&model),
     }

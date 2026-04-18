@@ -209,6 +209,7 @@ pub(crate) fn build_runtime_launcher_profile(
 
 pub fn run(
     model_path: &str,
+    mmproj_path: Option<&str>,
     host: &str,
     port: u16,
     context: u32,
@@ -249,6 +250,7 @@ pub fn run(
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
         model_path,
+        mmproj_path,
         host,
         port,
         context,
@@ -317,6 +319,7 @@ pub fn run_worker_bootstrap(bootstrap_file: &str) -> anyhow::Result<()> {
 }
 async fn run_async(
     model_path: &str,
+    mmproj_path: Option<&str>,
     host: &str,
     port: u16,
     context: u32,
@@ -508,7 +511,35 @@ async fn run_async(
                     "no"
                 }
             );
+            println!(
+                "  Triality weight: enabled={}, source_ftype={}, policy={}, modality_scope={}",
+                gguf_cfg.weight_enabled,
+                gguf_cfg.weight_source_ftype.as_deref().unwrap_or("none"),
+                gguf_cfg.weight_policy.as_deref().unwrap_or("none"),
+                gguf_cfg.weight_modality_scope.as_deref().unwrap_or("none"),
+            );
+            println!(
+                "  Triality protection: roles={}, layers={}",
+                gguf_cfg.weight_protected_roles.as_deref().unwrap_or("[]"),
+                gguf_cfg.weight_protected_layers.as_deref().unwrap_or("[]"),
+            );
+            println!(
+                "  Triality weight payload: format={}, bytes={}, inline_json={}",
+                gguf_cfg.weight_payload_format.as_deref().unwrap_or("none"),
+                gguf_cfg.weight_payload_bytes,
+                if gguf_cfg.weight_payload_json.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            println!(
+                "  Triality multimodal: mmproj_required={}, capabilities={}",
+                gguf_cfg.mmproj_required(),
+                gguf_cfg.modality_capabilities().join(","),
+            );
         }
+        println!("  mmproj path: {}", mmproj_path.unwrap_or("(not provided)"));
         if let Some(storage) = compat_storage.as_ref() {
             println!(
                 "  Compat storage: {}",
@@ -605,6 +636,19 @@ async fn run_async(
 
     let serve_turboquant_config_path = turboquant_config.map(|s| std::path::PathBuf::from(s));
     let compat_default_max_length_value = compat_default_max_length(256, context);
+    let multimodal_capabilities = runtime
+        .turboquant
+        .modality_capabilities()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mmproj_required = runtime.turboquant.mmproj_required();
+    let has_image_capability = multimodal_capabilities
+        .iter()
+        .any(|capability| capability == "image");
+    let has_audio_capability = multimodal_capabilities
+        .iter()
+        .any(|capability| capability == "audio");
     let compat_feature_defaults = CompatFeatureFlags {
         savedata: compat_storage
             .as_ref()
@@ -619,6 +663,10 @@ async fn run_async(
         } else {
             0
         },
+        websearch: true,
+        embeddings: true,
+        vision: has_image_capability,
+        transcribe: has_audio_capability,
         ..CompatFeatureFlags::default()
     };
     let compat_features = if compat_mode_enabled() {
@@ -649,6 +697,9 @@ async fn run_async(
             .map(std::path::PathBuf::from)
             .or_else(|| path.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        mmproj_path: mmproj_path.map(std::path::PathBuf::from),
+        mmproj_required,
+        multimodal_capabilities,
         default_context: Arc::new(AtomicU32::new(context)),
         load_duration_ns,
         telemetry,
@@ -767,7 +818,35 @@ async fn run_async(
                 "no"
             }
         );
+        println!(
+            "  Triality weight: enabled={}, source_ftype={}, policy={}, modality_scope={}",
+            gguf_cfg.weight_enabled,
+            gguf_cfg.weight_source_ftype.as_deref().unwrap_or("none"),
+            gguf_cfg.weight_policy.as_deref().unwrap_or("none"),
+            gguf_cfg.weight_modality_scope.as_deref().unwrap_or("none"),
+        );
+        println!(
+            "  Triality protection: roles={}, layers={}",
+            gguf_cfg.weight_protected_roles.as_deref().unwrap_or("[]"),
+            gguf_cfg.weight_protected_layers.as_deref().unwrap_or("[]"),
+        );
+        println!(
+            "  Triality weight payload: format={}, bytes={}, inline_json={}",
+            gguf_cfg.weight_payload_format.as_deref().unwrap_or("none"),
+            gguf_cfg.weight_payload_bytes,
+            if gguf_cfg.weight_payload_json.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  Triality multimodal: mmproj_required={}, capabilities={}",
+            gguf_cfg.mmproj_required(),
+            gguf_cfg.modality_capabilities().join(","),
+        );
     }
+    println!("  mmproj path: {}", mmproj_path.unwrap_or("(not provided)"));
     println!(
         "  Placement: {} GPU | {} host pageable | {} host pinned | {} NVMe",
         format_bytes(runtime.placement_summary.total_gpu_bytes),
