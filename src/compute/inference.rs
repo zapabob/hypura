@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,19 +9,19 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::cache::kv_codec::{build_kv_codec, KvCodec};
+use crate::cache::kv_codec::{KvCodec, build_kv_codec};
 use crate::cache::kv_codec_ffi::KvCodecRuntimeBridge;
 use crate::compute::ffi::*;
 use crate::compute::nvme_backend::{
-    build_override_patterns, eval_callback, HypuraBuftController, LayerStatus, PrefetchState,
+    HypuraBuftController, LayerStatus, PrefetchState, build_override_patterns, eval_callback,
 };
 use crate::io::compat;
 use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 use crate::model::tensor_role::TensorRole;
 use crate::model::turboquant_sidecar::{
-    resolve_turboquant_config, GgufTurboQuantConfig, ResolvedTurboQuantConfig, RotationPolicy,
-    TurboQuantMode,
+    GgufTurboQuantConfig, ResolvedTurboQuantConfig, RotationPolicy, TurboQuantMode,
+    resolve_turboquant_config,
 };
 use crate::profiler;
 use crate::profiler::types::HardwareProfile;
@@ -781,6 +781,14 @@ fn build_turboquant_runtime_session(
         return Ok(None);
     };
 
+    if should_delegate_turboquant_runtime_to_llama(turboquant) {
+        tracing::info!(
+            "TurboQuant runtime delegated to llama.cpp embedded GGUF bridge (mode={})",
+            turboquant.mode
+        );
+        return Ok(None);
+    }
+
     let runtime_path = match env::var("HYPURA_TURBOQUANT_RUNTIME")
         .unwrap_or_else(|_| "rust".to_string())
         .to_ascii_lowercase()
@@ -811,6 +819,10 @@ fn build_turboquant_runtime_session(
         runtime_path,
         codec,
     ))))
+}
+
+fn should_delegate_turboquant_runtime_to_llama(turboquant: &ResolvedTurboQuantConfig) -> bool {
+    turboquant.mode != TurboQuantMode::Exact && turboquant.gguf_metadata.is_some()
 }
 
 fn validate_turboquant_runtime_mode(turboquant: &ResolvedTurboQuantConfig) -> anyhow::Result<()> {
@@ -1326,7 +1338,10 @@ pub fn compute_gpu_budget(
         .saturating_sub(runtime_overhead)
 }
 
-fn tensor_backing_residence(plan: &PlacementPlan, tensor: &crate::model::gguf::TensorInfo) -> TensorResidence {
+fn tensor_backing_residence(
+    plan: &PlacementPlan,
+    tensor: &crate::model::gguf::TensorInfo,
+) -> TensorResidence {
     let role = TensorRole::from_name(&tensor.name);
     let placement = plan
         .placement_for(&tensor.name)
@@ -2259,22 +2274,14 @@ fn total_physical_memory() -> u64 {
             );
             size
         };
-        if total == 0 {
-            32 * (1 << 30)
-        } else {
-            total
-        }
+        if total == 0 { 32 * (1 << 30) } else { total }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total = sys.total_memory();
-        if total == 0 {
-            16 * (1 << 30)
-        } else {
-            total
-        }
+        if total == 0 { 16 * (1 << 30) } else { total }
     }
 }
 
@@ -2305,6 +2312,9 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::model::gguf::{GgmlType, TensorInfo};
+    use crate::model::turboquant_sidecar::{
+        GgufTurboQuantConfig, ResolvedTurboQuantConfig, TurboQuantMode,
+    };
 
     fn make_gguf(layers: u32, tensors_per_layer: u32) -> GgufFile {
         let mut tensors = Vec::new();
@@ -2335,11 +2345,7 @@ mod tests {
             .map(|(name, residence)| {
                 (
                     name,
-                    TensorPlacement::new(
-                        residence,
-                        ComputeTarget::Gpu,
-                        PrefetchPriority::Warm,
-                    ),
+                    TensorPlacement::new(residence, ComputeTarget::Gpu, PrefetchPriority::Warm),
                 )
             })
             .collect();
@@ -2455,5 +2461,53 @@ mod tests {
         assert_eq!(tensor_vector_range(shape, 1, 0, 0), 4..8);
         assert_eq!(tensor_vector_range(shape, 0, 1, 0), 8..12);
         assert_eq!(tensor_vector_range(shape, 0, 0, 1), 24..28);
+    }
+
+    #[test]
+    fn gguf_embedded_turboquant_delegates_to_llama_runtime() {
+        let resolved = ResolvedTurboQuantConfig {
+            mode: TurboQuantMode::ResearchKvSplit,
+            schema_kind: None,
+            source_path: None,
+            config: None,
+            gguf_metadata: Some(GgufTurboQuantConfig {
+                enabled: true,
+                schema_version: 1,
+                mode: TurboQuantMode::ResearchKvSplit,
+                public_mode_label: "triality-proxy-so8-pareto".into(),
+                runtime_mode: "research-kv-split".into(),
+                rotation_policy: None,
+                triality_view: Some("vector".into()),
+                triality_mode: Some("triality_proxy".into()),
+                triality_mix: None,
+                paper_fidelity: false,
+                k_bits: 3.5,
+                v_bits: 16.0,
+                payload_format: Some("json-inline-v1".into()),
+                payload_bytes: 128,
+                payload_json: Some("{}".into()),
+                rotation_seed: 7,
+                artifact_path: None,
+                head_dim: 256,
+                num_layers: 32,
+                num_kv_heads: 4,
+                layers: Vec::new(),
+            }),
+        };
+
+        assert!(should_delegate_turboquant_runtime_to_llama(&resolved));
+    }
+
+    #[test]
+    fn sidecar_turboquant_keeps_hypura_runtime() {
+        let resolved = ResolvedTurboQuantConfig {
+            mode: TurboQuantMode::ResearchKvSplit,
+            schema_kind: None,
+            source_path: Some("triality.json".into()),
+            config: None,
+            gguf_metadata: None,
+        };
+
+        assert!(!should_delegate_turboquant_runtime_to_llama(&resolved));
     }
 }

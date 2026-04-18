@@ -334,9 +334,9 @@ fn parse_embedded_mode(raw_mode: &str) -> Option<(TurboQuantMode, String, String
             "paper-faithful".to_string(),
             "paper-key-only".to_string(),
         )),
-        "triality-so8-pareto" => Some((
+        "triality-proxy-so8-pareto" | "triality-so8-pareto" => Some((
             TurboQuantMode::ResearchKvSplit,
-            "triality-so8-pareto".to_string(),
+            "triality-proxy-so8-pareto".to_string(),
             "research-kv-split".to_string(),
         )),
         "paper-key-only" => Some((
@@ -351,7 +351,7 @@ fn parse_embedded_mode(raw_mode: &str) -> Option<(TurboQuantMode, String, String
         )),
         "research-kv-split" => Some((
             TurboQuantMode::ResearchKvSplit,
-            "triality-so8-pareto".to_string(),
+            "triality-proxy-so8-pareto".to_string(),
             "research-kv-split".to_string(),
         )),
         _ => None,
@@ -440,7 +440,9 @@ fn parse_turboquant_mode(raw: &str) -> anyhow::Result<TurboQuantMode> {
         "exact" => Ok(TurboQuantMode::Exact),
         "paper-faithful" | "paper-key-only" => Ok(TurboQuantMode::PaperKeyOnly),
         "paper-full-kv" => Ok(TurboQuantMode::PaperFullKv),
-        "triality-so8-pareto" | "research-kv-split" => Ok(TurboQuantMode::ResearchKvSplit),
+        "triality-proxy-so8-pareto" | "triality-so8-pareto" | "research-kv-split" => {
+            Ok(TurboQuantMode::ResearchKvSplit)
+        }
         other => Err(anyhow::anyhow!(
             "Unsupported GGUF TurboQuant mode `{other}`"
         )),
@@ -510,9 +512,9 @@ fn parse_legacy_gguf_turboquant_config(
         return Ok(None);
     }
 
-    let raw_mode = gguf
-        .get_string("hypura.turboquant.mode")
-        .ok_or_else(|| anyhow::anyhow!("Legacy GGUF TurboQuant metadata is missing `hypura.turboquant.mode`"))?;
+    let raw_mode = gguf.get_string("hypura.turboquant.mode").ok_or_else(|| {
+        anyhow::anyhow!("Legacy GGUF TurboQuant metadata is missing `hypura.turboquant.mode`")
+    })?;
     let mode = parse_turboquant_mode(raw_mode)?;
     let (public_mode_label, default_runtime_mode) = parse_embedded_mode(raw_mode)
         .map(|(_, public, runtime)| (public, runtime))
@@ -580,7 +582,10 @@ fn parse_strict_gguf_turboquant_config(
     metadata: &ModelMetadata,
     schema_version: u32,
 ) -> anyhow::Result<GgufTurboQuantConfig> {
-    let expected_len = metadata.num_layers as usize;
+    let expected_len = gguf
+        .get_f32_array("tq_total_bits")
+        .map(|values| values.len())
+        .unwrap_or(metadata.num_layers as usize);
     anyhow::ensure!(
         expected_len > 0,
         "GGUF TurboQuant metadata requires a non-zero layer count"
@@ -609,12 +614,13 @@ fn parse_strict_gguf_turboquant_config(
             (stage1_effective_bits[i] + qjl_bits[i] as f32 - runtime_bits[i]).abs() <= 1e-6,
             "GGUF TurboQuant metadata layer {i} is inconsistent: tq_stage1_effective_bits + tq_qjl_bits != tq_runtime_bits_per_channel"
         );
-        let parsed_rotation_policy = RotationPolicy::from_str(&rotation_policy[i]).ok_or_else(|| {
-            anyhow::anyhow!(
-                "GGUF TurboQuant metadata layer {i} has unsupported tq_rotation_policy `{}`",
-                rotation_policy[i]
-            )
-        })?;
+        let parsed_rotation_policy =
+            RotationPolicy::from_str(&rotation_policy[i]).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GGUF TurboQuant metadata layer {i} has unsupported tq_rotation_policy `{}`",
+                    rotation_policy[i]
+                )
+            })?;
         layers.push(GgufTurboQuantLayerConfig {
             total_bits: total_bits[i],
             runtime_bits_per_channel: runtime_bits[i],
@@ -1240,11 +1246,127 @@ mod tests {
             .expect("strict gguf metadata should be attached");
         assert_eq!(gguf_cfg.schema_version, 1);
         assert_eq!(gguf_cfg.mode, TurboQuantMode::ResearchKvSplit);
-        assert_eq!(gguf_cfg.rotation_policy, Some(RotationPolicy::TrialityVector));
+        assert_eq!(
+            gguf_cfg.rotation_policy,
+            Some(RotationPolicy::TrialityVector)
+        );
         assert_eq!(gguf_cfg.triality_mode.as_deref(), Some("triality_proxy"));
         assert_eq!(gguf_cfg.triality_view.as_deref(), Some("vector"));
         assert_eq!(gguf_cfg.layers.len(), 2);
         assert_eq!(gguf_cfg.layers[0].qjl_dim, 128);
         assert_eq!(gguf_cfg.layers[1].sign_pack_format, "int8_unpacked_binary");
+    }
+
+    #[test]
+    fn resolves_sparse_strict_gguf_turboquant_metadata() {
+        let mut gguf = GgufFile {
+            version: 3,
+            metadata: Default::default(),
+            tensors: Vec::new(),
+            data_offset: 0,
+        };
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufValue::String("qwen35".into()),
+        );
+        gguf.metadata
+            .insert("tq_schema_version".into(), GgufValue::Uint32(1));
+        gguf.metadata.insert(
+            "tq_total_bits".into(),
+            array(vec![GgufValue::Float32(3.5), GgufValue::Float32(3.5)]),
+        );
+        gguf.metadata.insert(
+            "tq_runtime_bits_per_channel".into(),
+            array(vec![GgufValue::Float32(3.0), GgufValue::Float32(3.0)]),
+        );
+        gguf.metadata.insert(
+            "tq_stage1_effective_bits".into(),
+            array(vec![GgufValue::Float32(2.0), GgufValue::Float32(2.0)]),
+        );
+        gguf.metadata.insert(
+            "tq_qjl_bits".into(),
+            array(vec![GgufValue::Uint32(1), GgufValue::Uint32(1)]),
+        );
+        gguf.metadata.insert(
+            "tq_qjl_dim".into(),
+            array(vec![GgufValue::Uint32(128), GgufValue::Uint32(128)]),
+        );
+        gguf.metadata.insert(
+            "tq_rotation_policy".into(),
+            array(vec![
+                GgufValue::String("block_so8_learned".into()),
+                GgufValue::String("block_so8_learned".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_rotation_seed".into(),
+            array(vec![GgufValue::Uint32(7), GgufValue::Uint32(9)]),
+        );
+        gguf.metadata.insert(
+            "tq_qjl_seed".into(),
+            array(vec![GgufValue::Uint32(1), GgufValue::Uint32(1)]),
+        );
+        gguf.metadata.insert(
+            "tq_triality_mode".into(),
+            array(vec![
+                GgufValue::String("triality_proxy".into()),
+                GgufValue::String("triality_proxy".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_triality_view".into(),
+            array(vec![
+                GgufValue::String("vector".into()),
+                GgufValue::String("vector".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_stage1_allocation_scheme".into(),
+            array(vec![
+                GgufValue::String("magnitude-topk".into()),
+                GgufValue::String("magnitude-topk".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_stage1_bitwidth_payload_dtype".into(),
+            array(vec![
+                GgufValue::String("uint8".into()),
+                GgufValue::String("uint8".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_norm_dtype".into(),
+            array(vec![
+                GgufValue::String("float32".into()),
+                GgufValue::String("float32".into()),
+            ]),
+        );
+        gguf.metadata.insert(
+            "tq_sign_pack_format".into(),
+            array(vec![
+                GgufValue::String("int8_unpacked_binary".into()),
+                GgufValue::String("int8_unpacked_binary".into()),
+            ]),
+        );
+
+        let mut metadata = sample_metadata();
+        metadata.num_layers = 4;
+
+        let resolved = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &metadata,
+            &gguf,
+            TurboQuantMode::ResearchKvSplit,
+            None,
+        )
+        .unwrap();
+
+        let gguf_cfg = resolved
+            .gguf_metadata
+            .expect("sparse strict gguf metadata should be attached");
+        assert_eq!(gguf_cfg.num_layers, 4);
+        assert_eq!(gguf_cfg.layers.len(), 2);
+        assert_eq!(gguf_cfg.layers[0].rotation_seed, 7);
+        assert_eq!(gguf_cfg.layers[1].rotation_seed, 9);
     }
 }
