@@ -1092,6 +1092,14 @@ fn build_turboquant_runtime_session(
         return Ok(None);
     };
 
+    if should_delegate_turboquant_runtime_to_llama(turboquant) {
+        tracing::info!(
+            "TurboQuant runtime delegated to llama.cpp embedded GGUF bridge (mode={})",
+            turboquant.mode
+        );
+        return Ok(None);
+    }
+
     let runtime_path = match env::var("HYPURA_TURBOQUANT_RUNTIME")
         .unwrap_or_else(|_| "rust".to_string())
         .to_ascii_lowercase()
@@ -1122,6 +1130,10 @@ fn build_turboquant_runtime_session(
         runtime_path,
         codec,
     ))))
+}
+
+fn should_delegate_turboquant_runtime_to_llama(turboquant: &ResolvedTurboQuantConfig) -> bool {
+    turboquant.mode != TurboQuantMode::Exact && turboquant.gguf_metadata.is_some()
 }
 
 fn validate_turboquant_runtime_mode(turboquant: &ResolvedTurboQuantConfig) -> anyhow::Result<()> {
@@ -2648,6 +2660,9 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::model::gguf::{GgmlType, TensorInfo};
+    use crate::model::turboquant_sidecar::{
+        GgufTurboQuantConfig, ResolvedTurboQuantConfig, TurboQuantMode,
+    };
 
     fn make_gguf(layers: u32, tensors_per_layer: u32) -> GgufFile {
         let mut tensors = Vec::new();
@@ -2797,6 +2812,51 @@ mod tests {
     }
 
     #[test]
+    fn gguf_embedded_turboquant_delegates_to_llama_runtime() {
+        let resolved = ResolvedTurboQuantConfig {
+            mode: TurboQuantMode::ResearchKvSplit,
+            schema_kind: None,
+            source_path: None,
+            config: None,
+            gguf_metadata: Some(GgufTurboQuantConfig {
+                enabled: true,
+                schema_version: 1,
+                mode: TurboQuantMode::ResearchKvSplit,
+                public_mode_label: "triality-proxy-so8-pareto".into(),
+                runtime_mode: "research-kv-split".into(),
+                rotation_policy: None,
+                triality_view: Some("vector".into()),
+                triality_mode: Some("triality_proxy".into()),
+                triality_mix: None,
+                paper_fidelity: false,
+                k_bits: 3.5,
+                v_bits: 16.0,
+                payload_format: Some("json-inline-v1".into()),
+                payload_bytes: 128,
+                payload_json: Some("{}".into()),
+                rotation_seed: 7,
+                artifact_path: None,
+                head_dim: 256,
+                num_layers: 32,
+                num_kv_heads: 4,
+                layers: Vec::new(),
+            }),
+        };
+
+        assert!(should_delegate_turboquant_runtime_to_llama(&resolved));
+    }
+
+    #[test]
+    fn sidecar_turboquant_keeps_hypura_runtime() {
+        let resolved = ResolvedTurboQuantConfig {
+            mode: TurboQuantMode::ResearchKvSplit,
+            schema_kind: None,
+            source_path: Some("triality.json".into()),
+            config: None,
+            gguf_metadata: None,
+        };
+
+        assert!(!should_delegate_turboquant_runtime_to_llama(&resolved));
     fn restored_prefix_len_requires_matching_prefix_and_state_bytes() {
         let snapshot = ContextStateSnapshot {
             token_ids: vec![1, 2, 3],
