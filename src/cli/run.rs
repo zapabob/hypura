@@ -24,6 +24,7 @@ pub fn run(
     rotation_seed: u32,
     residency_profile: ResidencyProfile,
     host_pinned: HostPinnedPolicy,
+    tq_allow_exact_fallback: bool,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
@@ -38,6 +39,7 @@ pub fn run(
         rotation_seed,
         residency_profile,
         host_pinned,
+        tq_allow_exact_fallback,
     ))
 }
 
@@ -53,6 +55,7 @@ async fn run_async(
     rotation_seed: u32,
     residency_profile: ResidencyProfile,
     host_pinned: HostPinnedPolicy,
+    tq_allow_exact_fallback: bool,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     let llama_bridge = LlamaTurboquantCliBridge {
@@ -67,6 +70,7 @@ async fn run_async(
         turboquant_config.map(Path::new),
         llama_bridge,
         ResidencyPolicyConfig::new(residency_profile, host_pinned),
+        tq_allow_exact_fallback,
     )?;
 
     let has_nvme = runtime.placement_summary.total_nvme_bytes > 0;
@@ -96,6 +100,21 @@ async fn run_async(
             "faithful-attached"
         }
     );
+    if let Some(weight) = runtime
+        .turboquant
+        .gguf_metadata
+        .as_ref()
+        .and_then(|cfg| cfg.weight.as_ref())
+    {
+        println!(
+            "  Weight contract: codec={} policy={} status={} payload_valid={} tensor_plan_entries={}",
+            weight.codec.as_deref().unwrap_or("none"),
+            weight.policy.as_deref().unwrap_or("none"),
+            weight.runtime_status(),
+            weight.payload_valid,
+            weight.tensor_plan_entries,
+        );
+    }
 
     print_placement_header(
         &runtime.placement_summary,

@@ -1135,10 +1135,15 @@ pub fn summarize_placement(
         layers_in_host_pinned: 0,
         layers_in_host_pageable: 0,
         layers_on_nvme: 0,
+        total_file_bytes: 0,
+        total_resident_bytes: 0,
+        total_staging_bytes: 0,
         total_gpu_bytes: 0,
         total_host_pinned_bytes: 0,
         total_host_pageable_bytes: 0,
         total_nvme_bytes: 0,
+        estimated_dequant_cost_us: 0.0,
+        estimated_matmul_cost_us: 0.0,
         host_pinned_active: false,
         host_pinned_budget_bytes,
     };
@@ -1149,6 +1154,28 @@ pub fn summarize_placement(
     let mut pageable_layers = std::collections::HashSet::new();
     let mut nvme_layers = std::collections::HashSet::new();
 
+    let estimate_dequant_cost_us = |size_bytes: u64, residence: TensorResidence| -> f64 {
+        let bytes_per_us = match residence {
+            TensorResidence::GpuResident => return 0.0,
+            TensorResidence::HostPinned => 24_000.0,
+            TensorResidence::HostPageable => 18_000.0,
+            TensorResidence::NvmeBacked => 12_000.0,
+        };
+        size_bytes as f64 / bytes_per_us
+    };
+    let estimate_matmul_cost_us = |size_bytes: u64, role: &TensorRole| -> f64 {
+        let bytes_per_us = match role {
+            TensorRole::AttentionQuery
+            | TensorRole::AttentionKey
+            | TensorRole::AttentionValue
+            | TensorRole::AttentionOutput => 80_000.0,
+            TensorRole::FfnGate | TensorRole::FfnUp | TensorRole::FfnDown => 64_000.0,
+            TensorRole::MoeFusedExperts => 52_000.0,
+            _ => 96_000.0,
+        };
+        size_bytes as f64 / bytes_per_us
+    };
+
     for t in tensors {
         let role = TensorRole::from_name(&t.name);
         let placement = assignments
@@ -1157,6 +1184,18 @@ pub fn summarize_placement(
             .unwrap_or_else(|| TensorPlacement::nvme_backed(PrefetchPriority::Warm));
         summary.host_pinned_active |= placement.residence == TensorResidence::HostPinned;
         let residence = backing_residence(&placement, &role, inference_mode);
+        summary.total_file_bytes += t.size_bytes;
+        if residence != TensorResidence::NvmeBacked {
+            summary.total_resident_bytes += t.size_bytes;
+        }
+        if matches!(
+            residence,
+            TensorResidence::HostPinned | TensorResidence::HostPageable | TensorResidence::NvmeBacked
+        ) {
+            summary.total_staging_bytes += t.size_bytes;
+        }
+        summary.estimated_dequant_cost_us += estimate_dequant_cost_us(t.size_bytes, residence);
+        summary.estimated_matmul_cost_us += estimate_matmul_cost_us(t.size_bytes, &role);
 
         match residence {
             TensorResidence::GpuResident => {

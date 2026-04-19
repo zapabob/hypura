@@ -6,7 +6,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Instant;
 
 use hypura::compute::inference::{self, LlamaTurboquantCliBridge};
-use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
+use hypura::model::{
+    gguf::GgufFile,
+    metadata::ModelMetadata,
+    turboquant_sidecar::{RotationPolicy, TurboQuantMode, read_gguf_turboquant_config},
+};
 use hypura::scheduler::types::{HostPinnedPolicy, ResidencyPolicyConfig, ResidencyProfile};
 use hypura::server::compat::{CompatFeatureFlags, CompatPerfState};
 use hypura::server::compat_storage::{
@@ -227,6 +231,7 @@ pub fn run(
     dry_run: bool,
     residency_profile: ResidencyProfile,
     host_pinned: HostPinnedPolicy,
+    tq_allow_exact_fallback: bool,
     savedatafile: Option<&str>,
     preloadstory: Option<&str>,
     admindir: Option<&str>,
@@ -259,6 +264,7 @@ pub fn run(
         ui_theme,
         dry_run,
         ResidencyPolicyConfig::new(residency_profile, host_pinned),
+        tq_allow_exact_fallback,
         savedatafile,
         preloadstory,
         admindir,
@@ -307,6 +313,7 @@ pub fn run_worker_bootstrap(bootstrap_file: &str) -> anyhow::Result<()> {
         false,
         bootstrap.residency_profile,
         bootstrap.host_pinned,
+        false,
         bootstrap.savedatafile.as_deref(),
         bootstrap.preloadstory.as_deref(),
         bootstrap.admindir.as_deref(),
@@ -327,6 +334,7 @@ async fn run_async(
     ui_theme: &str,
     dry_run: bool,
     residency_policy: ResidencyPolicyConfig,
+    tq_allow_exact_fallback: bool,
     savedatafile: Option<&str>,
     preloadstory: Option<&str>,
     admindir: Option<&str>,
@@ -335,6 +343,11 @@ async fn run_async(
     migration_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
+    let embedded_turboquant = {
+        let gguf = GgufFile::open(path)?;
+        let metadata = ModelMetadata::from_gguf(&gguf)?;
+        read_gguf_turboquant_config(&gguf, &metadata)?
+    };
     let seed_config = if compat_mode_enabled() {
         config
             .map(|path| load_json_object(Path::new(path)))
@@ -383,6 +396,7 @@ async fn run_async(
         turboquant_config.map(Path::new),
         llama_bridge.clone(),
         residency_policy,
+        tq_allow_exact_fallback,
     )?;
     if cli_progress_enabled() {
         pb_setup.finish_and_clear();
@@ -455,6 +469,14 @@ async fn run_async(
             format_bytes(runtime.placement_summary.total_nvme_bytes),
         );
         println!(
+            "  Placement accounting: file={} resident={} staging={} dequant_us={:.1} matmul_us={:.1}",
+            format_bytes(runtime.placement_summary.total_file_bytes),
+            format_bytes(runtime.placement_summary.total_resident_bytes),
+            format_bytes(runtime.placement_summary.total_staging_bytes),
+            runtime.placement_summary.estimated_dequant_cost_us,
+            runtime.placement_summary.estimated_matmul_cost_us,
+        );
+        println!(
             "  Residency: mode={}, pinned_tier={}, pinned_policy={}, n_gpu_layers={}",
             runtime.plan.residency_policy.residency_profile.label(),
             if runtime.placement_summary.host_pinned_active {
@@ -480,7 +502,12 @@ async fn run_async(
                 "faithful-attached"
             }
         );
-        if let Some(ref gguf_cfg) = runtime.turboquant.gguf_metadata {
+        let reported_gguf_cfg = runtime
+            .turboquant
+            .gguf_metadata
+            .as_ref()
+            .or(embedded_turboquant.as_ref());
+        if let Some(gguf_cfg) = reported_gguf_cfg {
             println!(
                 "  Triality profile: public_mode={}, runtime_mode={}, schema_version={}",
                 gguf_cfg.public_mode_label, gguf_cfg.runtime_mode, gguf_cfg.schema_version
@@ -508,6 +535,16 @@ async fn run_async(
                     "no"
                 }
             );
+            if let Some(weight) = gguf_cfg.weight.as_ref() {
+                println!(
+                    "  Weight contract: codec={} policy={} status={} payload_valid={} tensor_plan_entries={}",
+                    weight.codec.as_deref().unwrap_or("none"),
+                    weight.policy.as_deref().unwrap_or("none"),
+                    weight.runtime_status(),
+                    weight.payload_valid,
+                    weight.tensor_plan_entries,
+                );
+            }
         }
         if let Some(storage) = compat_storage.as_ref() {
             println!(
@@ -657,6 +694,7 @@ async fn run_async(
         serve_turboquant_config_path,
         serve_llama_bridge: llama_bridge,
         serve_residency_policy: residency_policy.normalized(),
+        serve_tq_allow_exact_fallback: tq_allow_exact_fallback,
         active_cancel: Arc::new(std::sync::Mutex::new(None)),
         generation_in_progress: Arc::new(AtomicBool::new(false)),
         gui_presets: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -739,7 +777,12 @@ async fn run_async(
             "faithful-attached"
         }
     );
-    if let Some(ref gguf_cfg) = state.turboquant.gguf_metadata {
+    let reported_gguf_cfg = state
+        .turboquant
+        .gguf_metadata
+        .as_ref()
+        .or(embedded_turboquant.as_ref());
+    if let Some(gguf_cfg) = reported_gguf_cfg {
         println!(
             "  Triality profile: public_mode={}, runtime_mode={}, schema_version={}",
             gguf_cfg.public_mode_label, gguf_cfg.runtime_mode, gguf_cfg.schema_version
@@ -767,6 +810,16 @@ async fn run_async(
                 "no"
             }
         );
+        if let Some(weight) = gguf_cfg.weight.as_ref() {
+            println!(
+                "  Weight contract: codec={} policy={} status={} payload_valid={} tensor_plan_entries={}",
+                weight.codec.as_deref().unwrap_or("none"),
+                weight.policy.as_deref().unwrap_or("none"),
+                weight.runtime_status(),
+                weight.payload_valid,
+                weight.tensor_plan_entries,
+            );
+        }
     }
     println!(
         "  Placement: {} GPU | {} host pageable | {} host pinned | {} NVMe",
@@ -774,6 +827,14 @@ async fn run_async(
         format_bytes(runtime.placement_summary.total_host_pageable_bytes),
         format_bytes(runtime.placement_summary.total_host_pinned_bytes),
         format_bytes(runtime.placement_summary.total_nvme_bytes),
+    );
+    println!(
+        "  Placement accounting: file={} resident={} staging={} dequant_us={:.1} matmul_us={:.1}",
+        format_bytes(runtime.placement_summary.total_file_bytes),
+        format_bytes(runtime.placement_summary.total_resident_bytes),
+        format_bytes(runtime.placement_summary.total_staging_bytes),
+        runtime.placement_summary.estimated_dequant_cost_us,
+        runtime.placement_summary.estimated_matmul_cost_us,
     );
     println!(
         "  Residency: mode={}, pinned_tier={}, pinned_policy={}",
