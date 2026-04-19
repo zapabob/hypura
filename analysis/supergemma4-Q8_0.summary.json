@@ -1,0 +1,1278 @@
+{
+  "model_file": {
+    "path": "C:\\Users\\downl\\Desktop\\SO8T\\gguf_models\\Abiray\\supergemma4-e4b-abliterated-GGUF\\supergemma4-Q8_0.gguf",
+    "bytes": 8031240480,
+    "size_human": "7.48 GB",
+    "sha256_first_bytes": {
+      "bytes_hashed": 16777216,
+      "sha256": "0f2bdcbf746adaf6d439d4eccdc820871c4c39be51f26162b3c73c7d9446eb4e"
+    }
+  },
+  "inspect_metadata": {
+    "Format": "GGUF v3",
+    "Architecture": "gemma4",
+    "Parameters": "7.5B",
+    "Layers": "42",
+    "Embedding dim": "2560",
+    "Attention heads": "8",
+    "KV heads": "2",
+    "Vocab size": "0",
+    "Context length": "131072",
+    "Quantization": "Q8_0",
+    "Total size": "7.5 GB",
+    "Tensors": "720"
+  },
+  "tensor_count": 720,
+  "tensor_bytes_total": 8029407201,
+  "tensor_bytes_total_human": "7.48 GB",
+  "role_stats": [
+    {
+      "count": 2,
+      "bytes": 3719508787,
+      "role": "Embedding"
+    },
+    {
+      "count": 42,
+      "bytes": 1171469082,
+      "role": "FfnDown"
+    },
+    {
+      "count": 42,
+      "bytes": 1171469082,
+      "role": "FfnGate"
+    },
+    {
+      "count": 42,
+      "bytes": 1171469082,
+      "role": "FfnUp"
+    },
+    {
+      "count": 42,
+      "bytes": 272315155,
+      "role": "AttentionOutput"
+    },
+    {
+      "count": 42,
+      "bytes": 272315155,
+      "role": "AttentionQuery"
+    },
+    {
+      "count": 42,
+      "bytes": 67528265,
+      "role": "AttentionKey"
+    },
+    {
+      "count": 42,
+      "bytes": 67528265,
+      "role": "AttentionValue"
+    },
+    {
+      "count": 1,
+      "bytes": 55050240,
+      "role": "Other(\"per_layer_model_proj.weight\")"
+    },
+    {
+      "count": 296,
+      "bytes": 2262016,
+      "role": "Norm"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.0.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.0.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.1.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.1.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.2.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.2.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.3.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.3.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.4.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.4.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.5.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.5.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.6.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.6.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.7.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.7.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.8.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.8.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.9.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.9.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.10.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.10.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.11.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.11.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.12.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.12.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.13.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.13.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.14.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.14.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.15.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.15.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.16.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.16.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.17.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.17.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.18.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.18.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.19.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.19.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.20.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.20.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.21.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.21.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.22.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.22.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.23.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.23.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.24.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.24.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.25.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.25.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.26.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.26.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.27.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.27.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.28.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.28.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.29.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.29.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.30.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.30.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.31.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.31.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.32.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.32.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.33.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.33.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.34.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.34.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.35.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.35.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.36.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.36.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.37.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.37.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.38.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.38.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.39.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.39.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.40.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.40.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.41.inp_gate.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 696320,
+      "role": "Other(\"blk.41.proj.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 1024,
+      "role": "Other(\"rope_freqs.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.0.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.1.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.2.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.3.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.4.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.5.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.6.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.7.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.8.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.9.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.10.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.11.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.12.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.13.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.14.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.15.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.16.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.17.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.18.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.19.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.20.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.21.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.22.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.23.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.24.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.25.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.26.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.27.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.28.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.29.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.30.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.31.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.32.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.33.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.34.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.35.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.36.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.37.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.38.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.39.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.40.layer_output_scale.weight\")"
+    },
+    {
+      "count": 1,
+      "bytes": 4,
+      "role": "Other(\"blk.41.layer_output_scale.weight\")"
+    }
+  ],
+  "type_stats": [
+    {
+      "count": 380,
+      "bytes": 7972093753,
+      "type": "Q8_0"
+    },
+    {
+      "count": 1,
+      "bytes": 55050240,
+      "type": "F16"
+    },
+    {
+      "count": 339,
+      "bytes": 2263208,
+      "type": "F32"
+    }
+  ],
+  "top_tensors": [
+    {
+      "name": "per_layer_token_embd.weight",
+      "size_text": "2.8 GB",
+      "bytes": 3006477107,
+      "type": "Q8_0",
+      "role": "Embedding"
+    },
+    {
+      "name": "token_embd.weight",
+      "size_text": "680.0 MB",
+      "bytes": 713031680,
+      "type": "Q8_0",
+      "role": "Embedding"
+    },
+    {
+      "name": "per_layer_model_proj.weight",
+      "size_text": "52.5 MB",
+      "bytes": 55050240,
+      "type": "F16",
+      "role": "Other(\"per_layer_model_proj.weight\")"
+    },
+    {
+      "name": "blk.0.ffn_down.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnDown"
+    },
+    {
+      "name": "blk.0.ffn_gate.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnGate"
+    },
+    {
+      "name": "blk.0.ffn_up.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnUp"
+    },
+    {
+      "name": "blk.1.ffn_down.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnDown"
+    },
+    {
+      "name": "blk.1.ffn_gate.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnGate"
+    },
+    {
+      "name": "blk.1.ffn_up.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnUp"
+    },
+    {
+      "name": "blk.2.ffn_down.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnDown"
+    },
+    {
+      "name": "blk.2.ffn_gate.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnGate"
+    },
+    {
+      "name": "blk.2.ffn_up.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnUp"
+    },
+    {
+      "name": "blk.3.ffn_down.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnDown"
+    },
+    {
+      "name": "blk.3.ffn_gate.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnGate"
+    },
+    {
+      "name": "blk.3.ffn_up.weight",
+      "size_text": "26.6 MB",
+      "bytes": 27892121,
+      "type": "Q8_0",
+      "role": "FfnUp"
+    }
+  ],
+  "layer_summary": [
+    {
+      "layer": 0,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 1,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 2,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 3,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 4,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 5,
+      "total_bytes": 113016423,
+      "attention": 27906456,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 6,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 7,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 8,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 9,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 10,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 11,
+      "total_bytes": 113016423,
+      "attention": 27906456,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 12,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 13,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 14,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 15,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 16,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 17,
+      "total_bytes": 113016423,
+      "attention": 27906456,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 18,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 19,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 20,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 21,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 22,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 23,
+      "total_bytes": 113016423,
+      "attention": 27906456,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 24,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 25,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 26,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 27,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 28,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 29,
+      "total_bytes": 113016423,
+      "attention": 27906456,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 30,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 31,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 32,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 33,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 34,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 35,
+      "total_bytes": 113016423,
+      "attention": 27906456,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 36,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 37,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 38,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 39,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 40,
+      "total_bytes": 98963455,
+      "attention": 13853488,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    },
+    {
+      "layer": 41,
+      "total_bytes": 113016423,
+      "attention": 27906456,
+      "ffn": 83686603,
+      "norm": 30720,
+      "other": 1392644
+    }
+  ],
+  "benchmark": {
+    "source_json": "C:\\Users\\downl\\Desktop\\hypura-main\\hypura-main\\benchmarks\\results\\2026-04-19T08-47-24_supergemma4-Q8_0.json",
+    "runs": [
+      {
+        "label": "hypura legacy-3tier + off",
+        "residency_profile": "legacy-3tier",
+        "host_pinned_policy": "off",
+        "generation_tok_s": 29.85079577246397,
+        "prompt_tok_s": 0.22106748603414442,
+        "prompt_eval_ms": 9047.011100000002,
+        "tokens_generated": 9,
+        "wall_time_ms": 208393.0106,
+        "placement": {
+          "gpu_gb": 7.4649373665452,
+          "host_pageable_gb": 0.0,
+          "host_pinned_gb": 0.0,
+          "nvme_gb": 0.0,
+          "inference_mode": "FullResident",
+          "pinned_tier_active": false,
+          "pinned_budget_gb": 0.14087581634521484
+        },
+        "telemetry": {
+          "hit_rate": 0.0,
+          "nvme_mbps": 0.0,
+          "gpu_slot_hit_rate": 0.0,
+          "pinned_slot_hit_rate": 0.0,
+          "pageable_fallback_rate": 0.0,
+          "h2d_pinned_mbps": 0.0,
+          "h2d_pageable_mbps": 0.0,
+          "eviction_churn_per_token": 0.0,
+          "first_token_stall_ms": 0.0
+        }
+      },
+      {
+        "label": "hypura four-tier + off",
+        "residency_profile": "four-tier",
+        "host_pinned_policy": "off",
+        "generation_tok_s": 0.17252954257863484,
+        "prompt_tok_s": 1.098438366650708,
+        "prompt_eval_ms": 1820.7667000000001,
+        "tokens_generated": 9,
+        "wall_time_ms": 99672.6022,
+        "placement": {
+          "gpu_gb": 7.4649373665452,
+          "host_pageable_gb": 0.0,
+          "host_pinned_gb": 0.0,
+          "nvme_gb": 0.0,
+          "inference_mode": "FullResident",
+          "pinned_tier_active": false,
+          "pinned_budget_gb": 0.14087581634521484
+        },
+        "telemetry": {
+          "hit_rate": 0.0,
+          "nvme_mbps": 0.0,
+          "gpu_slot_hit_rate": 0.0,
+          "pinned_slot_hit_rate": 0.0,
+          "pageable_fallback_rate": 0.0,
+          "h2d_pinned_mbps": 0.0,
+          "h2d_pageable_mbps": 0.0,
+          "eviction_churn_per_token": 0.0,
+          "first_token_stall_ms": 0.0
+        }
+      },
+      {
+        "label": "hypura four-tier + auto",
+        "residency_profile": "four-tier",
+        "host_pinned_policy": "auto",
+        "generation_tok_s": 0.16708184214800387,
+        "prompt_tok_s": 1.0956119754333118,
+        "prompt_eval_ms": 1825.4638,
+        "tokens_generated": 9,
+        "wall_time_ms": 68244.6537,
+        "placement": {
+          "gpu_gb": 7.4649373665452,
+          "host_pageable_gb": 0.0,
+          "host_pinned_gb": 0.0,
+          "nvme_gb": 0.0,
+          "inference_mode": "FullResident",
+          "pinned_tier_active": false,
+          "pinned_budget_gb": 0.14087581634521484
+        },
+        "telemetry": {
+          "hit_rate": 0.0,
+          "nvme_mbps": 0.0,
+          "gpu_slot_hit_rate": 0.0,
+          "pinned_slot_hit_rate": 0.0,
+          "pageable_fallback_rate": 0.0,
+          "h2d_pinned_mbps": 0.0,
+          "h2d_pageable_mbps": 0.0,
+          "eviction_churn_per_token": 0.0,
+          "first_token_stall_ms": 0.0
+        }
+      }
+    ],
+    "generation_tok_s_mean": 10.06346905239687,
+    "generation_tok_s_median": 0.17252954257863484,
+    "generation_tok_s_min": 0.16708184214800387,
+    "generation_tok_s_max": 29.85079577246397,
+    "wall_time_s_mean": 125.4367555,
+    "wall_time_s_median": 99.6726022
+  }
+}

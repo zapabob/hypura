@@ -57,14 +57,33 @@ Known limits that remain honest release notes:
 - Multimodal feature flags depend on actual local assets or helper availability
 - Ollama parity still needs a full audit pass even though compatibility surfaces exist
 
-## Bench snapshot
+## Benchmark score
 
-These are repository snapshot numbers from the current project status notes, not a fresh benchmark run for this release.
+Current benchmark score is computed from the JSON corpus in `benchmarks/results/` and summarized with mean +/- SD, error-bar charts, and multi-group comparison tables in [benchmarks/CHARTS.md](benchmarks/CHARTS.md).
 
-| Model | Mode | Throughput | Notes |
-| --- | --- | --- | --- |
-| Mixtral 8x7B Q5_K_M (30.9 GB) | expert-streaming | 2.19 tok/s | M1 Max 32 GB snapshot |
-| Llama 3.3 70B Q4_K_M (39.6 GB) | dense-FFN-streaming | 0.30 tok/s | M1 Max 32 GB snapshot |
+Current measured hardware corpus:
+
+- `AMD Ryzen 5 4500 6-Core Processor / NVIDIA GeForce RTX 3060 / 31.9 GB RAM`
+
+Best observed Hypura score per model in the current corpus:
+
+| Model | Score group | Benchmark score (tok/s) | Samples | Notes |
+| --- | --- | --- | ---: | --- |
+| Shadows-MoE-Q6 | `hypura four-tier + off` | `1.158 +/- 0.111` | 2 | Includes repeated runs and a baseline comparator in `benchmarks/results/` |
+| supergemma4-Q8_0 | `hypura legacy-3tier + off` | `29.851 +/- 0.000` | 1 | Single-run exploratory datapoint; GPU-resident and not yet a stable replicated estimate |
+
+Multi-group summary for the same corpus:
+
+| Model | baseline | legacy-3tier + off | four-tier + off | four-tier + auto |
+| --- | ---: | ---: | ---: | ---: |
+| Shadows-MoE-Q6 | `1.121 +/- 0.023` | `1.086 +/- 0.029` | `1.158 +/- 0.111` | `0.984 +/- 0.334` |
+| supergemma4-Q8_0 | `N/A` | `29.851 +/- 0.000` | `0.173 +/- 0.000` | `0.167 +/- 0.000` |
+
+Read these numbers with the run count in mind:
+
+- `Shadows-MoE-Q6` has `n=2` for every reported group, so SD reflects actual repetition.
+- `supergemma4-Q8_0` currently has `n=1`, so `+/- 0.000` means "only one observation", not "perfectly stable".
+- The `supergemma4-Q8_0` run is a full GPU-resident Windows CUDA datapoint, not an NVMe spill benchmark.
 
 ## Quick start
 
