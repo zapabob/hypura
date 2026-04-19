@@ -69,6 +69,8 @@ Best observed Hypura score per model in the current corpus:
 
 | Model | Score group | Benchmark score (tok/s) | Samples | Notes |
 | --- | --- | --- | ---: | --- |
+| Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M | `hypura four-tier + auto` | `51.835 +/- 2.293` | 2 | Repeated Windows CUDA runs; paired `mmproj` projector was inspect-validated separately |
+| Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M | `hypura four-tier + auto` | `0.041 +/- 0.034` | 2 | Sparse MoE mmap path fell back to CPU-only on this machine; baseline remained faster in this corpus |
 | Shadows-MoE-Q6 | `hypura four-tier + off` | `1.158 +/- 0.111` | 2 | Includes repeated runs and a baseline comparator in `benchmarks/results/` |
 | supergemma4-Q8_0 | `hypura legacy-3tier + off` | `29.851 +/- 0.000` | 1 | Single-run exploratory datapoint; GPU-resident and not yet a stable replicated estimate |
 
@@ -76,11 +78,15 @@ Multi-group summary for the same corpus:
 
 | Model | baseline | legacy-3tier + off | four-tier + off | four-tier + auto |
 | --- | ---: | ---: | ---: | ---: |
+| Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M | `41.681 +/- 4.357` | `50.390 +/- 3.980` | `29.407 +/- 34.425` | `51.835 +/- 2.293` |
+| Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M | `0.059 +/- 0.050` | `0.020 +/- 0.001` | `0.038 +/- 0.014` | `0.041 +/- 0.034` |
 | Shadows-MoE-Q6 | `1.121 +/- 0.023` | `1.086 +/- 0.029` | `1.158 +/- 0.111` | `0.984 +/- 0.334` |
 | supergemma4-Q8_0 | `N/A` | `29.851 +/- 0.000` | `0.173 +/- 0.000` | `0.167 +/- 0.000` |
 
 Read these numbers with the run count in mind:
 
+- `Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M` has `n=2`; `four-tier + auto` is currently the strongest replicated group, while `four-tier + off` shows very high variance.
+- `Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M` has `n=2`, but all groups are very slow on this hardware because Hypura's sparse MoE mmap path fell back to CPU-only (`ngl=0`) once the 19.7 GB model exceeded the RTX 3060 GPU budget.
 - `Shadows-MoE-Q6` has `n=2` for every reported group, so SD reflects actual repetition.
 - `supergemma4-Q8_0` currently has `n=1`, so `+/- 0.000` means "only one observation", not "perfectly stable".
 - The `supergemma4-Q8_0` run is a full GPU-resident Windows CUDA datapoint, not an NVMe spill benchmark.

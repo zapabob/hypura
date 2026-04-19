@@ -1,0 +1,51 @@
+{
+  "hardware": "AMD Ryzen 5 4500 6-Core Processor / NVIDIA GeForce RTX 3060 / 31.9 GB RAM",
+  "model": "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M",
+  "groups": {
+    "baseline": {
+      "n": 2,
+      "mean_tok_per_sec": 41.680699,
+      "sd_tok_per_sec": 4.35706,
+      "min_tok_per_sec": 38.599793,
+      "max_tok_per_sec": 44.761605,
+      "mean_prompt_eval_ms": 3820.1,
+      "mean_wall_time_ms": 94074.2
+    },
+    "hypura legacy-3tier + off": {
+      "n": 2,
+      "mean_tok_per_sec": 50.390014,
+      "sd_tok_per_sec": 3.979694,
+      "min_tok_per_sec": 47.575946,
+      "max_tok_per_sec": 53.204083,
+      "mean_prompt_eval_ms": 3448.3,
+      "mean_wall_time_ms": 75808.6
+    },
+    "hypura four-tier + off": {
+      "n": 2,
+      "mean_tok_per_sec": 29.407068,
+      "sd_tok_per_sec": 34.424782,
+      "min_tok_per_sec": 5.065071,
+      "max_tok_per_sec": 53.749064,
+      "mean_prompt_eval_ms": 442.9,
+      "mean_wall_time_ms": 15539.5
+    },
+    "hypura four-tier + auto": {
+      "n": 2,
+      "mean_tok_per_sec": 51.834626,
+      "sd_tok_per_sec": 2.292661,
+      "min_tok_per_sec": 50.21347,
+      "max_tok_per_sec": 53.455783,
+      "mean_prompt_eval_ms": 279.2,
+      "mean_wall_time_ms": 21441.9
+    }
+  },
+  "mmproj": {
+    "name": "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16",
+    "architecture": "clip",
+    "params": "478.1M",
+    "quant": "F16",
+    "size_gb": 0.9222755432128906,
+    "tensors": 483
+  },
+  "note": "Current Hypura CLI benches the text GGUF directly; mmproj was validated structurally with inspect but is not a direct bench input in this build."
+}

@@ -1,0 +1,43 @@
+{
+  "model": {
+    "name": "Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M",
+    "architecture": "qwen35moe",
+    "params": "34.7B",
+    "quant": "Q4K",
+    "size_gb": 19.70,
+    "layers": 40,
+    "experts": 256,
+    "active_experts": 8,
+    "context": 262144
+  },
+  "hardware": "AMD Ryzen 5 4500 6-Core Processor / NVIDIA GeForce RTX 3060 / 31.9 GB RAM",
+  "bench_config": {
+    "context": 1024,
+    "max_tokens": 2,
+    "prompt": "Hello."
+  },
+  "groups": {
+    "baseline": {
+      "n": 2,
+      "mean_tok_per_sec": 0.058528,
+      "sd_tok_per_sec": 0.050199
+    },
+    "hypura legacy-3tier + off": {
+      "n": 2,
+      "mean_tok_per_sec": 0.020106,
+      "sd_tok_per_sec": 0.000687
+    },
+    "hypura four-tier + off": {
+      "n": 2,
+      "mean_tok_per_sec": 0.037910,
+      "sd_tok_per_sec": 0.014356
+    },
+    "hypura four-tier + auto": {
+      "n": 2,
+      "mean_tok_per_sec": 0.041226,
+      "sd_tok_per_sec": 0.033923
+    }
+  },
+  "runtime_note": "Sparse MoE mmap path fell back to CPU-only (ngl=0) on this hardware because the 19.7 GB model exceeded the RTX 3060 GPU budget."
+}
+

@@ -243,3 +243,7 @@ Both expert-streaming and dense FFN-streaming share the same core architecture:
 | 2026-03-22 | Qwen3-Coder-Next-Q4_K_M Q4K | Apple M1 Max 32GB | 45.2 GB | 0.0 GB | 0.0 GB | 2.6 | 2.9 | 1.1x |
 | 2026-04-17 | Shadows-MoE-Q6 Q6K | AMD Ryzen 5 4500 6-Core Processor               31GB | 7.4 GB | 0.0 GB | 2.4 GB | 1.1 | 1.2 | 1.1x |
 | 2026-04-19 | supergemma4-Q8_0 Q8_0 | AMD Ryzen 5 4500 6-Core Processor               31GB | 7.5 GB | 0.0 GB | 0.0 GB | - | 0.2 | - |
+| 2026-04-19 | Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M Q4K | AMD Ryzen 5 4500 6-Core Processor               31GB | 5.0 GB | 0.0 GB | 0.0 GB | 38.6 | 50.2 | 1.3x |
+| 2026-04-19 | Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M Q4K | AMD Ryzen 5 4500 6-Core Processor               31GB | 5.0 GB | 0.0 GB | 0.0 GB | 44.8 | 53.5 | 1.2x |
+| 2026-04-19 | Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M Q4K | AMD Ryzen 5 4500 6-Core Processor               31GB | 19.7 GB | 0.0 GB | 0.0 GB | 0.1 | 0.0 | 0.2x |
+| 2026-04-19 | Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M Q4K | AMD Ryzen 5 4500 6-Core Processor               31GB | 19.7 GB | 0.0 GB | 0.0 GB | 0.0 | 0.1 | 2.8x |
