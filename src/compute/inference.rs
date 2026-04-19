@@ -702,6 +702,7 @@ pub fn resolve_runtime_setup(
     turboquant_config: Option<&Path>,
     llama_bridge: LlamaTurboquantCliBridge,
     residency_policy: ResidencyPolicyConfig,
+    allow_exact_fallback: bool,
 ) -> anyhow::Result<RuntimeSetup> {
     anyhow::ensure!(
         model_path.exists(),
@@ -727,6 +728,7 @@ pub fn resolve_runtime_setup(
         &gguf,
         turboquant_mode,
         turboquant_config,
+        allow_exact_fallback,
     )?;
     apply_gguf_turboquant_env(turboquant.gguf_metadata.as_ref());
     apply_llama_turboquant_cli_bridge(turboquant_mode, &turboquant, &llama_bridge);
@@ -2840,6 +2842,7 @@ mod tests {
                 num_layers: 32,
                 num_kv_heads: 4,
                 layers: Vec::new(),
+                weight: None,
             }),
         };
 
@@ -2857,6 +2860,9 @@ mod tests {
         };
 
         assert!(!should_delegate_turboquant_runtime_to_llama(&resolved));
+    }
+
+    #[test]
     fn restored_prefix_len_requires_matching_prefix_and_state_bytes() {
         let snapshot = ContextStateSnapshot {
             token_ids: vec![1, 2, 3],

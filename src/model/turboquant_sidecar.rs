@@ -306,6 +306,44 @@ pub struct GgufTurboQuantConfig {
     pub num_layers: u32,
     pub num_kv_heads: u32,
     pub layers: Vec<GgufTurboQuantLayerConfig>,
+    pub weight: Option<GgufTurboQuantWeightConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GgufTurboQuantWeightConfig {
+    pub enabled: bool,
+    pub codec: Option<String>,
+    pub source_ftype: Option<String>,
+    pub policy: Option<String>,
+    pub protected_roles_json: Option<String>,
+    pub protected_layers_json: Option<String>,
+    pub modality_scope: Option<String>,
+    pub payload_format: Option<String>,
+    pub payload_bytes: u64,
+    pub payload_json: Option<String>,
+    pub payload_schema: Option<String>,
+    pub payload_valid: bool,
+    pub tensor_plan_entries: u32,
+}
+
+impl GgufTurboQuantWeightConfig {
+    pub fn runtime_status(&self) -> &'static str {
+        if !self.enabled {
+            "disabled"
+        } else if !self.payload_valid {
+            "invalid"
+        } else {
+            match self.codec.as_deref() {
+                Some("tq4_1s") => "contract-only",
+                Some(_) => "unsupported-codec",
+                None => "missing-codec",
+            }
+        }
+    }
+
+    pub fn runtime_ready(&self) -> bool {
+        false
+    }
 }
 
 impl GgufTurboQuantConfig {
@@ -364,9 +402,29 @@ pub fn resolve_turboquant_config(
     gguf: &GgufFile,
     mode: TurboQuantMode,
     explicit_config: Option<&Path>,
+    allow_exact_fallback: bool,
 ) -> anyhow::Result<ResolvedTurboQuantConfig> {
     let gguf_metadata = read_gguf_turboquant_config(gguf, metadata)?;
     if let Some(gguf_metadata) = gguf_metadata {
+        if let Some(weight) = gguf_metadata.weight.as_ref() {
+            if weight.enabled && !weight.runtime_ready() {
+                if allow_exact_fallback {
+                    tracing::warn!(
+                        "Weight TurboQuant contract present for {} but runtime support is incomplete (codec={}, status={}). Falling back to exact runtime because --tq-allow-exact-fallback was set.",
+                        model_path.display(),
+                        weight.codec.as_deref().unwrap_or("none"),
+                        weight.runtime_status(),
+                    );
+                    return Ok(ResolvedTurboQuantConfig::exact());
+                }
+                return Err(anyhow::anyhow!(
+                    "Weight TurboQuant contract present for {} but runtime support is incomplete (codec={}, status={}). Pass --tq-allow-exact-fallback for a developer exact-runtime escape hatch.",
+                    model_path.display(),
+                    weight.codec.as_deref().unwrap_or("none"),
+                    weight.runtime_status(),
+                ));
+            }
+        }
         return Ok(ResolvedTurboQuantConfig {
             mode: gguf_metadata.mode,
             schema_kind: None,
@@ -385,14 +443,18 @@ pub fn resolve_turboquant_config(
         None => match auto_discover_sidecar_path(model_path, mode) {
             Some(path) => path,
             None => {
-                // NOTE: Exact fallback preserves safety when research artifacts are missing.
-                // Broader "Triality-by-default without sidecar" alignment is tracked separately.
                 if mode == TurboQuantMode::ResearchKvSplit {
-                    tracing::warn!(
-                        "No TurboQuant research sidecar or GGUF metadata found next to {}. Falling back to exact runtime.",
+                    if allow_exact_fallback {
+                        tracing::warn!(
+                            "No TurboQuant research sidecar or GGUF metadata found next to {}. Falling back to exact runtime because --tq-allow-exact-fallback was set.",
+                            model_path.display()
+                        );
+                        return Ok(ResolvedTurboQuantConfig::exact());
+                    }
+                    return Err(anyhow::anyhow!(
+                        "No TurboQuant research sidecar or GGUF metadata found next to {}. Fail-closed is active; provide embedded metadata or pass --turboquant-config. For developer exact fallback only, pass --tq-allow-exact-fallback.",
                         model_path.display()
-                    );
-                    return Ok(ResolvedTurboQuantConfig::exact());
+                    ));
                 }
                 return Err(anyhow::anyhow!(
                     "No TurboQuant sidecar found for mode `{mode}` next to {}. \
@@ -455,6 +517,143 @@ fn head_dim_from_metadata(metadata: &ModelMetadata) -> u32 {
     } else {
         metadata.embedding_dim / metadata.num_heads
     }
+}
+
+fn parse_gguf_weight_config(gguf: &GgufFile) -> anyhow::Result<Option<GgufTurboQuantWeightConfig>> {
+    let enabled = gguf
+        .get_bool("hypura.turboquant.weight.enabled")
+        .unwrap_or(false);
+    let codec = gguf
+        .get_string("hypura.turboquant.weight.codec")
+        .map(ToOwned::to_owned);
+    let source_ftype = gguf
+        .get_string("hypura.turboquant.weight.source_ftype")
+        .map(ToOwned::to_owned);
+    let policy = gguf
+        .get_string("hypura.turboquant.weight.policy")
+        .map(ToOwned::to_owned);
+    let protected_roles_json = gguf
+        .get_string("hypura.turboquant.weight.protected_roles")
+        .map(ToOwned::to_owned);
+    let protected_layers_json = gguf
+        .get_string("hypura.turboquant.weight.protected_layers")
+        .map(ToOwned::to_owned);
+    let modality_scope = gguf
+        .get_string("hypura.turboquant.weight.modality_scope")
+        .map(ToOwned::to_owned);
+    let payload_format = gguf
+        .get_string("hypura.turboquant.weight.payload_format")
+        .map(ToOwned::to_owned);
+    let payload_bytes = gguf
+        .get_u64("hypura.turboquant.weight.payload_bytes")
+        .unwrap_or(0);
+    let payload_json = gguf
+        .get_string("hypura.turboquant.weight.payload_json")
+        .map(ToOwned::to_owned);
+
+    let any_present = enabled
+        || codec.is_some()
+        || source_ftype.is_some()
+        || policy.is_some()
+        || protected_roles_json.is_some()
+        || protected_layers_json.is_some()
+        || modality_scope.is_some()
+        || payload_format.is_some()
+        || payload_json.is_some()
+        || payload_bytes > 0;
+    if !any_present {
+        return Ok(None);
+    }
+
+    let mut payload_schema = None;
+    let mut payload_valid = false;
+    let mut tensor_plan_entries = 0;
+
+    if enabled {
+        let payload_format_value = payload_format.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("GGUF weight metadata is missing `hypura.turboquant.weight.payload_format`")
+        })?;
+        anyhow::ensure!(
+            payload_format_value == "json-inline-v1",
+            "Unsupported GGUF weight payload format `{payload_format_value}`; expected `json-inline-v1`"
+        );
+        let payload_json_value = payload_json.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("GGUF weight metadata is missing `hypura.turboquant.weight.payload_json`")
+        })?;
+        anyhow::ensure!(
+            payload_bytes == payload_json_value.len() as u64,
+            "GGUF weight payload bytes do not match payload_json length"
+        );
+        let payload: Value = serde_json::from_str(payload_json_value)
+            .context("GGUF weight payload must contain valid JSON")?;
+        let obj = payload
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("GGUF weight payload must decode to an object"))?;
+        let schema = obj
+            .get("schema")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("GGUF weight payload is missing string key `schema`"))?;
+        anyhow::ensure!(
+            schema == "hypura.turboquant.weight.v1",
+            "Unsupported GGUF weight payload schema `{schema}`; expected `hypura.turboquant.weight.v1`"
+        );
+        payload_schema = Some(schema.to_string());
+
+        let payload_codec = obj
+            .get("codec")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("GGUF weight payload is missing string key `codec`"))?;
+        anyhow::ensure!(
+            codec.as_deref() == Some(payload_codec),
+            "GGUF weight payload codec does not match `hypura.turboquant.weight.codec`"
+        );
+        anyhow::ensure!(
+            source_ftype.as_deref() == obj.get("source_ftype").and_then(Value::as_str),
+            "GGUF weight payload source_ftype does not match `hypura.turboquant.weight.source_ftype`"
+        );
+        anyhow::ensure!(
+            policy.as_deref() == obj.get("policy").and_then(Value::as_str),
+            "GGUF weight payload policy does not match `hypura.turboquant.weight.policy`"
+        );
+        anyhow::ensure!(
+            modality_scope.as_deref() == obj.get("modality_scope").and_then(Value::as_str),
+            "GGUF weight payload modality_scope does not match `hypura.turboquant.weight.modality_scope`"
+        );
+        anyhow::ensure!(
+            obj.get("protected_roles").and_then(Value::as_array).is_some(),
+            "GGUF weight payload is missing array key `protected_roles`"
+        );
+        anyhow::ensure!(
+            obj.get("protected_layers").and_then(Value::as_array).is_some(),
+            "GGUF weight payload is missing array key `protected_layers`"
+        );
+        let tensor_plan = obj
+            .get("tensor_plan")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("GGUF weight payload is missing object key `tensor_plan`"))?;
+        anyhow::ensure!(
+            !tensor_plan.is_empty(),
+            "GGUF weight payload tensor_plan must not be empty"
+        );
+        tensor_plan_entries = tensor_plan.len() as u32;
+        payload_valid = true;
+    }
+
+    Ok(Some(GgufTurboQuantWeightConfig {
+        enabled,
+        codec,
+        source_ftype,
+        policy,
+        protected_roles_json,
+        protected_layers_json,
+        modality_scope,
+        payload_format,
+        payload_bytes,
+        payload_json,
+        payload_schema,
+        payload_valid,
+        tensor_plan_entries,
+    }))
 }
 
 fn require_f32_array(gguf: &GgufFile, key: &str, expected_len: usize) -> anyhow::Result<Vec<f32>> {
@@ -574,6 +773,7 @@ fn parse_legacy_gguf_turboquant_config(
         num_layers: metadata.num_layers,
         num_kv_heads: metadata.num_kv_heads,
         layers: Vec::new(),
+        weight: parse_gguf_weight_config(gguf)?,
     }))
 }
 
@@ -700,6 +900,7 @@ fn parse_strict_gguf_turboquant_config(
         num_layers: metadata.num_layers,
         num_kv_heads: metadata.num_kv_heads,
         layers,
+        weight: parse_gguf_weight_config(gguf)?,
     })
 }
 
@@ -991,6 +1192,99 @@ mod tests {
         }
     }
 
+    fn sample_weight_payload_json() -> String {
+        serde_json::json!({
+            "schema": "hypura.turboquant.weight.v1",
+            "codec": "tq4_1s",
+            "policy": "qwen35-config-i",
+            "source_ftype": "q8_0",
+            "protected_roles": [
+                "embedding",
+                "norm",
+                "output_head",
+                "recurrent_state"
+            ],
+            "protected_layers": [0, 1],
+            "modality_scope": "text",
+            "tensor_plan": {
+                "blk.*.attn_q.weight": "tq4_1s",
+                "blk.*.attn_k.weight": "tq4_1s",
+                "blk.*.attn_v.weight": "tq4_1s",
+                "blk.*.attn_output.weight": "tq4_1s",
+                "blk.*.ffn_gate.weight": "tq4_1s",
+                "blk.*.ffn_up.weight": "tq4_1s",
+                "blk.*.ffn_down.weight": "q4_k"
+            }
+        })
+        .to_string()
+    }
+
+    fn sample_gguf_with_weight_contract() -> GgufFile {
+        let mut gguf = sample_gguf();
+        let payload_json = sample_weight_payload_json();
+        gguf.metadata
+            .insert("hypura.turboquant.enabled".into(), GgufValue::Bool(true));
+        gguf.metadata.insert(
+            "hypura.turboquant.mode".into(),
+            GgufValue::String("triality-proxy-so8-pareto".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.schema_version".into(),
+            GgufValue::Uint32(1),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.runtime_mode".into(),
+            GgufValue::String("research-kv-split".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.rotation_policy".into(),
+            GgufValue::String("triality_vector".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.enabled".into(),
+            GgufValue::Bool(true),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.codec".into(),
+            GgufValue::String("tq4_1s".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.source_ftype".into(),
+            GgufValue::String("q8_0".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.policy".into(),
+            GgufValue::String("qwen35-config-i".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.protected_roles".into(),
+            GgufValue::String(
+                r#"["embedding","norm","output_head","recurrent_state"]"#.into(),
+            ),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.protected_layers".into(),
+            GgufValue::String("[0,1]".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.modality_scope".into(),
+            GgufValue::String("text".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.payload_format".into(),
+            GgufValue::String("json-inline-v1".into()),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.payload_bytes".into(),
+            GgufValue::Uint64(payload_json.len() as u64),
+        );
+        gguf.metadata.insert(
+            "hypura.turboquant.weight.payload_json".into(),
+            GgufValue::String(payload_json),
+        );
+        gguf
+    }
+
     fn array(values: Vec<GgufValue>) -> GgufValue {
         GgufValue::Array(values)
     }
@@ -1026,6 +1320,7 @@ mod tests {
             &sample_gguf(),
             TurboQuantMode::Exact,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(resolved.mode, TurboQuantMode::Exact);
@@ -1090,6 +1385,7 @@ mod tests {
             &gguf,
             TurboQuantMode::ResearchKvSplit,
             None,
+            false,
         )
         .unwrap();
 
@@ -1133,6 +1429,7 @@ mod tests {
             &gguf,
             TurboQuantMode::ResearchKvSplit,
             None,
+            false,
         )
         .unwrap();
 
@@ -1238,6 +1535,7 @@ mod tests {
             &gguf,
             TurboQuantMode::ResearchKvSplit,
             None,
+            false,
         )
         .unwrap();
 
@@ -1358,6 +1656,7 @@ mod tests {
             &gguf,
             TurboQuantMode::ResearchKvSplit,
             None,
+            false,
         )
         .unwrap();
 
@@ -1368,5 +1667,86 @@ mod tests {
         assert_eq!(gguf_cfg.layers.len(), 2);
         assert_eq!(gguf_cfg.layers[0].rotation_seed, 7);
         assert_eq!(gguf_cfg.layers[1].rotation_seed, 9);
+    }
+
+    #[test]
+    fn gguf_weight_contract_parses_and_reports_contract_only_status() {
+        let gguf = sample_gguf_with_weight_contract();
+        let parsed = read_gguf_turboquant_config(&gguf, &sample_metadata())
+            .unwrap()
+            .expect("gguf metadata should parse");
+        let weight = parsed.weight.expect("weight contract should parse");
+        assert_eq!(weight.codec.as_deref(), Some("tq4_1s"));
+        assert_eq!(weight.policy.as_deref(), Some("qwen35-config-i"));
+        assert_eq!(
+            weight.payload_schema.as_deref(),
+            Some("hypura.turboquant.weight.v1")
+        );
+        assert!(weight.payload_valid);
+        assert_eq!(weight.tensor_plan_entries, 7);
+        assert_eq!(weight.runtime_status(), "contract-only");
+        assert!(!weight.runtime_ready());
+    }
+
+    #[test]
+    fn gguf_weight_contract_fails_closed_without_exact_fallback_flag() {
+        let gguf = sample_gguf_with_weight_contract();
+        let err = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &sample_metadata(),
+            &gguf,
+            TurboQuantMode::ResearchKvSplit,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("runtime support is incomplete"));
+        assert!(err.to_string().contains("--tq-allow-exact-fallback"));
+    }
+
+    #[test]
+    fn gguf_weight_contract_can_exact_fallback_with_escape_hatch() {
+        let gguf = sample_gguf_with_weight_contract();
+        let resolved = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &sample_metadata(),
+            &gguf,
+            TurboQuantMode::ResearchKvSplit,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(resolved.mode, TurboQuantMode::Exact);
+        assert!(resolved.gguf_metadata.is_none());
+    }
+
+    #[test]
+    fn research_mode_missing_artifacts_fails_closed_by_default() {
+        let err = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &sample_metadata(),
+            &sample_gguf(),
+            TurboQuantMode::ResearchKvSplit,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Fail-closed is active"));
+    }
+
+    #[test]
+    fn research_mode_missing_artifacts_can_exact_fallback_with_escape_hatch() {
+        let resolved = resolve_turboquant_config(
+            Path::new("model.gguf"),
+            &sample_metadata(),
+            &sample_gguf(),
+            TurboQuantMode::ResearchKvSplit,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(resolved.mode, TurboQuantMode::Exact);
+        assert!(resolved.config.is_none());
+        assert!(resolved.gguf_metadata.is_none());
     }
 }

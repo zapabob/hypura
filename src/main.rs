@@ -62,6 +62,9 @@ enum Commands {
         /// Host pinned tier policy
         #[arg(long, value_enum, default_value_t = HostPinnedPolicy::Auto)]
         host_pinned: HostPinnedPolicy,
+        /// Developer-only escape hatch: allow exact fallback when TurboQuant artifacts are incomplete
+        #[arg(long)]
+        tq_allow_exact_fallback: bool,
     },
     /// Start Ollama-compatible API server
     Serve {
@@ -121,6 +124,9 @@ enum Commands {
         /// Host pinned tier policy
         #[arg(long, value_enum, default_value_t = HostPinnedPolicy::Auto)]
         host_pinned: HostPinnedPolicy,
+        /// Developer-only escape hatch: allow exact fallback when TurboQuant artifacts are incomplete
+        #[arg(long)]
+        tq_allow_exact_fallback: bool,
     },
     /// Start a KoboldCpp-compatible server profile with Kobold-style defaults
     #[command(name = "koboldcpp", visible_alias = "compat")]
@@ -259,6 +265,9 @@ enum Commands {
         /// Override the host pinned policy for the selected benchmark profile
         #[arg(long, value_enum)]
         host_pinned: Option<HostPinnedPolicy>,
+        /// Developer-only escape hatch: allow exact fallback when TurboQuant artifacts are incomplete
+        #[arg(long)]
+        tq_allow_exact_fallback: bool,
     },
     /// Print model metadata, tensor list, and placement plan
     Inspect {
@@ -267,6 +276,15 @@ enum Commands {
         /// Show individual tensor details
         #[arg(long)]
         tensors: bool,
+        /// Optional TurboQuant mode to validate during inspect
+        #[arg(long, value_enum)]
+        turboquant_mode: Option<TurboQuantMode>,
+        /// Optional TurboQuant sidecar config path used during inspect validation
+        #[arg(long)]
+        turboquant_config: Option<String>,
+        /// Developer-only escape hatch: allow exact fallback when TurboQuant artifacts are incomplete
+        #[arg(long)]
+        tq_allow_exact_fallback: bool,
     },
     /// Low-level NVMe I/O microbenchmark (diagnostic)
     Iobench {
@@ -308,6 +326,7 @@ fn main() -> anyhow::Result<()> {
             rotation_seed,
             residency_profile,
             host_pinned,
+            tq_allow_exact_fallback,
         } => cli::run::run(
             &model,
             context,
@@ -320,6 +339,7 @@ fn main() -> anyhow::Result<()> {
             rotation_seed,
             residency_profile,
             host_pinned,
+            tq_allow_exact_fallback,
         ),
         Commands::Serve {
             model,
@@ -341,6 +361,7 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             residency_profile,
             host_pinned,
+            tq_allow_exact_fallback,
         } => cli::serve::run(
             &model,
             &host,
@@ -361,6 +382,7 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             residency_profile,
             host_pinned,
+            tq_allow_exact_fallback,
             None,
             None,
             None,
@@ -446,6 +468,7 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             residency_profile,
             host_pinned,
+            tq_allow_exact_fallback,
         } => cli::bench::run(
             &model,
             baseline,
@@ -460,8 +483,21 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             residency_profile,
             host_pinned,
+            tq_allow_exact_fallback,
         ),
-        Commands::Inspect { model, tensors } => cli::inspect::run(&model, tensors),
+        Commands::Inspect {
+            model,
+            tensors,
+            turboquant_mode,
+            turboquant_config,
+            tq_allow_exact_fallback,
+        } => cli::inspect::run(
+            &model,
+            tensors,
+            turboquant_mode,
+            turboquant_config.as_deref(),
+            tq_allow_exact_fallback,
+        ),
         Commands::Iobench { model, read_gb } => cli::iobench::run(&model, read_gb),
         Commands::Optimize { model } => cli::optimize::run(&model),
     }

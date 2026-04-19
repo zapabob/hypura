@@ -2,25 +2,43 @@ use std::path::Path;
 
 use hypura::model::{
     gguf::GgufFile, metadata::ModelMetadata, tensor_role::TensorRole,
-    turboquant_sidecar::read_gguf_turboquant_config,
+    turboquant_sidecar::{read_gguf_turboquant_config, resolve_turboquant_config, TurboQuantMode},
 };
 
 use super::fmt_util::{format_bytes, format_params};
 
-pub fn run(model_path: &str, show_tensors: bool) -> anyhow::Result<()> {
+pub fn run(
+    model_path: &str,
+    show_tensors: bool,
+    turboquant_mode: Option<TurboQuantMode>,
+    turboquant_config: Option<&str>,
+    tq_allow_exact_fallback: bool,
+) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     anyhow::ensure!(path.exists(), "Model file not found: {model_path}");
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
-        "gguf" => inspect_gguf(path, show_tensors),
+        "gguf" => inspect_gguf(
+            path,
+            show_tensors,
+            turboquant_mode,
+            turboquant_config,
+            tq_allow_exact_fallback,
+        ),
         "safetensors" => anyhow::bail!("Safetensors inspect not yet implemented"),
         _ => anyhow::bail!("Unsupported model format: .{ext}"),
     }
 }
 
-fn inspect_gguf(path: &Path, show_tensors: bool) -> anyhow::Result<()> {
+fn inspect_gguf(
+    path: &Path,
+    show_tensors: bool,
+    turboquant_mode: Option<TurboQuantMode>,
+    turboquant_config: Option<&str>,
+    tq_allow_exact_fallback: bool,
+) -> anyhow::Result<()> {
     let gguf = GgufFile::open(path)?;
     let metadata = ModelMetadata::from_gguf(&gguf)?;
 
@@ -82,6 +100,32 @@ fn inspect_gguf(path: &Path, show_tensors: bool) -> anyhow::Result<()> {
                 "no"
             }
         );
+        if let Some(weight) = tq.weight.as_ref() {
+            println!(
+                "    Weight: codec={} policy={} status={} payload_valid={} tensor_plan_entries={}",
+                weight.codec.as_deref().unwrap_or("none"),
+                weight.policy.as_deref().unwrap_or("none"),
+                weight.runtime_status(),
+                weight.payload_valid,
+                weight.tensor_plan_entries,
+            );
+        }
+    }
+
+    if let Some(mode) = turboquant_mode {
+        let resolved = resolve_turboquant_config(
+            path,
+            &metadata,
+            &gguf,
+            mode,
+            turboquant_config.map(Path::new),
+            tq_allow_exact_fallback,
+        )?;
+        println!("  TurboQuant validation:");
+        println!("    Requested mode: {}", mode);
+        println!("    Resolved mode: {}", resolved.mode);
+        println!("    Schema: {}", resolved.schema_label());
+        println!("    Source: {}", resolved.source_label());
     }
 
     if show_tensors {

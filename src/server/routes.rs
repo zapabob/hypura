@@ -52,6 +52,7 @@ pub struct AppState {
     pub serve_turboquant_config_path: Option<PathBuf>,
     pub serve_llama_bridge: LlamaTurboquantCliBridge,
     pub serve_residency_policy: ResidencyPolicyConfig,
+    pub serve_tq_allow_exact_fallback: bool,
     pub active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub generation_in_progress: Arc<AtomicBool>,
     pub gui_presets: Arc<Mutex<HashMap<String, GuiPresetItem>>>,
@@ -1286,6 +1287,7 @@ async fn switch_loaded_model_runtime(
     let tq_config = state.serve_turboquant_config_path.clone();
     let bridge = state.serve_llama_bridge.clone();
     let residency_policy = state.serve_residency_policy;
+    let tq_allow_exact_fallback = state.serve_tq_allow_exact_fallback;
     let setup = tokio::task::spawn_blocking(move || {
         crate::compute::inference::resolve_runtime_setup(
             &path_for_setup,
@@ -1294,6 +1296,7 @@ async fn switch_loaded_model_runtime(
             tq_config.as_deref(),
             bridge,
             residency_policy,
+            tq_allow_exact_fallback,
         )
     })
     .await??;

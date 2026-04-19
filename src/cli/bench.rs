@@ -7,7 +7,11 @@ use tokio::sync::oneshot;
 
 use hypura::compute::ffi::SamplingParams;
 use hypura::compute::inference::*;
-use hypura::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
+use hypura::model::{
+    gguf::GgufFile,
+    metadata::ModelMetadata,
+    turboquant_sidecar::{RotationPolicy, TurboQuantMode, read_gguf_turboquant_config},
+};
 use hypura::scheduler::types::{HostPinnedPolicy, ResidencyPolicyConfig, ResidencyProfile};
 use hypura::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -30,6 +34,7 @@ pub fn run(
     dry_run: bool,
     residency_profile: Option<ResidencyProfile>,
     host_pinned: Option<HostPinnedPolicy>,
+    tq_allow_exact_fallback: bool,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
@@ -45,6 +50,7 @@ pub fn run(
         dry_run,
         residency_profile,
         host_pinned,
+        tq_allow_exact_fallback,
     ))
 }
 
@@ -61,8 +67,14 @@ async fn run_async(
     dry_run: bool,
     residency_profile: Option<ResidencyProfile>,
     host_pinned: Option<HostPinnedPolicy>,
+    tq_allow_exact_fallback: bool,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
+    let embedded_turboquant = {
+        let gguf = GgufFile::open(path)?;
+        let metadata = ModelMetadata::from_gguf(&gguf)?;
+        read_gguf_turboquant_config(&gguf, &metadata)?
+    };
     let prompt_text = prompt.unwrap_or(DEFAULT_PROMPT);
     let llama_bridge = LlamaTurboquantCliBridge {
         rotation_policy,
@@ -78,6 +90,7 @@ async fn run_async(
         turboquant_config.map(Path::new),
         llama_bridge.clone(),
         residency_cases[0],
+        tq_allow_exact_fallback,
     )?;
 
     if dry_run {
@@ -90,6 +103,14 @@ async fn run_async(
             format_bytes(base_runtime.placement_summary.total_host_pageable_bytes),
             format_bytes(base_runtime.placement_summary.total_host_pinned_bytes),
             format_bytes(base_runtime.placement_summary.total_nvme_bytes),
+        );
+        println!(
+            "  Placement accounting: file={} resident={} staging={} dequant_us={:.1} matmul_us={:.1}",
+            format_bytes(base_runtime.placement_summary.total_file_bytes),
+            format_bytes(base_runtime.placement_summary.total_resident_bytes),
+            format_bytes(base_runtime.placement_summary.total_staging_bytes),
+            base_runtime.placement_summary.estimated_dequant_cost_us,
+            base_runtime.placement_summary.estimated_matmul_cost_us,
         );
         println!(
             "  Config: context={}, max_tokens={}, n_gpu_layers={}, baseline={}",
@@ -115,7 +136,12 @@ async fn run_async(
             },
             base_runtime.plan.residency_policy.host_pinned_policy.label(),
         );
-        if let Some(ref gguf_cfg) = base_runtime.turboquant.gguf_metadata {
+        let reported_gguf_cfg = base_runtime
+            .turboquant
+            .gguf_metadata
+            .as_ref()
+            .or(embedded_turboquant.as_ref());
+        if let Some(gguf_cfg) = reported_gguf_cfg {
             println!(
                 "  Triality profile: public_mode={}, runtime_mode={}, schema_version={}",
                 gguf_cfg.public_mode_label, gguf_cfg.runtime_mode, gguf_cfg.schema_version
@@ -130,6 +156,16 @@ async fn run_async(
                     "no"
                 }
             );
+            if let Some(weight) = gguf_cfg.weight.as_ref() {
+                println!(
+                    "  Weight contract: codec={} policy={} status={} payload_valid={} tensor_plan_entries={}",
+                    weight.codec.as_deref().unwrap_or("none"),
+                    weight.policy.as_deref().unwrap_or("none"),
+                    weight.runtime_status(),
+                    weight.payload_valid,
+                    weight.tensor_plan_entries,
+                );
+            }
         }
         println!("  Dry-run: benchmark plan resolved without loading model weights");
         return Ok(());
@@ -232,6 +268,7 @@ async fn run_async(
             turboquant_config.map(Path::new),
             llama_bridge.clone(),
             residency_policy,
+            tq_allow_exact_fallback,
         )?;
 
         println!(
@@ -246,6 +283,14 @@ async fn run_async(
             format_bytes(runtime.placement_summary.total_host_pageable_bytes),
             format_bytes(runtime.placement_summary.total_host_pinned_bytes),
             format_bytes(runtime.placement_summary.total_nvme_bytes),
+        );
+        println!(
+            "    Placement accounting: file={} resident={} staging={} dequant_us={:.1} matmul_us={:.1}",
+            format_bytes(runtime.placement_summary.total_file_bytes),
+            format_bytes(runtime.placement_summary.total_resident_bytes),
+            format_bytes(runtime.placement_summary.total_staging_bytes),
+            runtime.placement_summary.estimated_dequant_cost_us,
+            runtime.placement_summary.estimated_matmul_cost_us,
         );
         println!(
             "    Residency: mode={:?}, pinned_tier={}, pinned_policy={}",
