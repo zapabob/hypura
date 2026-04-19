@@ -54,6 +54,7 @@ fn main() {
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
+        .define("GGML_CCACHE", "OFF")
         .define("GGML_CPU", "ON")
         .define("GGML_BLAS", "OFF")
         .define("GGML_CPU_REPACK", "OFF");
