@@ -14,14 +14,14 @@ Hypura has two shipped product surfaces:
 - Keep TurboQuant and Triality metadata inside GGUF workflows while preserving a plain `hypura` CLI surface.
 - Build Windows CUDA releases against an explicit toolkit version such as CUDA 12.8 without silently drifting to the newest installed Visual Studio CUDA integration.
 
-## What ships in v0.10.0
+## What ships in v0.11.0
 
 ### Native runtime
 
 - Tier-aware tensor placement across GPU, RAM, pinned host memory, and NVMe
 - `inspect`, `bench`, and `optimize` workflows for real model analysis and layout work
 - TurboQuant and Triality-aware runtime metadata handling
-- Vendored `llama.cpp` with `tq4_1s` GGML CPU support and staged CUDA dequant support
+- Vendored `llama.cpp` main sync with `tq4_1s` GGML CPU support, staged CUDA dequant support, Triality ABI hardening, and fail-closed metadata handling
 - Apple Silicon Metal path and Windows CUDA path in the same workspace
 
 ### KoboldCpp compatibility profile

@@ -52,6 +52,9 @@ fn main() {
         .define("CMAKE_BUILD_TYPE", "Release")
         .define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL")
         .define("LLAMA_BUILD_TESTS", "OFF")
+        // Hypura links against the vendored libraries only; skip tool targets so
+        // upstream tool-only link seams do not block runtime syncs.
+        .define("LLAMA_BUILD_TOOLS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_SERVER", "OFF")
         .define("GGML_CCACHE", "OFF")

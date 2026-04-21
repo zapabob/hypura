@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "hypura"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "hypura-sys"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bindgen",
  "cc",
