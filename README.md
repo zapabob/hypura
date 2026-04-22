@@ -1,39 +1,40 @@
 # Hypura
 
-Storage-tier-aware GGUF runtime plus a KoboldCpp-compatible server profile.
+Storage-tier-aware GGUF runtime and KoboldCpp-compatible server product.
 
-Hypura has two shipped product surfaces:
+Hypura ships two user-facing entrypoints:
 
-- `hypura serve`: the native Hypura runtime and HTTP server
-- `hypura koboldcpp`: a KoboldCpp-compatible supervisor/worker profile with vendored Kobold Lite, savedata bridges, OpenAI-compatible endpoints, and probe-gated multimodal surfaces
+- `hypura serve` for the native Hypura runtime and HTTP API
+- `hypura koboldcpp` for the KoboldCpp-compatible supervisor/worker stack with vendored Kobold Lite, savedata bridges, and probe-gated optional multimodal surfaces
 
-## TL;DR
+## Why Hypura
 
-- Run models that do not fit cleanly in GPU memory by placing tensors across GPU, RAM, pinned host memory, and NVMe.
-- Serve a KoboldCpp-compatible stack without standing up a separate proxy layer.
-- Keep TurboQuant and Triality metadata inside GGUF workflows while preserving a plain `hypura` CLI surface.
-- Build Windows CUDA releases against an explicit toolkit version such as CUDA 12.8 without silently drifting to the newest installed Visual Studio CUDA integration.
+- Keep oversized GGUF models moving by placing tensors across GPU, RAM, pinned host memory, and NVMe instead of treating VRAM as the only useful tier.
+- Expose a real KoboldCpp-compatible profile without adding a second proxy product beside the runtime.
+- Carry TurboQuant and Triality metadata end-to-end in GGUF workflows while keeping the public CLI and release surface simple.
+- Build Windows CUDA releases against an explicit toolkit such as CUDA 12.8 instead of drifting to whichever Visual Studio CUDA integration was installed last.
 
-## What ships in v0.11.0
+## What ships in v0.12.0
 
-### Native runtime
+### Core runtime
 
-- Tier-aware tensor placement across GPU, RAM, pinned host memory, and NVMe
-- `inspect`, `bench`, and `optimize` workflows for real model analysis and layout work
+- Tier-aware placement across GPU, RAM, pinned host memory, and NVMe
+- `inspect`, `bench`, `run`, and `optimize` workflows for analysis, benchmarking, and layout work
 - TurboQuant and Triality-aware runtime metadata handling
-- Vendored `llama.cpp` main sync with `tq4_1s` GGML CPU support, staged CUDA dequant support, Triality ABI hardening, and fail-closed metadata handling
-- Apple Silicon Metal path and Windows CUDA path in the same workspace
+- Vendored `llama.cpp` main sync with `tq4_1s` GGML CPU support, staged CUDA dequant support, fail-closed metadata handling, and two-layer Triality TurboQuant compatibility
+- Vendored `Turboquant-CUDA` main sync with TheTom-compatible Triality bridge metadata and refreshed GGUF profile tooling
+- Apple Silicon Metal and Windows CUDA in the same workspace
 
-### KoboldCpp compatibility profile
+### KoboldCpp compatibility
 
 - `hypura koboldcpp <model.gguf>` with KoboldCpp-style defaults such as port `5001`
-- Vendored Kobold Lite surface
+- Vendored Kobold Lite
 - Kobold extra/admin routes, state save/load, preload story, `.jsondb` bridge, and `.kcpps` launcher config bridge
 - OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, and `/v1/embeddings`
 - Built-in websearch route and supervisor-managed feature probing
-- Supervisor/worker split so compat reloads and feature state changes do not mutate the native `serve` path
+- Supervisor/worker split so compat reloads and feature-state changes stay out of the native `serve` path
 
-### Packaged Windows bootstrap path
+### Windows packaged path
 
 - Desktop-owned first-run asset bootstrap manifest
 - Probe-gated embeddings plus STT/TTS packaged path
@@ -41,9 +42,9 @@ Hypura has two shipped product surfaces:
 
 ## Compatibility snapshot
 
-The pinned KoboldCpp baseline is `v1.111.2`. Current manifest status lives in [docs/compat/koboldcpp-v1.111.2-parity-manifest.json](docs/compat/koboldcpp-v1.111.2-parity-manifest.json).
+The pinned KoboldCpp baseline is `v1.111.2`. The current implementation ledger lives in [docs/compat/koboldcpp-v1.111.2-parity-manifest.json](docs/compat/koboldcpp-v1.111.2-parity-manifest.json).
 
-Shipped compatibility areas:
+Implemented compatibility areas:
 
 - Kobold generation routes and admin/state endpoints
 - Vendored Kobold Lite
@@ -52,15 +53,15 @@ Shipped compatibility areas:
 - Probe-gated multimodal proxy routes
 - Windows packaged asset bootstrap for embeddings plus audio
 
-Known limits that remain honest release notes:
+Still honest about current limits:
 
 - Packaged Stable Diffusion payloads are still optional rather than part of the default packaged-ready set
 - Multimodal feature flags depend on actual local assets or helper availability
 - Ollama parity still needs a full audit pass even though compatibility surfaces exist
 
-## Benchmark score
+## Benchmark evidence
 
-Current benchmark score is computed from the JSON corpus in `benchmarks/results/` and summarized with mean +/- SD, error-bar charts, and multi-group comparison tables in [benchmarks/CHARTS.md](benchmarks/CHARTS.md).
+Benchmark output is computed from the JSON corpus in `benchmarks/results/` and summarized with mean +/- SD, error-bar charts, and multi-group comparison tables in [benchmarks/CHARTS.md](benchmarks/CHARTS.md).
 
 Current measured hardware corpus:
 
@@ -151,12 +152,13 @@ cargo build --bin hypura --message-format short
 - `src/server/` - native HTTP surface plus compat supervisor/worker layers
 - `hypura-sys/` - vendored `llama.cpp` FFI build
 - `vendor/llama.cpp/` - upstream runtime dependency
+- `vendor/turboquant-cuda/` - vendored TurboQuant reference implementation and metadata tooling
 - `docs/compat/` - pinned compatibility manifests and packaged asset manifests
 - `hypura-desktop/` - packaged desktop bootstrap shell
 
-## Release notes for operators
+## Release flow
 
-- Use [RELEASING.md](RELEASING.md) for version alignment, stable branch flow, tagging, and GitHub CLI release steps.
+- Use [RELEASING.md](RELEASING.md) for version alignment, versioned stable branch flow, tagging, and GitHub CLI release steps.
 - On Windows, stop concurrent `cargo` and `rustc` processes before builds to avoid stale file locks.
 - After `llama.cpp` or FFI changes, prefer cleaning `hypura-sys` outputs rather than wiping the entire workspace by default.
 

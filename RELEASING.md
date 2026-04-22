@@ -63,44 +63,43 @@ Typical Windows bundle outputs (paths vary slightly by Tauri version):
 
 macOS: `.dmg` / `.app` under `bundle/`. Attach what you built to the GitHub Release.
 
-## 6. Stable branch workflow
+## 6. Versioned stable branch workflow
 
-Create **`stable`** once (optional but useful for hotfixes):
+For release trains, cut a versioned stable branch such as **`stable/v0.12.0`** from the release commit:
 
 ```sh
 git checkout main
 git pull
-git checkout -b stable
-git push -u origin stable
+git checkout -b stable/v0.12.0
+git push -u origin stable/v0.12.0
 ```
 
-**Normal release:** merge `main` into `stable`, then tag the `stable` tip:
+Recommended flow:
 
-```sh
-git checkout stable
-git merge main
-git push origin stable
-```
+- prepare and verify the release commit on `main`
+- branch `stable/vX.Y.Z` from that exact commit
+- push both `main` and `stable/vX.Y.Z`
+- tag the shared release commit with `vX.Y.Z`
 
-**Hotfix:** commit on `stable`, push, then tag from `stable` (cherry-pick back to `main` as needed).
+Hotfixes after release can land on the versioned stable branch first and then be cherry-picked or merged back to `main` as needed.
 
 ## 7. Tag and `gh release create`
 
 Use tag **`vX.Y.Z`** (with `v` prefix) matching the bumped version.
 
 ```sh
-git tag -a v0.11.0 -m "release v0.11.0"
-git push origin v0.11.0
+git tag -a v0.12.0 -m "release v0.12.0"
+git push origin v0.12.0
 ```
 
 **Windows example** — attach CLI binary + Tauri installer (adjust paths to your build outputs):
 
 ```powershell
-gh release create v0.11.0 `
-  --title "Hypura v0.11.0" `
+gh release create v0.12.0 `
+  --title "Hypura v0.12.0" `
   --notes "See README and git log for changes." `
-  "target/release/hypura.exe#hypura-0.11.0-windows-x86_64.exe" `
-  "hypura-desktop/src-tauri/target/release/bundle/nsis/Hypura Desktop_0.11.0_x64-setup.exe#hypura-desktop-0.11.0-windows-x64-setup.exe"
+  "target/release/hypura.exe#hypura-0.12.0-windows-x86_64.exe" `
+  "hypura-desktop/src-tauri/target/release/bundle/nsis/Hypura Desktop_0.12.0_x64-setup.exe#hypura-desktop-0.12.0-windows-x64-setup.exe"
 ```
 
 Syntax: `"local/path#DisplayName"` renames the asset on GitHub. If your NSIS/MSI filename differs, tab-complete the path.
@@ -108,8 +107,8 @@ Syntax: `"local/path#DisplayName"` renames the asset on GitHub. If your NSIS/MSI
 **Linux / macOS** — attach `target/release/hypura` and/or zip:
 
 ```sh
-gh release create v0.11.0 \
-  --title "Hypura v0.11.0" \
+gh release create v0.12.0 \
+  --title "Hypura v0.12.0" \
   --notes "See README." \
   target/release/hypura
 ```
@@ -117,7 +116,7 @@ gh release create v0.11.0 \
 ## 8. Verify
 
 ```sh
-gh release view v0.11.0
+gh release view v0.12.0
 ```
 
 ## 9. CI tokens
