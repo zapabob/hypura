@@ -2857,6 +2857,9 @@ mod tests {
         };
 
         assert!(!should_delegate_turboquant_runtime_to_llama(&resolved));
+    }
+
+    #[test]
     fn restored_prefix_len_requires_matching_prefix_and_state_bytes() {
         let snapshot = ContextStateSnapshot {
             token_ids: vec![1, 2, 3],
