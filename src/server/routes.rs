@@ -1101,6 +1101,47 @@ async fn show_handler(
         .or(req.model.as_deref())
         .unwrap_or(model_name.as_str())
         .to_string();
+    let mut model_info = serde_json::json!({
+        "general.name": requested_model,
+        "general.architecture": info.architecture.clone(),
+        "general.context_length": info.context_length,
+        "general.parameter_count": info.parameter_count,
+        "hypura.turboquant.mode": state.turboquant.mode.as_str(),
+        "hypura.turboquant.schema": state.turboquant.schema_label(),
+        "hypura.turboquant.config_path": state.turboquant.source_label(),
+        "hypura.turboquant.runtime_status": turboquant_runtime_status(
+            state.turboquant.mode,
+            state.turboquant.config.is_some(),
+        ),
+    });
+    if let (Some(elt_loop), Some(object)) = (&info.elt_loop, model_info.as_object_mut()) {
+        object.insert("elt.loop.enabled".into(), serde_json::json!(elt_loop.enabled));
+        object.insert("elt.loop.required".into(), serde_json::json!(elt_loop.required));
+        object.insert("elt.loop.L_min".into(), serde_json::json!(elt_loop.l_min));
+        object.insert(
+            "elt.loop.L_default".into(),
+            serde_json::json!(elt_loop.l_default),
+        );
+        object.insert("elt.loop.L_max".into(), serde_json::json!(elt_loop.l_max));
+        object.insert(
+            "elt.loop_unit".into(),
+            serde_json::json!(elt_loop.loop_unit_label()),
+        );
+        object.insert(
+            "elt.loop.model_family".into(),
+            serde_json::json!(elt_loop.family_label()),
+        );
+        object.insert(
+            "elt.gguf.runtime_status".into(),
+            serde_json::json!(elt_loop.gguf_runtime_status.as_deref().unwrap_or("unknown")),
+        );
+        object.insert(
+            "hypura.elt_loop.runtime_gate".into(),
+            serde_json::json!(elt_loop.runtime_gate_label(
+                crate::model::elt_loop::elt_loop_runtime_supported_from_env()
+            )),
+        );
+    }
     Json(ShowResponse {
         details: ModelDetails {
             format: "gguf".into(),
@@ -1108,19 +1149,7 @@ async fn show_handler(
             parameter_size: format_parameter_size(info.parameter_count),
             quantization_level: info.quantization.clone(),
         },
-        model_info: serde_json::json!({
-            "general.name": requested_model,
-            "general.architecture": info.architecture,
-            "general.context_length": info.context_length,
-            "general.parameter_count": info.parameter_count,
-            "hypura.turboquant.mode": state.turboquant.mode.as_str(),
-            "hypura.turboquant.schema": state.turboquant.schema_label(),
-            "hypura.turboquant.config_path": state.turboquant.source_label(),
-            "hypura.turboquant.runtime_status": turboquant_runtime_status(
-                state.turboquant.mode,
-                state.turboquant.config.is_some(),
-            ),
-        }),
+        model_info,
     })
 }
 
@@ -1312,6 +1341,7 @@ async fn switch_loaded_model_runtime(
             .clone()
             .unwrap_or_else(|| "unknown".into()),
         context_length: setup.metadata.context_length,
+        elt_loop: setup.elt_loop.clone(),
     };
 
     let config = crate::compute::inference::InferenceConfig {

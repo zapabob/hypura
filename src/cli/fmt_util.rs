@@ -1,5 +1,7 @@
 use std::io::{stderr, IsTerminal};
 
+use hypura::model::elt_loop::{elt_loop_runtime_supported_from_env, EltLoopMetadata};
+
 /// Whether to show indicatif spinners/bars (stderr TTY, not CI, NO_COLOR unset).
 pub fn cli_progress_enabled() -> bool {
     stderr().is_terminal()
@@ -36,4 +38,23 @@ pub fn format_bandwidth(bytes_per_sec: u64) -> String {
     } else {
         format!("{:.0} MB/s", bytes_per_sec as f64 / 1e6)
     }
+}
+
+pub fn print_elt_loop_status(elt_loop: Option<&EltLoopMetadata>, prefix: &str) {
+    let Some(elt_loop) = elt_loop else {
+        return;
+    };
+    let runtime_supported = elt_loop_runtime_supported_from_env();
+    println!(
+        "{prefix}ELT loop: enabled={}, required={}, L_min={}, L_default={}, L_max={}, unit={}, family={}, runtime_status={}, gate={}",
+        elt_loop.enabled,
+        elt_loop.required,
+        elt_loop.l_min,
+        elt_loop.l_default,
+        elt_loop.l_max,
+        elt_loop.loop_unit_label(),
+        elt_loop.family_label(),
+        elt_loop.gguf_runtime_status.as_deref().unwrap_or("unknown"),
+        elt_loop.runtime_gate_label(runtime_supported),
+    );
 }

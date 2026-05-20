@@ -16,7 +16,7 @@ use hypura::scheduler::types::{HostPinnedPolicy, ResidencyPolicyConfig, Residenc
 use hypura::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use super::fmt_util::{cli_progress_enabled, format_bytes, format_params};
+use super::fmt_util::{cli_progress_enabled, format_bytes, format_params, print_elt_loop_status};
 
 const DEFAULT_PROMPT: &str = "Write a short paragraph about artificial intelligence.";
 
@@ -167,6 +167,7 @@ async fn run_async(
                 );
             }
         }
+        print_elt_loop_status(base_runtime.elt_loop.as_ref(), "  ");
         println!("  Dry-run: benchmark plan resolved without loading model weights");
         return Ok(());
     }
@@ -229,6 +230,7 @@ async fn run_async(
             base_runtime.turboquant.config.is_some()
         ),
     );
+    print_elt_loop_status(base_runtime.elt_loop.as_ref(), "  ");
     println!(
         "  Config: context={}, max_tokens={}, baseline={}",
         context,

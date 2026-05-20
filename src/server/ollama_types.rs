@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::model::elt_loop::EltLoopMetadata;
+
 // ── Request types ──
 
 #[derive(Debug, Deserialize)]
@@ -562,4 +564,5 @@ pub struct GgufInfo {
     pub parameter_count: u64,
     pub quantization: String,
     pub context_length: u32,
+    pub elt_loop: Option<EltLoopMetadata>,
 }

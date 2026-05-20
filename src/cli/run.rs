@@ -10,7 +10,7 @@ use hypura::scheduler::types::{
 use hypura::telemetry::metrics::TelemetryEmitter;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use super::fmt_util::{cli_progress_enabled, format_bytes};
+use super::fmt_util::{cli_progress_enabled, format_bytes, print_elt_loop_status};
 
 pub fn run(
     model_path: &str,
@@ -115,6 +115,7 @@ async fn run_async(
             weight.tensor_plan_entries,
         );
     }
+    print_elt_loop_status(runtime.elt_loop.as_ref(), "  ");
 
     print_placement_header(
         &runtime.placement_summary,

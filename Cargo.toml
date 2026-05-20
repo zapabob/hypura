@@ -4,7 +4,7 @@ exclude = ["hypura-desktop"]
 resolver = "2"
 
 [workspace.package]
-version = "0.12.0"
+version = "0.15.0"
 edition = "2024"
 license = "MIT"
 
@@ -15,6 +15,10 @@ edition.workspace = true
 license.workspace = true
 description = "Storage-tier-aware LLM inference scheduler"
 default-run = "hypura"
+
+[features]
+default = []
+kobold-gui = []
 
 [[bin]]
 name = "hypura"

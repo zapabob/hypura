@@ -1,3 +1,4 @@
+pub mod elt_loop;
 pub mod gguf;
 pub mod metadata;
 pub mod safetensors;

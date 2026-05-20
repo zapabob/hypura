@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use hypura::model::{
-    gguf::GgufFile, metadata::ModelMetadata, tensor_role::TensorRole,
+    elt_loop::EltLoopMetadata, gguf::GgufFile, metadata::ModelMetadata, tensor_role::TensorRole,
     turboquant_sidecar::{read_gguf_turboquant_config, resolve_turboquant_config, TurboQuantMode},
 };
 
-use super::fmt_util::{format_bytes, format_params};
+use super::fmt_util::{format_bytes, format_params, print_elt_loop_status};
 
 pub fn run(
     model_path: &str,
@@ -41,6 +41,7 @@ fn inspect_gguf(
 ) -> anyhow::Result<()> {
     let gguf = GgufFile::open(path)?;
     let metadata = ModelMetadata::from_gguf(&gguf)?;
+    let elt_loop = EltLoopMetadata::from_gguf(&gguf);
 
     println!("Model: {}", path.display());
     println!("  Format: GGUF v{}", gguf.version);
@@ -67,6 +68,7 @@ fn inspect_gguf(
         gguf.total_tensor_bytes() as f64 / (1u64 << 30) as f64
     );
     println!("  Tensors: {}", gguf.tensors.len());
+    print_elt_loop_status(elt_loop.as_ref(), "  ");
 
     if let Some(tq) = read_gguf_turboquant_config(&gguf, &metadata)? {
         println!("  Triality/TurboQuant:");

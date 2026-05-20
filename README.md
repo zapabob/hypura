@@ -14,15 +14,16 @@ Hypura ships two user-facing entrypoints:
 - Carry TurboQuant and Triality metadata end-to-end in GGUF workflows while keeping the public CLI and release surface simple.
 - Build Windows CUDA releases against an explicit toolkit such as CUDA 12.8 instead of drifting to whichever Visual Studio CUDA integration was installed last.
 
-## What ships in v0.12.0
+## What ships in v0.15.0
 
 ### Core runtime
 
 - Tier-aware placement across GPU, RAM, pinned host memory, and NVMe
 - `inspect`, `bench`, `run`, and `optimize` workflows for analysis, benchmarking, and layout work
 - TurboQuant and Triality-aware runtime metadata handling
-- Vendored `llama.cpp` main sync with `tq4_1s` GGML CPU support, staged CUDA dequant support, fail-closed metadata handling, and two-layer Triality TurboQuant compatibility
-- Vendored `Turboquant-CUDA` main sync with TheTom-compatible Triality bridge metadata and refreshed GGUF profile tooling
+- ELT loop metadata detection for `elt.loop.*` GGUFs, with a fail-closed gate so `elt.loop.required=true` models are not silently run as L=1 unless a verified loop-aware `zapabob/llama.cpp` runtime is selected
+- Vendored `llama.cpp` main sync through `a9cebe03` with the May 2026 upstream sync, server/router CUDA context guard, MTP support, refactored conversion modules, TurboQuant CUDA kernel refreshes, and the current main-branch attention-rotation verification notes
+- Vendored `Turboquant-CUDA` main sync through `df771a2`, including default-branch dependency remediation, Triality SO8 audit artifacts, Qwen3.5-4B TQ4 export support, with its nested `zapabob/llama.cpp` pointer committed on `Turboquant-CUDA` main at the same `a9cebe03` runtime
 - Apple Silicon Metal and Windows CUDA in the same workspace
 
 ### KoboldCpp compatibility
@@ -55,6 +56,9 @@ Implemented compatibility areas:
 
 Still honest about current limits:
 
+- Official `llama.cpp` and LM Studio should be treated as L=1-compatible for looped ELT GGUFs.
+- L>=2 ELT execution requires the zapabob stack: `Turboquant-CUDA` for preserving `ELT/Qwen3.5-looped` metadata, `zapabob/llama.cpp` for loop-aware decode/graph execution, and Hypura for selecting and distributing that verified runtime build.
+- Hypura does not make an `elt.loop.required=true` model loop-aware by itself. Runtime commands fail closed unless `HYPURA_ELT_LOOP_RUNTIME_SUPPORTED=1` is set for a verified loop-aware `zapabob/llama.cpp` build.
 - Packaged Stable Diffusion payloads are still optional rather than part of the default packaged-ready set
 - Multimodal feature flags depend on actual local assets or helper availability
 - Ollama parity still needs a full audit pass even though compatibility surfaces exist

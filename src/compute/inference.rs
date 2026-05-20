@@ -16,6 +16,7 @@ use crate::compute::nvme_backend::{
     HypuraBuftController, LayerStatus, PrefetchState, build_override_patterns, eval_callback,
 };
 use crate::io::compat;
+use crate::model::elt_loop::{EltLoopMetadata, elt_loop_runtime_supported_from_env};
 use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 use crate::model::tensor_role::TensorRole;
@@ -428,6 +429,7 @@ pub struct RuntimeSetup {
     pub hardware: HardwareProfile,
     pub gguf: GgufFile,
     pub metadata: ModelMetadata,
+    pub elt_loop: Option<EltLoopMetadata>,
     pub plan: PlacementPlan,
     pub placement_summary: PlacementSummary,
     pub n_gpu_layers: i32,
@@ -722,6 +724,7 @@ pub fn resolve_runtime_setup(
 
     let gguf = GgufFile::open(model_path)?;
     let metadata = ModelMetadata::from_gguf(&gguf)?;
+    let elt_loop = prepare_elt_loop_runtime(&gguf)?;
     let turboquant = resolve_turboquant_config(
         model_path,
         &metadata,
@@ -747,11 +750,27 @@ pub fn resolve_runtime_setup(
         hardware,
         gguf,
         metadata,
+        elt_loop,
         plan,
         placement_summary,
         n_gpu_layers,
         turboquant,
     })
+}
+
+fn prepare_elt_loop_runtime(gguf: &GgufFile) -> anyhow::Result<Option<EltLoopMetadata>> {
+    let elt_loop = EltLoopMetadata::from_gguf(gguf);
+    if let Some(ref metadata) = elt_loop {
+        metadata.ensure_runtime_supported(elt_loop_runtime_supported_from_env())?;
+        apply_gguf_elt_loop_env(metadata);
+    }
+    Ok(elt_loop)
+}
+
+fn apply_gguf_elt_loop_env(metadata: &EltLoopMetadata) {
+    for (key, value) in metadata.llama_env_pairs() {
+        set_process_env_var(key, value);
+    }
 }
 
 fn apply_gguf_turboquant_env(gguf_turboquant: Option<&GgufTurboQuantConfig>) {
@@ -1291,6 +1310,7 @@ pub fn load_model(
 ) -> anyhow::Result<LoadedModel> {
     let backend = LlamaBackend::init();
     let metadata = ModelMetadata::from_gguf(gguf)?;
+    prepare_elt_loop_runtime(gguf)?;
     let turboquant_layout = turboquant_runtime_layout(&metadata, turboquant.mode);
     validate_turboquant_runtime_mode(turboquant)?;
 
@@ -2052,6 +2072,7 @@ pub fn generate_with_nvme_scheduling(
 ) -> anyhow::Result<GenerationResult> {
     let _backend = LlamaBackend::init();
     let metadata = ModelMetadata::from_gguf(gguf)?;
+    prepare_elt_loop_runtime(gguf)?;
     let turboquant_layout = turboquant_runtime_layout(&metadata, turboquant.mode);
     let turboquant_session = build_turboquant_runtime_session(turboquant, turboquant_layout)?;
 

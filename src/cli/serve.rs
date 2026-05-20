@@ -26,7 +26,7 @@ use hypura::telemetry::metrics::TelemetryEmitter;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{Value, json};
 
-use super::fmt_util::{cli_progress_enabled, format_bytes};
+use super::fmt_util::{cli_progress_enabled, format_bytes, print_elt_loop_status};
 
 fn set_process_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
     unsafe {
@@ -546,6 +546,7 @@ async fn run_async(
                 );
             }
         }
+        print_elt_loop_status(runtime.elt_loop.as_ref(), "  ");
         if let Some(storage) = compat_storage.as_ref() {
             println!(
                 "  Compat storage: {}",
@@ -573,6 +574,7 @@ async fn run_async(
             .clone()
             .unwrap_or_else(|| "unknown".into()),
         context_length: runtime.metadata.context_length,
+        elt_loop: runtime.elt_loop.clone(),
     };
 
     let config = inference::InferenceConfig {
@@ -821,6 +823,7 @@ async fn run_async(
             );
         }
     }
+    print_elt_loop_status(runtime.elt_loop.as_ref(), "  ");
     println!(
         "  Placement: {} GPU | {} host pageable | {} host pinned | {} NVMe",
         format_bytes(runtime.placement_summary.total_gpu_bytes),
