@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hypura - Local LLM Runtime</title>
+    <meta
+      name="description"
+      content="Hypura is a storage-tier-aware local LLM runtime for GGUF, KoboldCpp-compatible serving, and Triality/TurboQuant workflows."
+    />
+    <meta property="og:title" content="Hypura" />
+    <meta
+      property="og:description"
+      content="A local LLM runtime that coordinates GPU, memory, and NVMe for large GGUF workloads."
+    />
+    <meta property="og:image" content="assets/hypura-hero.png" />
+    <meta name="theme-color" content="#050607" />
+    <link rel="preload" href="assets/hypura-hero.png" as="image" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#overview">Skip to overview</a>
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <img class="hero__image" src="assets/hypura-hero.png" alt="" aria-hidden="true" />
+        <div class="hero__shade"></div>
+        <div class="hero__content">
+          <p class="eyebrow">Hypura v0.15.0</p>
+          <h1 id="hero-title">Hypura</h1>
+          <p class="hero__lead">
+            A local GGUF runtime shaped for large-model inference, KoboldCpp-compatible serving,
+            and storage-aware execution across GPU, memory, and NVMe.
+          </p>
+          <div class="hero__actions" aria-label="Primary actions">
+            <a class="button button--primary" href="https://github.com/zapabob/hypura/releases/tag/v0.15.0">Download</a>
+            <a class="button button--secondary" href="https://github.com/zapabob/hypura">GitHub</a>
+          </div>
+        </div>
+      </section>
+
+      <section id="overview" class="release-band" aria-label="Release status">
+        <div>
+          <span class="release-band__label">Stable release</span>
+          <strong>v0.15.0</strong>
+        </div>
+        <div>
+          <span class="release-band__label">Main snapshot</span>
+          <strong>7b4a3ba</strong>
+        </div>
+        <div>
+          <span class="release-band__label">Runtime profile</span>
+          <strong>GGUF + KoboldCpp</strong>
+        </div>
+      </section>
+
+      <section class="section section--light" aria-labelledby="runtime-title">
+        <div class="section__inner">
+          <p class="eyebrow eyebrow--dark">Runtime Architecture</p>
+          <h2 id="runtime-title">Built for models that outgrow one memory tier.</h2>
+          <p class="section__intro">
+            Hypura coordinates model placement, GGUF metadata, and compatibility surfaces so local
+            inference can move through one predictable runtime path.
+          </p>
+          <div class="feature-grid">
+            <article class="feature-card">
+              <span class="feature-card__kicker">01</span>
+              <h3>Storage-tier scheduling</h3>
+              <p>Placement logic treats GPU, RAM, and NVMe as explicit execution resources.</p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-card__kicker">02</span>
+              <h3>KoboldCpp-compatible serving</h3>
+              <p>Use the familiar Kobold API surface while running through the Hypura product path.</p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-card__kicker">03</span>
+              <h3>Loop-aware GGUF metadata</h3>
+              <p>Preserves ELT loop metadata and runtime status for compatible downstream tools.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section section--dark" aria-labelledby="release-title">
+        <div class="section__inner section__inner--split">
+          <div>
+            <p class="eyebrow">Release</p>
+            <h2 id="release-title">Pinned, packaged, and clone-reproducible.</h2>
+          </div>
+          <div class="release-links" aria-label="Release links">
+            <a href="https://github.com/zapabob/hypura/releases/tag/v0.15.0">
+              <span>Stable branch</span>
+              <strong>v0.15.0 full-source tar.gz</strong>
+            </a>
+            <a href="https://github.com/zapabob/hypura/releases/tag/main-v0.15.0">
+              <span>Main branch</span>
+              <strong>main-v0.15.0 full-source tar.gz</strong>
+            </a>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
