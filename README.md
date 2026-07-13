@@ -1,114 +1,120 @@
-# Hypura
+# Hypura v1.0.0
 
-Storage-tier-aware GGUF runtime and KoboldCpp-compatible server product.
+Hypura is a storage-tier-aware GGUF runtime with a Triality Council execution path, native HTTP API, and KoboldCpp-compatible server profile.
 
-Hypura ships two user-facing entrypoints:
+Version 1.0.0 is the first stable Council release. Its Windows binary is built for NVIDIA RTX 50-series GPUs with CUDA 12.8 and compute capability `sm_120`. The release carries a CLI executable, recursive fullsource archive, MSI, NSIS installer, and SHA-256 manifests on both the stable and main release tracks.
 
-- `hypura serve` for the native Hypura runtime and HTTP API
-- `hypura koboldcpp` for the KoboldCpp-compatible supervisor/worker stack with vendored Kobold Lite, savedata bridges, and probe-gated optional multimodal surfaces
+## What v1.0.0 adds
 
-## Why Hypura
+### Triality Council
 
-- Keep oversized GGUF models moving by placing tensors across GPU, RAM, pinned host memory, and NVMe instead of treating VRAM as the only useful tier.
-- Expose a real KoboldCpp-compatible profile without adding a second proxy product beside the runtime.
-- Carry TurboQuant and Triality metadata end-to-end in GGUF workflows while keeping the public CLI and release surface simple.
-- Build Windows CUDA releases against an explicit toolkit such as CUDA 12.8 instead of drifting to whichever Visual Studio CUDA integration was installed last.
+The dedicated Answer Council evaluates three Triality views of the same prompt and selects one response through deterministic 3 x 3 teacher-forced cross-scoring. It deliberately rejects attention-consensus and synthesis requests instead of silently treating them as Answer Council work. Native per-layer Triality execution remains available on the ordinary `run`, `serve`, and compatible worker paths when the loaded schema-v2 model advertises the requested capability.
 
-## What ships in v0.15.0
+Sequential execution is the safe default. `auto` permits parallel answer contexts only when the scheduler can preserve the configured VRAM headroom; an explicitly requested parallel run fails closed when its memory budget is not admissible.
 
-### Core runtime
+The trace-enabled Council API response records the selected candidate, scoring matrix, memory decision, NC-KA gate outcome, URT report, capabilities, and Aha evaluation. The default persistent record keeps selection and cross-score evidence, an Aha event when available, and content only according to the explicit storage policy; it does not persist the complete trace. Prompt text and private candidate text are not written to persistent telemetry by default.
 
-- Tier-aware placement across GPU, RAM, pinned host memory, and NVMe
-- `inspect`, `bench`, `run`, and `optimize` workflows for analysis, benchmarking, and layout work
-- TurboQuant and Triality-aware runtime metadata handling
-- ELT loop metadata detection for `elt.loop.*` GGUFs, with a fail-closed gate so `elt.loop.required=true` models are not silently run as L=1 unless a verified loop-aware `zapabob/llama.cpp` runtime is selected
-- Vendored `llama.cpp` main sync through `a9cebe03` with the May 2026 upstream sync, server/router CUDA context guard, MTP support, refactored conversion modules, TurboQuant CUDA kernel refreshes, and the current main-branch attention-rotation verification notes
-- Vendored `Turboquant-CUDA` main sync through `df771a2`, including default-branch dependency remediation, Triality SO8 audit artifacts, Qwen3.5-4B TQ4 export support, with its nested `zapabob/llama.cpp` pointer committed on `Turboquant-CUDA` main at the same `a9cebe03` runtime
-- Apple Silicon Metal and Windows CUDA in the same workspace
+### Triality schema v2
 
-### KoboldCpp compatibility
+`zapabob/Turboquant-CUDA` is the schema producer and verifier. The v2 contract adds deterministic bundle metadata, short canonical tensor identifiers, manifest hashing, strict dtype and shape validation, NC-KA and URT descriptors, and negative validation for incomplete or contradictory bundles. Schema v1 remains readable for the legacy single-view path.
 
-- `hypura koboldcpp <model.gguf>` with KoboldCpp-style defaults such as port `5001`
-- Vendored Kobold Lite
-- Kobold extra/admin routes, state save/load, preload story, `.jsondb` bridge, and `.kcpps` launcher config bridge
-- OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, and `/v1/embeddings`
-- Built-in websearch route and supervisor-managed feature probing
-- Supervisor/worker split so compat reloads and feature-state changes stay out of the native `serve` path
+`zapabob/llama.cpp` is the low-level runtime authority. It owns strict GGUF contract parsing, rotation-tensor structural and SO(8) validation, caller-owned public C ABI buffers, context configuration, capability reporting, fused attention consensus, and low-level finite-metric capture. Hypura verifies the embedded controller's physical-byte hash, evaluates request-level NC-KA, projects memory across storage tiers, applies fail-closed admission, and owns privacy-safe Council and URT persistence. Storage-changing context configuration is reserved before allocation; it is not silently changed after decode begins.
 
-### Windows packaged path
+### NC-KA, URT, and Aha
 
-- Desktop-owned first-run asset bootstrap manifest
-- Probe-gated embeddings plus STT/TTS packaged path
-- Structured unavailable responses when optional multimodal backends are not ready instead of optimistic success flags
+NC-KA checks the numerical rank and conditioning evidence required by a configured Council policy. URT records reproducible transformation and selection evidence under a configured data root: the HTTP service uses its application-data root, while the CLI uses the parent of its explicit `--output-dir`. Aha activation requires both an explicit safety comparator and calibration evidence; without them, Aha remains disabled rather than reporting an unsupported safety claim.
 
-## Compatibility snapshot
+### Existing runtime surfaces
 
-The pinned KoboldCpp baseline is `v1.111.2`. The current implementation ledger lives in [docs/compat/koboldcpp-v1.111.2-parity-manifest.json](docs/compat/koboldcpp-v1.111.2-parity-manifest.json).
+Hypura continues to provide:
 
-Implemented compatibility areas:
+- tier-aware tensor placement across GPU, pinned host memory, pageable RAM, and NVMe
+- native `run`, `serve`, `inspect`, `estimate`, `bench`, `profile`, `iobench`, and `optimize` workflows
+- a KoboldCpp-compatible supervisor/worker profile with vendored Kobold Lite
+- OpenAI-compatible completions, chat completions, and embeddings routes
+- savedata, preload story, launcher configuration, and probe-gated optional multimodal bridges
+- ELT loop metadata detection with a fail-closed runtime gate
 
-- Kobold generation routes and admin/state endpoints
-- Vendored Kobold Lite
-- OpenAI chat, completions, and embeddings
-- Savedata and launcher config bridges
-- Probe-gated multimodal proxy routes
-- Windows packaged asset bootstrap for embeddings plus audio
+## Source authority and reproducibility
 
-Still honest about current limits:
+The canonical runtime inputs are:
 
-- Official `llama.cpp` and LM Studio should be treated as L=1-compatible for looped ELT GGUFs.
-- L>=2 ELT execution requires the zapabob stack: `Turboquant-CUDA` for preserving `ELT/Qwen3.5-looped` metadata, `zapabob/llama.cpp` for loop-aware decode/graph execution, and Hypura for selecting and distributing that verified runtime build.
-- Hypura does not make an `elt.loop.required=true` model loop-aware by itself. Runtime commands fail closed unless `HYPURA_ELT_LOOP_RUNTIME_SUPPORTED=1` is set for a verified loop-aware `zapabob/llama.cpp` build.
-- Packaged Stable Diffusion payloads are still optional rather than part of the default packaged-ready set
-- Multimodal feature flags depend on actual local assets or helper availability
-- Ollama parity still needs a full audit pass even though compatibility surfaces exist
+- [zapabob/llama.cpp](https://github.com/zapabob/llama.cpp)
+- [zapabob/Turboquant-CUDA](https://github.com/zapabob/Turboquant-CUDA)
 
-## Benchmark evidence
+Hypura pins tested commits from both repositories. Every fullsource release recursively materializes direct and nested submodules and includes `SOURCE-MANIFEST.json` with the exact Hypura, llama.cpp, Turboquant-CUDA, and nested llama.cpp commits. Release checksums are listed in `SHA256SUMS.txt`.
 
-Benchmark output is computed from the JSON corpus in `benchmarks/results/` and summarized with mean +/- SD, error-bar charts, and multi-group comparison tables in [benchmarks/CHARTS.md](benchmarks/CHARTS.md).
+## Windows stable release requirements
 
-Current measured hardware corpus:
+The v1.0.0 prebuilt CLI and Desktop artifacts target:
 
-- `AMD Ryzen 5 4500 6-Core Processor / NVIDIA GeForce RTX 3060 / 31.9 GB RAM`
+- Windows 11 x86-64
+- NVIDIA RTX 50-series GPU with compute capability 12.0
+- NVIDIA CUDA 12.8 runtime
+- Microsoft Visual C++ runtime compatible with the Visual Studio 2022 build
 
-Best observed Hypura score per model in the current corpus:
+The release binary is intentionally rebuilt with `CUDA_PATH`, `HYPURA_CUDA_ARCHITECTURES`, and `CMAKE_CUDA_ARCHITECTURES` pinned to CUDA 12.8 and architecture 120. A binary importing CUDA 13 libraries does not pass the v1.0.0 release gate.
 
-| Model | Score group | Benchmark score (tok/s) | Samples | Notes |
-| --- | --- | --- | ---: | --- |
-| Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M | `hypura four-tier + auto` | `51.835 +/- 2.293` | 2 | Repeated Windows CUDA runs; paired `mmproj` projector was inspect-validated separately |
-| Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M | `hypura four-tier + auto` | `0.041 +/- 0.034` | 2 | Sparse MoE mmap path fell back to CPU-only on this machine; baseline remained faster in this corpus |
-| Shadows-MoE-Q6 | `hypura four-tier + off` | `1.158 +/- 0.111` | 2 | Includes repeated runs and a baseline comparator in `benchmarks/results/` |
-| supergemma4-Q8_0 | `hypura legacy-3tier + off` | `29.851 +/- 0.000` | 1 | Single-run exploratory datapoint; GPU-resident and not yet a stable replicated estimate |
+Source builds for other platforms remain available, but they are not represented by the Windows `sm_120` asset and must pass their own backend validation.
 
-Multi-group summary for the same corpus:
+## Install
 
-| Model | baseline | legacy-3tier + off | four-tier + off | four-tier + auto |
-| --- | ---: | ---: | ---: | ---: |
-| Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M | `41.681 +/- 4.357` | `50.390 +/- 3.980` | `29.407 +/- 34.425` | `51.835 +/- 2.293` |
-| Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M | `0.059 +/- 0.050` | `0.020 +/- 0.001` | `0.038 +/- 0.014` | `0.041 +/- 0.034` |
-| Shadows-MoE-Q6 | `1.121 +/- 0.023` | `1.086 +/- 0.029` | `1.158 +/- 0.111` | `0.984 +/- 0.334` |
-| supergemma4-Q8_0 | `N/A` | `29.851 +/- 0.000` | `0.173 +/- 0.000` | `0.167 +/- 0.000` |
+Download the stable assets from the `v1.0.0` GitHub release and verify them against `SHA256SUMS.txt`. The main snapshot uses the `main-v1.0.0` tag and contains the same tested source commit under channel-specific asset names.
 
-Read these numbers with the run count in mind:
+CLI users may place the verified executable in `%USERPROFILE%\.cargo\bin` or another directory on `PATH`. Desktop users may install either the MSI or NSIS package. Check the release notes for the code-signing status before running an installer.
 
-- `Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M` has `n=2`; `four-tier + auto` is currently the strongest replicated group, while `four-tier + off` shows very high variance.
-- `Huihui-Qwen3.6-35B-A3B-abliterated.Q4_K_M` has `n=2`, but all groups are very slow on this hardware because Hypura's sparse MoE mmap path fell back to CPU-only (`ngl=0`) once the 19.7 GB model exceeded the RTX 3060 GPU budget.
-- `Shadows-MoE-Q6` has `n=2` for every reported group, so SD reflects actual repetition.
-- `supergemma4-Q8_0` currently has `n=1`, so `+/- 0.000` means "only one observation", not "perfectly stable".
-- The `supergemma4-Q8_0` run is a full GPU-resident Windows CUDA datapoint, not an NVMe spill benchmark.
+```powershell
+hypura --version
+hypura --help
+hypura council --help
+```
 
 ## Quick start
 
-### Native runtime
+### Council generation
 
 ```powershell
-hypura serve .\model.gguf
+hypura council .\model.gguf `
+  --prompt 'Explain why deterministic evaluation matters.' `
+  --parallelism auto `
+  --cross-score `
+  --max-tokens 128
 ```
 
-### One-shot local generation
+Use `--parallelism sequential` when reproducibility and minimum peak memory are more important than latency. `parallel` is never treated as permission to exceed the configured headroom.
+
+### Native one-shot generation
 
 ```powershell
-hypura run .\model.gguf --prompt "Hello"
+hypura run .\model.gguf --prompt 'Hello' --max-tokens 128
+```
+
+### Native HTTP server
+
+```powershell
+hypura serve .\model.gguf --host 127.0.0.1 --port 8080
+```
+
+```powershell
+$body = @{
+  prompt = 'Explain Triality Council in one paragraph.'
+  parallelism = 'auto'
+  cross_score = $true
+  max_tokens = 128
+  stream = $false
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri 'http://127.0.0.1:8080/api/extra/triality/council' `
+  -ContentType 'application/json' `
+  -Body $body
+```
+
+The response includes an `id`. Retrieve the persisted privacy-safe trace with:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/api/extra/triality/council/<id>
 ```
 
 ### KoboldCpp-compatible profile
@@ -117,56 +123,73 @@ hypura run .\model.gguf --prompt "Hello"
 hypura koboldcpp .\model.gguf
 ```
 
-Useful follow-up routes:
+The default native endpoint is `http://127.0.0.1:8080`. The compatibility profile defaults to `http://127.0.0.1:5001`, with Kobold Lite at `/kobold-lite`.
 
-- native server default: `http://127.0.0.1:8080`
-- KoboldCpp profile default: `http://127.0.0.1:5001`
-- Kobold Lite: `http://127.0.0.1:5001/kobold-lite`
+## Build from source
 
-## Build
-
-### Standard build
+Initialize every submodule before building:
 
 ```powershell
-.\scripts\stop-cargo.ps1
-cargo build --release
+git submodule update --init --recursive
 ```
 
-### Windows CUDA 12.8 build
+For the supported Windows CUDA 12.8 release configuration:
 
 ```powershell
-.\scripts\stop-cargo.ps1
-$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
-$env:HYPURA_CUDA = "1"
-$env:HYPURA_CUDA_ARCHITECTURES = "86"
-cargo build --release
+$env:CUDA_PATH = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+$env:Path = "$env:CUDA_PATH\bin;$env:Path"
+$env:HYPURA_CUDA = '1'
+$env:HYPURA_CUDA_ARCHITECTURES = '120'
+$env:CMAKE_CUDA_ARCHITECTURES = '120'
+$env:CARGO_TARGET_DIR = 'H:\hypura-cargo-target-v1.0.0'
+
+$activeRustBuilds = Get-CimInstance Win32_Process | Where-Object {
+  $_.Name -in @('cargo.exe', 'rustc.exe')
+}
+if ($activeRustBuilds) {
+  $activeRustBuilds | Select-Object ProcessId,ParentProcessId,Name,CommandLine
+  throw 'Rust builds are active. Identify ownership and wait for or stop only release-owned processes before cleaning.'
+}
+
+cargo clean -p hypura-sys
+cargo build --release --locked --bin hypura
 ```
 
-If you need a fully isolated CUDA build tree:
+Use a target directory with sufficient free space. On Windows, clean `hypura-sys` whenever the pinned llama.cpp commit, public FFI header, CUDA toolkit, or CUDA architecture changes.
+
+Desktop installers are built separately:
 
 ```powershell
-$env:CARGO_TARGET_DIR = ".\target-cuda128"
-cargo build --bin hypura --message-format short
+Set-Location .\hypura-desktop
+npm ci
+$env:CARGO_TARGET_DIR = 'H:\hypura-desktop-release-target-v1.0.0'
+npm run tauri -- build
 ```
 
-## Repo map
+## Validation boundaries
 
-- `src/compute/` - runtime, inference, and storage-tier execution
-- `src/scheduler/` - placement and estimation logic
-- `src/server/` - native HTTP surface plus compat supervisor/worker layers
-- `hypura-sys/` - vendored `llama.cpp` FFI build
-- `vendor/llama.cpp/` - upstream runtime dependency
-- `vendor/turboquant-cuda/` - vendored TurboQuant reference implementation and metadata tooling
-- `docs/compat/` - pinned compatibility manifests and packaged asset manifests
-- `hypura-desktop/` - packaged desktop bootstrap shell
+The Turboquant schema fixture proves serialization, parser, manifest, and fail-closed behavior. It is not a runnable language model. Live Council QA uses a runnable GGUF whose original tensors are preserved byte-for-byte while a complete, deterministic identity-view schema-v2 bundle is materialized into the file. That fixture proves runtime wiring and view isolation; it is not evidence that identity views improve model quality.
 
-## Release flow
+The Aha false-positive target cannot be established from source code or an unlabeled smoke test. It requires a versioned labeled evaluation set, declared sample count, safety comparator, and recorded calculation. Until that evidence is present, Hypura reports Aha as disabled or uncalibrated.
 
-- Use [RELEASING.md](RELEASING.md) for version alignment, versioned stable branch flow, tagging, and GitHub CLI release steps.
-- On Windows, stop concurrent `cargo` and `rustc` processes before builds to avoid stale file locks.
-- After `llama.cpp` or FFI changes, prefer cleaning `hypura-sys` outputs rather than wiping the entire workspace by default.
+ELT loop execution has a separate gate. An `elt.loop.required=true` model is rejected unless the selected zapabob runtime has been verified for loop-aware decode and graph execution.
 
-## Related repositories
+## Repository map
 
-- [zapabob/Turboquant-CUDA](https://github.com/zapabob/Turboquant-CUDA)
-- [zapabob/llama.cpp](https://github.com/zapabob/llama.cpp)
+- `src/council/`: Council types, scoring, selection, NC-KA, and Aha policy
+- `src/urt/`: URT registry, reports, and privacy-safe persistence
+- `src/compute/`: llama.cpp FFI, inference contexts, and storage-tier execution
+- `src/scheduler/`: placement, VRAM headroom, and Council admission
+- `src/server/`: native API and compatibility supervisor/worker surfaces
+- `hypura-sys/`: vendored llama.cpp build and generated FFI boundary
+- `vendor/llama.cpp/`: pinned canonical runtime
+- `vendor/turboquant-cuda/`: pinned canonical schema producer and verifier
+- `hypura-desktop/`: Tauri Desktop application and installers
+- `scripts/package_fullsource.py`: deterministic recursive source packaging
+- `scripts/stage_release_assets.py`: channel-specific release staging and checksums
+
+## Release integrity
+
+The complete stable and main publication procedure is documented in [RELEASING.md](RELEASING.md). It includes source gates, CUDA dependency inspection, CLI and HTTP manual QA, Desktop builds, deterministic fullsource verification, overwrite installation, branches, tags, GitHub releases, and post-publication download checks.
+
+Security-sensitive or private Council inputs should not be attached to bug reports. Provide the source manifest, trace identifier, capability summary, and redacted telemetry instead.

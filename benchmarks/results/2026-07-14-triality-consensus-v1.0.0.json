@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-07-14T00:00:00+09:00",
+  "release": {
+    "version": "1.0.0",
+    "channel": [
+      "stable",
+      "main"
+    ],
+    "hypura_implementation_commit": "ece7acaed4c35ace5f9a0ffeeaa7b3bdcb92c469",
+    "llama_cpp_commit": "81b08be15c554918a8cfe20d5f0846038082430f",
+    "turboquant_cuda_commit": "d2e992e54a557990f9d2e38834987dbeb28d8ec0",
+    "nested_turboquant_llama_cpp_commit": "81b08be15c554918a8cfe20d5f0846038082430f"
+  },
+  "hardware": {
+    "cpu": "AMD Ryzen 5 4500 6-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "gpu_vram_bytes": 17102733312,
+    "cuda_compiler": "12.8.61",
+    "cuda_architecture": "sm_120"
+  },
+  "fixtures": {
+    "live_model": "stories260K-Q4_0-triality-v2-s260k.gguf",
+    "live_model_sha256": "5033056f4adb74a545126c9e44bc5a4c9b12253c88070154636dae381cfdaee7",
+    "identity_view_fallback": true,
+    "identity_view_fallback_scope": "developer wiring fixture only"
+  },
+  "tests": {
+    "hypura_workspace": {
+      "status": "pass",
+      "command": "cargo test --workspace --locked -j1",
+      "root_library_passed": 158,
+      "root_library_ignored": 1,
+      "cli_unit_passed": 11,
+      "failure_count": 0,
+      "log_sha256": "DA1753B7CAAF9B6BB3B01C25B3E70AAD10F978D99DE962002D2413D14B4BDF86"
+    },
+    "hypura_live_integration": {
+      "status": "pass",
+      "explicit_ignored_test_execution": true,
+      "deterministic_modes": [
+        "sequential",
+        "parallel",
+        "best_of_views",
+        "attention"
+      ]
+    },
+    "turboquant_schema_v2": {
+      "status": "pass",
+      "passed": 60,
+      "failed": 0
+    },
+    "llama_cpp_cpu_focused": {
+      "status": "pass",
+      "passed": 13,
+      "failed": 0
+    },
+    "llama_cpp_cpu_full": {
+      "status": "baseline_exception",
+      "passed": 63,
+      "failed": 1,
+      "exception": "unchanged test-quantize-fns q2_0 threshold failure"
+    },
+    "llama_cpp_cuda_focused": {
+      "status": "pass",
+      "passed": 5,
+      "failed": 0
+    },
+    "llama_cpp_cuda_live": {
+      "status": "pass",
+      "tests": 3,
+      "assertions": 41
+    },
+    "clippy_advisory": {
+      "status": "pass_with_warnings",
+      "command": "cargo clippy --workspace --all-targets --locked -j1",
+      "strict_deny_warnings_status": "baseline_exception",
+      "strict_deny_warnings_reason": "pre-existing workspace-wide style warnings under Rust 1.94"
+    }
+  },
+  "triality_live": {
+    "peak_contexts": {
+      "sequential": 1,
+      "parallel": 3
+    },
+    "latency_ms": {
+      "sequential": 89,
+      "parallel": 69,
+      "candidate_vector": [
+        2,
+        2,
+        1
+      ],
+      "mode_first_run": {
+        "vector": 492,
+        "best_of_views": 9,
+        "attention": 296
+      },
+      "mode_second_run": {
+        "vector": 11,
+        "best_of_views": 11,
+        "attention": 302
+      }
+    },
+    "selection": {
+      "selected_view": "vector",
+      "cross_scores": [
+        -0.558008879874067,
+        -0.558008879874067,
+        -0.558008879874067
+      ],
+      "selection_margin": 0.0,
+      "ncka_rank": null,
+      "ncka_rank_unavailable_reason": "the identity-view fixture exposes no low-level rank observation",
+      "urt_error": null,
+      "urt_error_unavailable_reason": "the identity-view fixture exposes no independent cross-representation observation"
+    },
+    "aha": {
+      "enabled": false,
+      "precision": null,
+      "activation_frequency": null,
+      "unavailable_reason": "no labeled evaluation suite was supplied; no quality-improvement claim is made"
+    }
+  },
+  "cuda_operator": {
+    "max_attention_output_frobenius_relative_error": 3.06652582e-07,
+    "prefill_latency_ms": {
+      "mean": 0.32916,
+      "p50": 0.2828,
+      "p95": 0.5055
+    },
+    "decode_latency_ms": {
+      "mean": 0.040475,
+      "p50": 0.0358,
+      "p95": 0.0652
+    },
+    "free_vram_bytes_at_observation": 15907946496,
+    "peak_vram_bytes": null,
+    "peak_vram_unavailable_reason": "the standalone operator backend does not expose per-operation peak allocation",
+    "next_logit_kl": null,
+    "next_logit_kl_unavailable_reason": "the standalone attention operator does not emit model logits",
+    "hidden_state_cosine": null,
+    "hidden_state_cosine_unavailable_reason": "the standalone attention operator does not emit model hidden states",
+    "embedded_cubin_architectures": [
+      "sm_120"
+    ],
+    "cuda_13_runtime_dependency_found": false
+  },
+  "compatibility": {
+    "gguf_schema_v1_read": "pass",
+    "turboquant_schema_v2_write_read_verify": "pass",
+    "legacy_vector_default_preserved": true,
+    "private_chain_of_thought_persisted": false,
+    "proxy_score_disclaimer_required": true
+  }
+}
