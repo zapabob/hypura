@@ -41,6 +41,12 @@ The maximum attention-output Frobenius relative error was `3.06652582e-07`, incl
 
 Peak VRAM is unavailable because the standalone operator backend does not expose per-operation peak allocation. Next-logit KL and hidden-state cosine are unavailable because this operator test emits neither full-model logits nor hidden states. These fields are `null`; no replacement estimate is used.
 
+## GitHub CI baseline audit
+
+The exact llama.cpp main commit has a successful Build Actions Cache run, `29281696076`. Its CANN run, `29280284880`, is an inherited upstream baseline exception: `build-cann.yml` defines no executable jobs, so GitHub rejects it before creating a job or log. The workflow blob is unchanged from `ggml-org/llama.cpp` master and was not touched by the Triality implementation. Rewriting an unrelated canonical upstream workflow solely to remove a red badge was rejected in favor of recording the limitation.
+
+Turboquant-CUDA and Hypura did not contain repository-native GitHub workflows before this release. Their published verification therefore relies on the recorded local schema-v2, workspace, live-model, CUDA, CLI, API, and Desktop gates rather than claiming unavailable GitHub CI coverage.
+
 ## Compatibility and rollback
 
 Schema-v1 GGUF reading, schema-v2 round-trip verification, the unchanged native API surface, and KoboldCpp-compatible API behavior are release gates. The new Council surface is additive. Operational rollback is available by using the default vector path or disabling Council behavior; binary rollback remains the preceding signed or checksummed release artifact. The identity-view fallback switches are restricted to developer fixtures and must not be used for production quality claims.

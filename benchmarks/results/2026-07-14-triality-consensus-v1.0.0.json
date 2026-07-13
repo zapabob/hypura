@@ -146,6 +146,25 @@
     ],
     "cuda_13_runtime_dependency_found": false
   },
+  "github_ci": {
+    "llama_cpp_main": {
+      "head": "81b08be15c554918a8cfe20d5f0846038082430f",
+      "actions_cache_run": 29281696076,
+      "actions_cache_status": "pass",
+      "cann_run": 29280284880,
+      "cann_status": "upstream_baseline_exception",
+      "cann_reason": "the inherited build-cann workflow defines zero executable jobs and fails validation before creating logs"
+    },
+    "turboquant_cuda_main": {
+      "head": "d2e992e54a557990f9d2e38834987dbeb28d8ec0",
+      "repository_workflows_present": false,
+      "verification_source": "local 60-test schema-v2 suite"
+    },
+    "hypura": {
+      "repository_workflows_present_before_release": false,
+      "verification_source": "local workspace, live model, CUDA, API, CLI, and Desktop release gates"
+    }
+  },
   "compatibility": {
     "gguf_schema_v1_read": "pass",
     "turboquant_schema_v2_write_read_verify": "pass",
