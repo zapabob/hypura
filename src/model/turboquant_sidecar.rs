@@ -1,12 +1,18 @@
+use std::collections::BTreeSet;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
-use crate::model::gguf::GgufFile;
+use crate::compute::ffi::{
+    TrialityBranchConfig, TrialityContextConfig, TrialityExecution, TrialityLayerConfig,
+    TrialityView,
+};
+use crate::model::gguf::{GgmlType, GgufFile, GgufValue};
 use crate::model::metadata::ModelMetadata;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -16,6 +22,8 @@ pub enum TurboQuantMode {
     PaperKeyOnly,
     PaperFullKv,
     ResearchKvSplit,
+    TrialityConsensus,
+    TrialityResidualParity,
 }
 
 impl TurboQuantMode {
@@ -27,7 +35,9 @@ impl TurboQuantMode {
         match self {
             Self::Exact => None,
             Self::PaperKeyOnly | Self::PaperFullKv => Some(TurboQuantSchemaKind::Paper),
-            Self::ResearchKvSplit => Some(TurboQuantSchemaKind::Research),
+            Self::ResearchKvSplit | Self::TrialityConsensus | Self::TrialityResidualParity => {
+                Some(TurboQuantSchemaKind::Research)
+            }
         }
     }
 
@@ -44,6 +54,8 @@ impl TurboQuantMode {
             Self::PaperKeyOnly => "paper-key-only",
             Self::PaperFullKv => "paper-full-kv",
             Self::ResearchKvSplit => "research-kv-split",
+            Self::TrialityConsensus => "triality-consensus",
+            Self::TrialityResidualParity => "triality-residual-parity",
         }
     }
 }
@@ -93,6 +105,8 @@ pub enum RotationPolicy {
     TrialitySpinorPlus,
     /// Triality spinor- view
     TrialitySpinorMinus,
+    #[value(skip)]
+    IdentityDev,
 }
 
 impl RotationPolicy {
@@ -104,6 +118,7 @@ impl RotationPolicy {
             "triality_vector" => Some(Self::TrialityVector),
             "triality_spinor_plus" => Some(Self::TrialitySpinorPlus),
             "triality_spinor_minus" => Some(Self::TrialitySpinorMinus),
+            "identity_dev" => Some(Self::IdentityDev),
             _ => None,
         }
     }
@@ -116,6 +131,7 @@ impl RotationPolicy {
             Self::TrialityVector => "triality_vector",
             Self::TrialitySpinorPlus => "triality_spinor_plus",
             Self::TrialitySpinorMinus => "triality_spinor_minus",
+            Self::IdentityDev => "identity_dev",
         }
     }
 
@@ -131,6 +147,7 @@ impl RotationPolicy {
             Self::TrialityVector => Some("vector"),
             Self::TrialitySpinorPlus => Some("spinor_plus_proxy"),
             Self::TrialitySpinorMinus => Some("spinor_minus_proxy"),
+            Self::IdentityDev => None,
             _ => None,
         }
     }
@@ -261,9 +278,19 @@ impl ResolvedTurboQuantConfig {
     }
 
     pub fn schema_label(&self) -> &'static str {
-        self.schema_kind
-            .map(TurboQuantSchemaKind::as_str)
-            .unwrap_or("none")
+        if let Some(schema_kind) = self.schema_kind {
+            return schema_kind.as_str();
+        }
+        match self
+            .gguf_metadata
+            .as_ref()
+            .map(|config| config.schema_version)
+        {
+            Some(2) => "schema-v2",
+            Some(1) => "schema-v1",
+            Some(_) => "gguf",
+            None => "none",
+        }
     }
 
     pub fn source_label(&self) -> String {
@@ -307,6 +334,60 @@ pub struct GgufTurboQuantConfig {
     pub num_kv_heads: u32,
     pub layers: Vec<GgufTurboQuantLayerConfig>,
     pub weight: Option<GgufTurboQuantWeightConfig>,
+    pub consensus: Option<GgufTrialityConsensusConfig>,
+    pub ncka: Option<GgufNcKaConfig>,
+    pub urt: Option<GgufUrtConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GgufTrialityBranchConfig {
+    pub view: String,
+    pub weight: f32,
+    pub bias: f32,
+    pub scale: f32,
+    pub temperature: f32,
+    pub expected_error: f32,
+    pub bits_per_channel: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GgufTrialityConsensusConfig {
+    pub profile_id: String,
+    pub execution: String,
+    pub branches_by_layer: Vec<[GgufTrialityBranchConfig; 3]>,
+    pub js_fallback_threshold: f32,
+    pub required: bool,
+    pub override_allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GgufNcKaConfig {
+    pub enabled: bool,
+    pub required: bool,
+    pub schema_version: u32,
+    pub controller_type: String,
+    pub coordinate_names: Vec<String>,
+    pub outer_count: u32,
+    pub knot_count: u32,
+    pub s3_equivariant: bool,
+    pub controller_sha256: String,
+    pub normalisation_sha256: String,
+    pub static_fallback_selected: bool,
+    pub fallback_weights: [f32; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GgufUrtConfig {
+    pub enabled: bool,
+    pub schema_version: u32,
+    pub abstract_algebra_id: String,
+    pub operator_word_manifest: String,
+    pub operator_word_sha256: String,
+    pub reference_representation: String,
+    pub supported_representations: Vec<String>,
+    pub consistency_tolerance: f32,
+    pub moment_degree: u32,
+    pub moment_manifest_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,7 +439,10 @@ impl GgufTurboQuantConfig {
             Some("spinor_minus_proxy") => "triality_spinor_minus",
             _ => match self.mode {
                 TurboQuantMode::PaperFullKv => "asym_q8_turbo4",
-                TurboQuantMode::PaperKeyOnly | TurboQuantMode::ResearchKvSplit => "triality_vector",
+                TurboQuantMode::PaperKeyOnly
+                | TurboQuantMode::ResearchKvSplit
+                | TurboQuantMode::TrialityConsensus
+                | TurboQuantMode::TrialityResidualParity => "triality_vector",
                 TurboQuantMode::Exact => "exact",
             },
         }
@@ -505,6 +589,8 @@ fn parse_turboquant_mode(raw: &str) -> anyhow::Result<TurboQuantMode> {
         "triality-proxy-so8-pareto" | "triality-so8-pareto" | "research-kv-split" => {
             Ok(TurboQuantMode::ResearchKvSplit)
         }
+        "triality-consensus" => Ok(TurboQuantMode::TrialityConsensus),
+        "triality-residual-parity" => Ok(TurboQuantMode::TrialityResidualParity),
         other => Err(anyhow::anyhow!(
             "Unsupported GGUF TurboQuant mode `{other}`"
         )),
@@ -571,14 +657,18 @@ fn parse_gguf_weight_config(gguf: &GgufFile) -> anyhow::Result<Option<GgufTurboQ
 
     if enabled {
         let payload_format_value = payload_format.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("GGUF weight metadata is missing `hypura.turboquant.weight.payload_format`")
+            anyhow::anyhow!(
+                "GGUF weight metadata is missing `hypura.turboquant.weight.payload_format`"
+            )
         })?;
         anyhow::ensure!(
             payload_format_value == "json-inline-v1",
             "Unsupported GGUF weight payload format `{payload_format_value}`; expected `json-inline-v1`"
         );
         let payload_json_value = payload_json.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("GGUF weight metadata is missing `hypura.turboquant.weight.payload_json`")
+            anyhow::anyhow!(
+                "GGUF weight metadata is missing `hypura.turboquant.weight.payload_json`"
+            )
         })?;
         anyhow::ensure!(
             payload_bytes == payload_json_value.len() as u64,
@@ -620,17 +710,23 @@ fn parse_gguf_weight_config(gguf: &GgufFile) -> anyhow::Result<Option<GgufTurboQ
             "GGUF weight payload modality_scope does not match `hypura.turboquant.weight.modality_scope`"
         );
         anyhow::ensure!(
-            obj.get("protected_roles").and_then(Value::as_array).is_some(),
+            obj.get("protected_roles")
+                .and_then(Value::as_array)
+                .is_some(),
             "GGUF weight payload is missing array key `protected_roles`"
         );
         anyhow::ensure!(
-            obj.get("protected_layers").and_then(Value::as_array).is_some(),
+            obj.get("protected_layers")
+                .and_then(Value::as_array)
+                .is_some(),
             "GGUF weight payload is missing array key `protected_layers`"
         );
         let tensor_plan = obj
             .get("tensor_plan")
             .and_then(Value::as_object)
-            .ok_or_else(|| anyhow::anyhow!("GGUF weight payload is missing object key `tensor_plan`"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("GGUF weight payload is missing object key `tensor_plan`")
+            })?;
         anyhow::ensure!(
             !tensor_plan.is_empty(),
             "GGUF weight payload tensor_plan must not be empty"
@@ -774,6 +870,9 @@ fn parse_legacy_gguf_turboquant_config(
         num_kv_heads: metadata.num_kv_heads,
         layers: Vec::new(),
         weight: parse_gguf_weight_config(gguf)?,
+        consensus: None,
+        ncka: None,
+        urt: None,
     }))
 }
 
@@ -901,13 +1000,1291 @@ fn parse_strict_gguf_turboquant_config(
         num_kv_heads: metadata.num_kv_heads,
         layers,
         weight: parse_gguf_weight_config(gguf)?,
+        consensus: None,
+        ncka: None,
+        urt: None,
     })
+}
+
+const TRIALITY_VIEWS: [&str; 3] = ["vector", "spinor_plus_proxy", "spinor_minus_proxy"];
+const NCKA_COORDINATES: [&str; 24] = [
+    "branch_entropy.vector",
+    "branch_entropy.spinor_plus_proxy",
+    "branch_entropy.spinor_minus_proxy",
+    "orthogonality_error.vector",
+    "orthogonality_error.spinor_plus_proxy",
+    "orthogonality_error.spinor_minus_proxy",
+    "determinant_error.vector",
+    "determinant_error.spinor_plus_proxy",
+    "determinant_error.spinor_minus_proxy",
+    "expected_quant_error.vector",
+    "expected_quant_error.spinor_plus_proxy",
+    "expected_quant_error.spinor_minus_proxy",
+    "pairwise_js.vector_plus",
+    "pairwise_js.vector_minus",
+    "pairwise_js.plus_minus",
+    "candidate_cross_score_mean.vector",
+    "candidate_cross_score_mean.spinor_plus_proxy",
+    "candidate_cross_score_mean.spinor_minus_proxy",
+    "candidate_cross_score_variance.vector",
+    "candidate_cross_score_variance.spinor_plus_proxy",
+    "candidate_cross_score_variance.spinor_minus_proxy",
+    "winner_margin",
+    "latency_multiplier",
+    "memory_ratio",
+];
+
+fn exact_metadata<'a>(gguf: &'a GgufFile, key: &str) -> anyhow::Result<&'a GgufValue> {
+    gguf.metadata
+        .get(key)
+        .ok_or_else(|| anyhow::anyhow!("GGUF Triality schema-v2 metadata is missing `{key}`"))
+}
+
+fn exact_bool(gguf: &GgufFile, key: &str) -> anyhow::Result<bool> {
+    match exact_metadata(gguf, key)? {
+        GgufValue::Bool(value) => Ok(*value),
+        _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` must be BOOL"),
+    }
+}
+
+fn exact_u32(gguf: &GgufFile, key: &str) -> anyhow::Result<u32> {
+    match exact_metadata(gguf, key)? {
+        GgufValue::Uint32(value) => Ok(*value),
+        _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` must be UINT32"),
+    }
+}
+
+fn exact_u64(gguf: &GgufFile, key: &str) -> anyhow::Result<u64> {
+    match exact_metadata(gguf, key)? {
+        GgufValue::Uint64(value) => Ok(*value),
+        _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` must be UINT64"),
+    }
+}
+
+fn exact_f32(gguf: &GgufFile, key: &str) -> anyhow::Result<f32> {
+    match exact_metadata(gguf, key)? {
+        GgufValue::Float32(value) => Ok(*value),
+        _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` must be FLOAT32"),
+    }
+}
+
+fn exact_string(gguf: &GgufFile, key: &str) -> anyhow::Result<String> {
+    match exact_metadata(gguf, key)? {
+        GgufValue::String(value) => Ok(value.clone()),
+        _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` must be STRING"),
+    }
+}
+
+fn exact_array<'a>(gguf: &'a GgufFile, key: &str) -> anyhow::Result<&'a [GgufValue]> {
+    match exact_metadata(gguf, key)? {
+        GgufValue::Array(values) => Ok(values),
+        _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` must be ARRAY"),
+    }
+}
+
+fn exact_f32_array(gguf: &GgufFile, key: &str, len: usize) -> anyhow::Result<Vec<f32>> {
+    let values = exact_array(gguf, key)?;
+    anyhow::ensure!(
+        values.len() == len,
+        "GGUF Triality schema-v2 metadata `{key}` must have length {len}, got {}",
+        values.len()
+    );
+    values
+        .iter()
+        .map(|value| match value {
+            GgufValue::Float32(value) => Ok(*value),
+            _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` elements must be FLOAT32"),
+        })
+        .collect()
+}
+
+fn exact_u32_array(gguf: &GgufFile, key: &str, len: usize) -> anyhow::Result<Vec<u32>> {
+    let values = exact_array(gguf, key)?;
+    anyhow::ensure!(
+        values.len() == len,
+        "GGUF Triality schema-v2 metadata `{key}` must have length {len}, got {}",
+        values.len()
+    );
+    values
+        .iter()
+        .map(|value| match value {
+            GgufValue::Uint32(value) => Ok(*value),
+            _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` elements must be UINT32"),
+        })
+        .collect()
+}
+
+fn exact_string_array(gguf: &GgufFile, key: &str, len: usize) -> anyhow::Result<Vec<String>> {
+    let values = exact_array(gguf, key)?;
+    anyhow::ensure!(
+        values.len() == len,
+        "GGUF Triality schema-v2 metadata `{key}` must have length {len}, got {}",
+        values.len()
+    );
+    values
+        .iter()
+        .map(|value| match value {
+            GgufValue::String(value) => Ok(value.clone()),
+            _ => anyhow::bail!("GGUF Triality schema-v2 metadata `{key}` elements must be STRING"),
+        })
+        .collect()
+}
+
+fn json_object<'a>(value: &'a Value, name: &str) -> anyhow::Result<&'a Map<String, Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Triality payload `{name}` must be an object"))
+}
+
+fn json_field<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    name: &str,
+) -> anyhow::Result<&'a Value> {
+    object
+        .get(key)
+        .ok_or_else(|| anyhow::anyhow!("Triality payload `{name}` is missing `{key}`"))
+}
+
+fn json_string(object: &Map<String, Value>, key: &str, name: &str) -> anyhow::Result<String> {
+    json_field(object, key, name)?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Triality payload `{name}.{key}` must be a string"))
+}
+
+fn json_bool(object: &Map<String, Value>, key: &str, name: &str) -> anyhow::Result<bool> {
+    json_field(object, key, name)?
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("Triality payload `{name}.{key}` must be a boolean"))
+}
+
+fn json_u32(object: &Map<String, Value>, key: &str, name: &str) -> anyhow::Result<u32> {
+    let value = json_field(object, key, name)?.as_u64().ok_or_else(|| {
+        anyhow::anyhow!("Triality payload `{name}.{key}` must be an unsigned integer")
+    })?;
+    u32::try_from(value)
+        .map_err(|_| anyhow::anyhow!("Triality payload `{name}.{key}` exceeds UINT32"))
+}
+
+fn json_f32(object: &Map<String, Value>, key: &str, name: &str) -> anyhow::Result<f32> {
+    let value = json_field(object, key, name)?
+        .as_f64()
+        .ok_or_else(|| anyhow::anyhow!("Triality payload `{name}.{key}` must be numeric"))?;
+    anyhow::ensure!(
+        value.is_finite() && value >= f32::MIN as f64 && value <= f32::MAX as f64,
+        "Triality payload `{name}.{key}` is outside finite FLOAT32 range"
+    );
+    Ok(value as f32)
+}
+
+fn json_string_array(
+    object: &Map<String, Value>,
+    key: &str,
+    name: &str,
+) -> anyhow::Result<Vec<String>> {
+    let values = json_field(object, key, name)?
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Triality payload `{name}.{key}` must be an array"))?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                anyhow::anyhow!("Triality payload `{name}.{key}` elements must be strings")
+            })
+        })
+        .collect()
+}
+
+fn json_f32_vector(value: &Value, name: &str, len: usize) -> anyhow::Result<Vec<f32>> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Triality payload `{name}` must be an array"))?;
+    anyhow::ensure!(
+        values.len() == len,
+        "Triality payload `{name}` must have length {len}"
+    );
+    values
+        .iter()
+        .map(|value| {
+            let value = value.as_f64().ok_or_else(|| {
+                anyhow::anyhow!("Triality payload `{name}` elements must be numeric")
+            })?;
+            anyhow::ensure!(
+                value.is_finite() && value >= f32::MIN as f64 && value <= f32::MAX as f64,
+                "Triality payload `{name}` contains a non-finite or out-of-range value"
+            );
+            Ok(value as f32)
+        })
+        .collect()
+}
+
+fn exact_json_keys(
+    object: &Map<String, Value>,
+    expected: &[&str],
+    name: &str,
+) -> anyhow::Result<()> {
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+    let extra = actual.difference(&expected).copied().collect::<Vec<_>>();
+    anyhow::ensure!(
+        missing.is_empty() && extra.is_empty(),
+        "Triality payload `{name}` keys are invalid: missing={missing:?}, unexpected={extra:?}"
+    );
+    Ok(())
+}
+
+fn valid_profile_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_sha256(value: &Value) -> anyhow::Result<String> {
+    let encoded = serde_json::to_vec(value).context("Failed to canonicalise Triality JSON")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn same_f32(left: f32, right: f32) -> bool {
+    left.is_finite() && right.is_finite() && (left - right).abs() <= 1.0e-6
+}
+
+fn same_f32_slice(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| same_f32(*left, *right))
+}
+
+fn validate_probability(values: &[f32], name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        values.len() == 3
+            && values
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            && (values.iter().sum::<f32>() - 1.0).abs() <= 1.0e-6,
+        "{name} must contain three finite non-negative values summing to one"
+    );
+    Ok(())
+}
+
+fn validate_v2_namespace_keys(gguf: &GgufFile) -> anyhow::Result<()> {
+    const ALLOWED: &[&str] = &[
+        "hypura.turboquant.schema_version",
+        "hypura.turboquant.enabled",
+        "hypura.turboquant.mode",
+        "hypura.turboquant.codec",
+        "hypura.turboquant.rotation_policy",
+        "hypura.turboquant.rotation_block_size",
+        "hypura.turboquant.rotation_seed",
+        "hypura.turboquant.triality_view",
+        "hypura.turboquant.triality_mix",
+        "hypura.turboquant.cache_type_k",
+        "hypura.turboquant.cache_type_v",
+        "hypura.turboquant.view_bundle_complete",
+        "hypura.turboquant.orthogonality_error",
+        "hypura.turboquant.determinant_error_max",
+        "hypura.turboquant.paper_fidelity",
+        "hypura.turboquant.k_bits",
+        "hypura.turboquant.v_bits",
+        "hypura.turboquant.payload_format",
+        "hypura.turboquant.payload_bytes",
+        "hypura.turboquant.payload_json",
+        "hypura.turboquant.runtime_mode",
+        "hypura.turboquant.source_profile",
+        "hypura.turboquant.artifact",
+        "hypura.turboquant.weight.enabled",
+        "hypura.turboquant.weight.codec",
+        "hypura.turboquant.weight.source_ftype",
+        "hypura.turboquant.weight.policy",
+        "hypura.turboquant.weight.protected_roles",
+        "hypura.turboquant.weight.protected_layers",
+        "hypura.turboquant.weight.modality_scope",
+        "hypura.turboquant.weight.payload_format",
+        "hypura.turboquant.weight.payload_bytes",
+        "hypura.turboquant.weight.payload_json",
+        "hypura.turboquant.weight.generated_at_utc",
+        "hypura.turboquant.triality.profile_id",
+        "hypura.turboquant.triality.execution",
+        "hypura.turboquant.triality.override_allowed",
+        "hypura.turboquant.triality.view_count",
+        "hypura.turboquant.triality.views",
+        "hypura.turboquant.triality.weights",
+        "hypura.turboquant.triality.bias",
+        "hypura.turboquant.triality.scale",
+        "hypura.turboquant.triality.temperature",
+        "hypura.turboquant.triality.js_fallback_threshold",
+        "hypura.turboquant.ncka.enabled",
+        "hypura.turboquant.ncka.required",
+        "hypura.turboquant.ncka.schema_version",
+        "hypura.turboquant.ncka.controller_type",
+        "hypura.turboquant.ncka.coordinate_names",
+        "hypura.turboquant.ncka.outer_count",
+        "hypura.turboquant.ncka.knot_count",
+        "hypura.turboquant.ncka.s3_equivariant",
+        "hypura.turboquant.ncka.controller_sha256",
+        "hypura.turboquant.ncka.normalisation_sha256",
+        "hypura.turboquant.urt.enabled",
+        "hypura.turboquant.urt.schema_version",
+        "hypura.turboquant.urt.abstract_algebra_id",
+        "hypura.turboquant.urt.operator_word_manifest",
+        "hypura.turboquant.urt.operator_word_sha256",
+        "hypura.turboquant.urt.reference_representation",
+        "hypura.turboquant.urt.supported_representations",
+        "hypura.turboquant.urt.consistency_tolerance",
+        "hypura.turboquant.urt.moment_degree",
+        "hypura.turboquant.urt.moment_manifest_sha256",
+    ];
+    for key in gguf.metadata.keys() {
+        let allowed = !key.starts_with("hypura.turboquant.") || ALLOWED.contains(&key.as_str());
+        anyhow::ensure!(allowed, "Unknown Triality schema-v2 metadata key `{key}`");
+    }
+    Ok(())
+}
+
+fn validate_v2_base_types(gguf: &GgufFile, metadata: &ModelMetadata) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        exact_u32(gguf, "tq_schema_version")? == 1,
+        "Triality schema-v2 requires canonical TurboQuant artifact schema 1"
+    );
+    anyhow::ensure!(
+        exact_bool(gguf, "hypura.turboquant.enabled")?,
+        "Triality schema-v2 cannot be disabled"
+    );
+    exact_string(gguf, "hypura.turboquant.mode")?;
+    exact_string(gguf, "hypura.turboquant.runtime_mode")?;
+    anyhow::ensure!(
+        exact_string(gguf, "hypura.turboquant.payload_format")? == "json-inline-v2",
+        "Triality schema-v2 payload format must be `json-inline-v2`"
+    );
+    exact_u64(gguf, "hypura.turboquant.payload_bytes")?;
+    exact_string(gguf, "hypura.turboquant.payload_json")?;
+
+    let layer_count = metadata.num_layers as usize;
+    anyhow::ensure!(
+        layer_count > 0,
+        "Triality schema-v2 requires at least one layer"
+    );
+    for key in [
+        "tq_total_bits",
+        "tq_runtime_bits_per_channel",
+        "tq_stage1_effective_bits",
+    ] {
+        let values = exact_f32_array(gguf, key, layer_count)?;
+        anyhow::ensure!(
+            values
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0),
+            "Triality schema-v2 metadata `{key}` must contain finite non-negative values"
+        );
+    }
+    for key in [
+        "tq_qjl_bits",
+        "tq_qjl_dim",
+        "tq_rotation_seed",
+        "tq_qjl_seed",
+    ] {
+        exact_u32_array(gguf, key, layer_count)?;
+    }
+    for key in [
+        "tq_rotation_policy",
+        "tq_triality_mode",
+        "tq_triality_view",
+        "tq_stage1_allocation_scheme",
+        "tq_stage1_bitwidth_payload_dtype",
+        "tq_norm_dtype",
+        "tq_sign_pack_format",
+    ] {
+        exact_string_array(gguf, key, layer_count)?;
+    }
+    Ok(())
+}
+
+fn validate_artifact_path(gguf: &GgufFile) -> anyhow::Result<()> {
+    let Some(value) = gguf.metadata.get("hypura.turboquant.artifact") else {
+        return Ok(());
+    };
+    let GgufValue::String(value) = value else {
+        anyhow::bail!("Triality schema-v2 artifact path must be STRING");
+    };
+    anyhow::ensure!(
+        !value.is_empty(),
+        "Triality schema-v2 artifact path must not be empty"
+    );
+    let path = Path::new(value);
+    anyhow::ensure!(
+        !path.is_absolute(),
+        "Triality schema-v2 artifact path must be relative"
+    );
+    anyhow::ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "Triality schema-v2 artifact path must not contain root, prefix, parent, or current-directory components"
+    );
+    Ok(())
+}
+
+fn validate_payload_header(
+    payload: &Map<String, Value>,
+    gguf: &GgufFile,
+    metadata: &ModelMetadata,
+) -> anyhow::Result<(u32, u32)> {
+    let paper_fidelity = json_bool(payload, "paper_fidelity", "payload")?;
+    let mut expected_keys = vec![
+        "schema_kind",
+        "schema_version",
+        "codec",
+        "mode",
+        "model_family",
+        "runtime_mode",
+        "head_dim",
+        "num_layers",
+        "num_kv_heads",
+        "rotation_policy",
+        "rotation_block_size",
+        "rotation_seed",
+        "triality_view",
+        "triality_mix",
+        "cache_type_k",
+        "cache_type_v",
+        "view_bundle_complete",
+        "orthogonality_error",
+        "determinant_error_max",
+        "paper_fidelity",
+        "k_bits",
+        "v_bits",
+        "offline_metrics",
+        "weight_plan",
+        "profile_id",
+        "consensus",
+        "ncka",
+        "urt",
+        "tensor_manifest",
+    ];
+    let conditional_key = if paper_fidelity {
+        "paper_config"
+    } else {
+        "pareto_profile"
+    };
+    expected_keys.push(conditional_key);
+    if payload.contains_key("source_manifest") {
+        expected_keys.push("source_manifest");
+    }
+    exact_json_keys(payload, &expected_keys, "payload")?;
+    json_object(
+        json_field(payload, conditional_key, "payload")?,
+        conditional_key,
+    )?;
+    if let Some(source_manifest) = payload.get("source_manifest") {
+        json_object(source_manifest, "source_manifest")?;
+    }
+    anyhow::ensure!(
+        json_string(payload, "schema_kind", "payload")? == "triality_gguf_payload",
+        "Unsupported Triality payload schema_kind"
+    );
+    anyhow::ensure!(
+        json_u32(payload, "schema_version", "payload")? == 2,
+        "Unsupported Triality payload schema_version"
+    );
+    anyhow::ensure!(
+        json_string(payload, "codec", "payload")? == "tq4_1s",
+        "Unsupported Triality payload codec"
+    );
+    anyhow::ensure!(
+        json_string(payload, "model_family", "payload")? == metadata.architecture,
+        "Triality payload model_family does not match GGUF architecture"
+    );
+    anyhow::ensure!(
+        json_string(payload, "mode", "payload")? == exact_string(gguf, "hypura.turboquant.mode")?,
+        "Triality payload mode contradicts flattened metadata"
+    );
+    anyhow::ensure!(
+        json_string(payload, "runtime_mode", "payload")?
+            == exact_string(gguf, "hypura.turboquant.runtime_mode")?,
+        "Triality payload runtime_mode contradicts flattened metadata"
+    );
+    anyhow::ensure!(
+        json_bool(payload, "view_bundle_complete", "payload")?,
+        "Triality schema-v2 requires a complete three-view bundle"
+    );
+    let num_layers = json_u32(payload, "num_layers", "payload")?;
+    let head_dim = json_u32(payload, "head_dim", "payload")?;
+    anyhow::ensure!(
+        num_layers == metadata.num_layers,
+        "Triality payload layer count does not match GGUF model metadata"
+    );
+    anyhow::ensure!(
+        json_u32(payload, "num_kv_heads", "payload")? == metadata.num_kv_heads,
+        "Triality payload KV-head count does not match GGUF model metadata"
+    );
+    anyhow::ensure!(
+        head_dim > 0 && head_dim % 8 == 0 && head_dim == head_dim_from_metadata(metadata),
+        "Triality payload head_dim must match the model and be a positive multiple of 8"
+    );
+    let qjl_dim = exact_u32_array(gguf, "tq_qjl_dim", num_layers as usize)?;
+    anyhow::ensure!(
+        qjl_dim.iter().all(|value| *value == head_dim),
+        "Triality schema-v2 requires every tq_qjl_dim to equal head_dim"
+    );
+    Ok((num_layers, head_dim))
+}
+
+fn parse_v2_consensus(
+    gguf: &GgufFile,
+    payload: &Map<String, Value>,
+    layers: &[GgufTurboQuantLayerConfig],
+) -> anyhow::Result<GgufTrialityConsensusConfig> {
+    let profile_id = exact_string(gguf, "hypura.turboquant.triality.profile_id")?;
+    anyhow::ensure!(
+        valid_profile_id(&profile_id),
+        "Triality profile_id must match [A-Za-z0-9][A-Za-z0-9._-]{{0,63}}"
+    );
+    anyhow::ensure!(
+        json_string(payload, "profile_id", "payload")? == profile_id,
+        "Triality profile_id contradicts payload"
+    );
+    let execution = exact_string(gguf, "hypura.turboquant.triality.execution")?;
+    anyhow::ensure!(
+        matches!(
+            execution.as_str(),
+            "single_view" | "best_per_layer" | "attention_logit_consensus" | "residual_parity"
+        ),
+        "Unsupported Triality execution `{execution}`"
+    );
+    anyhow::ensure!(
+        exact_u32(gguf, "hypura.turboquant.triality.view_count")? == 3,
+        "Triality view_count must be 3"
+    );
+    let views = exact_string_array(gguf, "hypura.turboquant.triality.views", 3)?;
+    anyhow::ensure!(
+        views.iter().map(String::as_str).eq(TRIALITY_VIEWS),
+        "Triality views must use canonical branch names and order"
+    );
+    let flattened_len = layers.len() * 3;
+    let weights = exact_f32_array(gguf, "hypura.turboquant.triality.weights", flattened_len)?;
+    let bias = exact_f32_array(gguf, "hypura.turboquant.triality.bias", flattened_len)?;
+    let scale = exact_f32_array(gguf, "hypura.turboquant.triality.scale", flattened_len)?;
+    let temperature = exact_f32_array(
+        gguf,
+        "hypura.turboquant.triality.temperature",
+        flattened_len,
+    )?;
+    let js_fallback_threshold =
+        exact_f32(gguf, "hypura.turboquant.triality.js_fallback_threshold")?;
+    anyhow::ensure!(
+        js_fallback_threshold.is_finite() && js_fallback_threshold >= 0.0,
+        "Triality JS fallback threshold must be finite and non-negative"
+    );
+    let override_allowed = match gguf
+        .metadata
+        .get("hypura.turboquant.triality.override_allowed")
+    {
+        None => false,
+        Some(GgufValue::Bool(value)) => *value,
+        Some(_) => anyhow::bail!(
+            "GGUF Triality schema-v2 metadata `hypura.turboquant.triality.override_allowed` must be BOOL"
+        ),
+    };
+
+    let consensus = json_object(json_field(payload, "consensus", "payload")?, "consensus")?;
+    exact_json_keys(
+        consensus,
+        &[
+            "schema_version",
+            "execution",
+            "view_count",
+            "views",
+            "rows",
+            "js_fallback_threshold",
+            "fallback_policy",
+            "fallback_weights",
+        ],
+        "consensus",
+    )?;
+    anyhow::ensure!(
+        json_u32(consensus, "schema_version", "consensus")? == 1,
+        "Unsupported Triality consensus schema_version"
+    );
+    anyhow::ensure!(
+        json_string(consensus, "execution", "consensus")? == execution,
+        "Triality consensus execution contradicts flattened metadata"
+    );
+    anyhow::ensure!(
+        json_u32(consensus, "view_count", "consensus")? == 3,
+        "Triality payload consensus view_count must be 3"
+    );
+    anyhow::ensure!(
+        json_string_array(consensus, "views", "consensus")?
+            .iter()
+            .map(String::as_str)
+            .eq(TRIALITY_VIEWS),
+        "Triality payload consensus views must use canonical order"
+    );
+    anyhow::ensure!(
+        same_f32(
+            json_f32(consensus, "js_fallback_threshold", "consensus")?,
+            js_fallback_threshold
+        ),
+        "Triality JS fallback threshold contradicts flattened metadata"
+    );
+    anyhow::ensure!(
+        json_string(consensus, "fallback_policy", "consensus")? == "static",
+        "Triality consensus fallback_policy must be `static`"
+    );
+    let fallback_weights = json_f32_vector(
+        json_field(consensus, "fallback_weights", "consensus")?,
+        "consensus.fallback_weights",
+        3,
+    )?;
+    validate_probability(&fallback_weights, "Triality consensus fallback_weights")?;
+
+    let rows = json_field(consensus, "rows", "consensus")?
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Triality payload `consensus.rows` must be an array"))?;
+    anyhow::ensure!(
+        rows.len() == layers.len(),
+        "Triality consensus rows must contain exactly one row per layer"
+    );
+    let mut branches_by_layer = Vec::with_capacity(layers.len());
+    for (layer_index, (row, layer)) in rows.iter().zip(layers).enumerate() {
+        let row_name = format!("consensus.rows[{layer_index}]");
+        let row = json_object(row, &row_name)?;
+        exact_json_keys(
+            row,
+            &["layer", "weights", "bias", "scale", "temperature"],
+            &row_name,
+        )?;
+        anyhow::ensure!(
+            json_u32(row, "layer", &row_name)? == layer_index as u32,
+            "Triality consensus row indices must be contiguous"
+        );
+        let row_weights = json_f32_vector(
+            json_field(row, "weights", &row_name)?,
+            &format!("{row_name}.weights"),
+            3,
+        )?;
+        let row_bias = json_f32_vector(
+            json_field(row, "bias", &row_name)?,
+            &format!("{row_name}.bias"),
+            3,
+        )?;
+        let row_scale = json_f32_vector(
+            json_field(row, "scale", &row_name)?,
+            &format!("{row_name}.scale"),
+            3,
+        )?;
+        let row_temperature = json_f32_vector(
+            json_field(row, "temperature", &row_name)?,
+            &format!("{row_name}.temperature"),
+            3,
+        )?;
+        validate_probability(
+            &row_weights,
+            &format!("Triality layer {layer_index} weights"),
+        )?;
+        anyhow::ensure!(
+            row_bias.iter().all(|value| value.is_finite()),
+            "Triality layer {layer_index} bias must be finite"
+        );
+        anyhow::ensure!(
+            row_scale
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0),
+            "Triality layer {layer_index} scale must be finite and positive"
+        );
+        anyhow::ensure!(
+            row_temperature
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0),
+            "Triality layer {layer_index} temperature must be finite and positive"
+        );
+        let offset = layer_index * 3;
+        anyhow::ensure!(
+            same_f32_slice(&weights[offset..offset + 3], &row_weights)
+                && same_f32_slice(&bias[offset..offset + 3], &row_bias)
+                && same_f32_slice(&scale[offset..offset + 3], &row_scale)
+                && same_f32_slice(&temperature[offset..offset + 3], &row_temperature),
+            "Triality consensus layer {layer_index} contradicts flattened metadata"
+        );
+        if execution == "single_view" {
+            anyhow::ensure!(
+                row_weights
+                    .iter()
+                    .filter(|weight| **weight > 1.0e-6)
+                    .count()
+                    == 1,
+                "single_view Triality execution requires one active branch per layer"
+            );
+        }
+        let branches = (0..3)
+            .map(|branch| GgufTrialityBranchConfig {
+                view: TRIALITY_VIEWS[branch].to_string(),
+                weight: row_weights[branch],
+                bias: row_bias[branch],
+                scale: row_scale[branch],
+                temperature: row_temperature[branch],
+                expected_error: 0.0,
+                bits_per_channel: layer.runtime_bits_per_channel,
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Triality layer must contain exactly three branches"))?;
+        branches_by_layer.push(branches);
+    }
+
+    Ok(GgufTrialityConsensusConfig {
+        profile_id,
+        execution,
+        branches_by_layer,
+        js_fallback_threshold,
+        required: true,
+        override_allowed,
+    })
+}
+
+fn parse_v2_ncka(gguf: &GgufFile, payload: &Map<String, Value>) -> anyhow::Result<GgufNcKaConfig> {
+    let enabled = exact_bool(gguf, "hypura.turboquant.ncka.enabled")?;
+    let required = exact_bool(gguf, "hypura.turboquant.ncka.required")?;
+    let schema_version = exact_u32(gguf, "hypura.turboquant.ncka.schema_version")?;
+    let controller_type = exact_string(gguf, "hypura.turboquant.ncka.controller_type")?;
+    let coordinate_names = exact_string_array(
+        gguf,
+        "hypura.turboquant.ncka.coordinate_names",
+        if enabled { NCKA_COORDINATES.len() } else { 0 },
+    )?;
+    let outer_count = exact_u32(gguf, "hypura.turboquant.ncka.outer_count")?;
+    let knot_count = exact_u32(gguf, "hypura.turboquant.ncka.knot_count")?;
+    let s3_equivariant = exact_bool(gguf, "hypura.turboquant.ncka.s3_equivariant")?;
+    let controller_sha256 = exact_string(gguf, "hypura.turboquant.ncka.controller_sha256")?;
+    let normalisation_sha256 = exact_string(gguf, "hypura.turboquant.ncka.normalisation_sha256")?;
+
+    let ncka = json_object(json_field(payload, "ncka", "payload")?, "ncka")?;
+    exact_json_keys(
+        ncka,
+        &[
+            "enabled",
+            "required",
+            "schema_version",
+            "controller_type",
+            "coordinate_names",
+            "outer_count",
+            "knot_count",
+            "s3_equivariant",
+            "fallback_policy",
+            "fallback_weights",
+            "normalisation_sha256",
+            "controller_sha256",
+        ],
+        "ncka",
+    )?;
+    anyhow::ensure!(
+        json_bool(ncka, "enabled", "ncka")? == enabled
+            && json_bool(ncka, "required", "ncka")? == required
+            && json_u32(ncka, "schema_version", "ncka")? == schema_version
+            && json_string(ncka, "controller_type", "ncka")? == controller_type
+            && json_string_array(ncka, "coordinate_names", "ncka")? == coordinate_names
+            && json_u32(ncka, "outer_count", "ncka")? == outer_count
+            && json_u32(ncka, "knot_count", "ncka")? == knot_count
+            && json_bool(ncka, "s3_equivariant", "ncka")? == s3_equivariant
+            && json_string(ncka, "controller_sha256", "ncka")? == controller_sha256
+            && json_string(ncka, "normalisation_sha256", "ncka")? == normalisation_sha256,
+        "NC-KA payload contradicts flattened metadata"
+    );
+    anyhow::ensure!(
+        json_string(ncka, "fallback_policy", "ncka")? == "static",
+        "NC-KA fallback_policy must be `static`"
+    );
+    let fallback = json_f32_vector(
+        json_field(ncka, "fallback_weights", "ncka")?,
+        "ncka.fallback_weights",
+        3,
+    )?;
+    validate_probability(&fallback, "NC-KA fallback_weights")?;
+    let fallback_weights: [f32; 3] = fallback
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("NC-KA fallback_weights must contain three values"))?;
+    let supported = schema_version == 1 && controller_type == "finite_moment_ka_v1";
+
+    if enabled {
+        anyhow::ensure!(schema_version == 1, "Unsupported NC-KA schema_version");
+        anyhow::ensure!(
+            !required || supported,
+            "Required NC-KA controller `{controller_type}` is unsupported"
+        );
+        anyhow::ensure!(
+            coordinate_names
+                .iter()
+                .map(String::as_str)
+                .eq(NCKA_COORDINATES),
+            "Enabled NC-KA requires canonical coordinate_names"
+        );
+        anyhow::ensure!(
+            s3_equivariant && outer_count > 0 && knot_count >= 2,
+            "Enabled NC-KA requires S3 equivariance, positive outer_count, and at least two knots"
+        );
+        anyhow::ensure!(
+            valid_sha256(&controller_sha256) && valid_sha256(&normalisation_sha256),
+            "Enabled NC-KA requires lowercase SHA256 hashes"
+        );
+        let normalisation = serde_json::json!({
+            "coordinate_names": NCKA_COORDINATES,
+            "range": [0.0, 1.0],
+            "clamp": true,
+        });
+        anyhow::ensure!(
+            canonical_sha256(&normalisation)? == normalisation_sha256,
+            "NC-KA normalisation hash mismatch"
+        );
+    } else {
+        anyhow::ensure!(
+            !required
+                && schema_version == 0
+                && controller_type.is_empty()
+                && coordinate_names.is_empty()
+                && outer_count == 0
+                && knot_count == 0
+                && !s3_equivariant
+                && controller_sha256.is_empty()
+                && normalisation_sha256.is_empty(),
+            "Disabled NC-KA must use the canonical empty contract"
+        );
+    }
+
+    Ok(GgufNcKaConfig {
+        enabled,
+        required,
+        schema_version,
+        controller_type,
+        coordinate_names,
+        outer_count,
+        knot_count,
+        s3_equivariant,
+        controller_sha256,
+        normalisation_sha256,
+        static_fallback_selected: enabled && !supported,
+        fallback_weights,
+    })
+}
+
+fn parse_v2_urt(gguf: &GgufFile, payload: &Map<String, Value>) -> anyhow::Result<GgufUrtConfig> {
+    let enabled = exact_bool(gguf, "hypura.turboquant.urt.enabled")?;
+    let schema_version = exact_u32(gguf, "hypura.turboquant.urt.schema_version")?;
+    let abstract_algebra_id = exact_string(gguf, "hypura.turboquant.urt.abstract_algebra_id")?;
+    let operator_word_manifest =
+        exact_string(gguf, "hypura.turboquant.urt.operator_word_manifest")?;
+    let operator_word_sha256 = exact_string(gguf, "hypura.turboquant.urt.operator_word_sha256")?;
+    let reference_representation =
+        exact_string(gguf, "hypura.turboquant.urt.reference_representation")?;
+    let supported_representations = exact_string_array(
+        gguf,
+        "hypura.turboquant.urt.supported_representations",
+        exact_array(gguf, "hypura.turboquant.urt.supported_representations")?.len(),
+    )?;
+    let consistency_tolerance = exact_f32(gguf, "hypura.turboquant.urt.consistency_tolerance")?;
+    let moment_degree = exact_u32(gguf, "hypura.turboquant.urt.moment_degree")?;
+    let moment_manifest_sha256 =
+        exact_string(gguf, "hypura.turboquant.urt.moment_manifest_sha256")?;
+
+    let urt = json_object(json_field(payload, "urt", "payload")?, "urt")?;
+    exact_json_keys(
+        urt,
+        &[
+            "enabled",
+            "schema_version",
+            "abstract_algebra_id",
+            "operator_word_manifest",
+            "operator_word_sha256",
+            "reference_representation",
+            "supported_representations",
+            "consistency_tolerance",
+            "moment_degree",
+            "moment_manifest_sha256",
+        ],
+        "urt",
+    )?;
+    let manifest_value = json_field(urt, "operator_word_manifest", "urt")?;
+    let canonical_manifest = serde_json::to_string(manifest_value)
+        .context("Failed to canonicalise URT operator manifest")?;
+    anyhow::ensure!(
+        json_bool(urt, "enabled", "urt")? == enabled
+            && json_u32(urt, "schema_version", "urt")? == schema_version
+            && json_string(urt, "abstract_algebra_id", "urt")? == abstract_algebra_id
+            && canonical_manifest == operator_word_manifest
+            && json_string(urt, "operator_word_sha256", "urt")? == operator_word_sha256
+            && json_string(urt, "reference_representation", "urt")? == reference_representation
+            && json_string_array(urt, "supported_representations", "urt")?
+                == supported_representations
+            && same_f32(
+                json_f32(urt, "consistency_tolerance", "urt")?,
+                consistency_tolerance
+            )
+            && json_u32(urt, "moment_degree", "urt")? == moment_degree
+            && json_string(urt, "moment_manifest_sha256", "urt")? == moment_manifest_sha256,
+        "URT payload contradicts flattened metadata"
+    );
+
+    if enabled {
+        anyhow::ensure!(schema_version == 1, "Unsupported URT schema_version");
+        anyhow::ensure!(
+            abstract_algebra_id == "octonion_triality_proxy_v1",
+            "Unsupported URT abstract_algebra_id"
+        );
+        anyhow::ensure!(
+            valid_sha256(&operator_word_sha256)
+                && canonical_sha256(manifest_value)? == operator_word_sha256,
+            "URT operator word hash mismatch"
+        );
+        anyhow::ensure!(
+            !supported_representations.is_empty()
+                && supported_representations.contains(&reference_representation),
+            "URT reference representation must be listed as supported"
+        );
+        anyhow::ensure!(
+            consistency_tolerance.is_finite() && consistency_tolerance > 0.0,
+            "URT consistency_tolerance must be finite and positive"
+        );
+        anyhow::ensure!(moment_degree == 4, "URT moment_degree must be 4");
+        let moment_manifest = serde_json::json!({
+            "degree": 4,
+            "moments": ["mean", "variance", "skewness", "kurtosis"],
+        });
+        anyhow::ensure!(
+            valid_sha256(&moment_manifest_sha256)
+                && canonical_sha256(&moment_manifest)? == moment_manifest_sha256,
+            "URT moment manifest hash mismatch"
+        );
+    } else {
+        anyhow::ensure!(
+            schema_version == 0
+                && abstract_algebra_id.is_empty()
+                && manifest_value.as_object().is_some_and(Map::is_empty)
+                && operator_word_manifest == "{}"
+                && operator_word_sha256.is_empty()
+                && reference_representation.is_empty()
+                && supported_representations.is_empty()
+                && consistency_tolerance == 0.0
+                && moment_degree == 0
+                && moment_manifest_sha256.is_empty(),
+            "Disabled URT must use the canonical empty contract"
+        );
+    }
+
+    Ok(GgufUrtConfig {
+        enabled,
+        schema_version,
+        abstract_algebra_id,
+        operator_word_manifest,
+        operator_word_sha256,
+        reference_representation,
+        supported_representations,
+        consistency_tolerance,
+        moment_degree,
+        moment_manifest_sha256,
+    })
+}
+
+fn manifest_shape(entry: &Map<String, Value>, name: &str) -> anyhow::Result<Vec<u64>> {
+    json_field(entry, "shape", name)?
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Triality tensor manifest `{name}.shape` must be an array"))?
+        .iter()
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Triality tensor manifest `{name}.shape` must contain UINT64 values"
+                )
+            })
+        })
+        .collect()
+}
+
+fn validate_v2_tensor_manifest(
+    gguf: &GgufFile,
+    payload: &Map<String, Value>,
+    consensus: &GgufTrialityConsensusConfig,
+    ncka: &GgufNcKaConfig,
+    head_dim: u32,
+) -> anyhow::Result<()> {
+    let manifest = json_object(
+        json_field(payload, "tensor_manifest", "payload")?,
+        "tensor_manifest",
+    )?;
+    let profile = &consensus.profile_id;
+    let layers = consensus.branches_by_layer.len() as u64;
+    let mut expected = Vec::<(String, Vec<u64>)>::new();
+    for layer in 0..layers {
+        for view in TRIALITY_VIEWS {
+            expected.push((
+                format!("turboquant.profile.{profile}.layer.{layer}.rotation.{view}"),
+                vec![u64::from(head_dim), u64::from(head_dim)],
+            ));
+        }
+    }
+    for field in ["weights", "bias", "scale", "temperature"] {
+        expected.push((
+            format!("turboquant.profile.{profile}.consensus.{field}"),
+            vec![3, layers],
+        ));
+    }
+    if ncka.enabled {
+        let coordinate_count = ncka.coordinate_names.len() as u64;
+        let outer_count = u64::from(ncka.outer_count);
+        let knot_count = u64::from(ncka.knot_count);
+        for (field, shape) in [
+            ("coordinate_min", vec![coordinate_count]),
+            ("coordinate_max", vec![coordinate_count]),
+            (
+                "inner_knots",
+                vec![knot_count, coordinate_count, outer_count, 3],
+            ),
+            (
+                "inner_values",
+                vec![knot_count, coordinate_count, outer_count, 3],
+            ),
+            ("outer_knots", vec![knot_count, outer_count, 3]),
+            ("outer_values", vec![knot_count, outer_count, 3]),
+            ("fallback_weights", vec![3]),
+        ] {
+            expected.push((format!("turboquant.profile.{profile}.ncka.{field}"), shape));
+        }
+    }
+    let expected_names = expected
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    let manifest_names = manifest.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        expected_names == manifest_names,
+        "Triality tensor manifest key set does not match the required schema-v2 tensors"
+    );
+    let tensor_names = gguf
+        .tensors
+        .iter()
+        .filter(|tensor| tensor.name.starts_with("turboquant."))
+        .map(|tensor| tensor.name.as_str())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        tensor_names == expected_names,
+        "Triality GGUF tensor headers do not match the schema-v2 manifest"
+    );
+
+    for (name, shape) in &expected {
+        let entry = json_object(
+            manifest
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Triality tensor manifest is missing `{name}`"))?,
+            name,
+        )?;
+        exact_json_keys(entry, &["dtype", "shape", "sha256"], name)?;
+        anyhow::ensure!(
+            json_string(entry, "dtype", name)? == "f32",
+            "Triality tensor manifest `{name}` must declare f32"
+        );
+        anyhow::ensure!(
+            manifest_shape(entry, name)? == *shape,
+            "Triality tensor manifest `{name}` has the wrong shape"
+        );
+        let hash = json_string(entry, "sha256", name)?;
+        anyhow::ensure!(
+            valid_sha256(&hash),
+            "Triality tensor manifest `{name}` requires a lowercase SHA256"
+        );
+        let tensor = gguf
+            .tensors
+            .iter()
+            .find(|tensor| tensor.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("Triality tensor `{name}` is absent from GGUF"))?;
+        anyhow::ensure!(
+            tensor.dtype == GgmlType::F32 && tensor.dimensions == *shape,
+            "Triality tensor `{name}` must be F32 with the manifest shape"
+        );
+    }
+
+    if ncka.enabled {
+        let marker = format!(".profile.{profile}.ncka.");
+        let controller_manifest = manifest
+            .iter()
+            .filter(|(name, _)| name.contains(&marker))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Map<_, _>>();
+        anyhow::ensure!(
+            canonical_sha256(&Value::Object(controller_manifest))? == ncka.controller_sha256,
+            "NC-KA controller manifest hash mismatch"
+        );
+    }
+    Ok(())
+}
+
+fn parse_strict_gguf_turboquant_config_v2(
+    gguf: &GgufFile,
+    metadata: &ModelMetadata,
+) -> anyhow::Result<GgufTurboQuantConfig> {
+    validate_v2_namespace_keys(gguf)?;
+    validate_v2_base_types(gguf, metadata)?;
+    validate_artifact_path(gguf)?;
+    let payload_json = exact_string(gguf, "hypura.turboquant.payload_json")?;
+    anyhow::ensure!(
+        exact_u64(gguf, "hypura.turboquant.payload_bytes")? == payload_json.len() as u64,
+        "Triality payload_bytes does not match payload_json length"
+    );
+    let payload_value: Value = serde_json::from_str(&payload_json)
+        .context("Triality schema-v2 payload_json must contain valid JSON")?;
+    let payload = json_object(&payload_value, "payload")?;
+    let (num_layers, head_dim) = validate_payload_header(payload, gguf, metadata)?;
+    let mut config = parse_strict_gguf_turboquant_config(gguf, metadata, 1)?;
+    anyhow::ensure!(
+        config.layers.len() == num_layers as usize,
+        "Triality schema-v2 layer count contradicts TurboQuant artifact metadata"
+    );
+    let rotation_policy_name = json_string(payload, "rotation_policy", "payload")?;
+    let rotation_policy = RotationPolicy::from_str(&rotation_policy_name).ok_or_else(|| {
+        anyhow::anyhow!("Unsupported Triality schema-v2 rotation_policy `{rotation_policy_name}`")
+    })?;
+    anyhow::ensure!(
+        matches!(
+            rotation_policy,
+            RotationPolicy::RandomHaar
+                | RotationPolicy::BlockSo8Learned
+                | RotationPolicy::IdentityDev
+        ),
+        "Unsupported Triality schema-v2 rotation_policy `{rotation_policy_name}`"
+    );
+    let rotation_seed = json_u32(payload, "rotation_seed", "payload")?;
+    anyhow::ensure!(
+        config.layers.iter().all(|layer| {
+            layer.rotation_policy == rotation_policy && layer.rotation_seed == rotation_seed
+        }),
+        "Triality payload rotation policy or seed contradicts layer metadata"
+    );
+    anyhow::ensure!(
+        rotation_policy != RotationPolicy::IdentityDev || rotation_seed == 0,
+        "identity_dev Triality rotations require rotation_seed=0"
+    );
+    let consensus = parse_v2_consensus(gguf, payload, &config.layers)?;
+    let ncka = parse_v2_ncka(gguf, payload)?;
+    let urt = parse_v2_urt(gguf, payload)?;
+    validate_v2_tensor_manifest(gguf, payload, &consensus, &ncka, head_dim)?;
+    config.schema_version = 2;
+    config.mode = if consensus.execution == "residual_parity" {
+        TurboQuantMode::TrialityResidualParity
+    } else {
+        TurboQuantMode::TrialityConsensus
+    };
+    config.public_mode_label = config.mode.as_str().to_string();
+    config.rotation_policy = Some(rotation_policy);
+    config.head_dim = head_dim;
+    config.consensus = Some(consensus);
+    config.ncka = Some(ncka);
+    config.urt = Some(urt);
+    Ok(config)
+}
+
+fn ffi_triality_view(view: &str) -> anyhow::Result<TrialityView> {
+    match view {
+        "vector" => Ok(TrialityView::Vector),
+        "spinor_plus_proxy" => Ok(TrialityView::SpinorPlusProxy),
+        "spinor_minus_proxy" => Ok(TrialityView::SpinorMinusProxy),
+        other => anyhow::bail!("Unsupported Triality branch view `{other}`"),
+    }
+}
+
+impl TryFrom<&GgufTurboQuantConfig> for TrialityContextConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(config: &GgufTurboQuantConfig) -> Result<Self, Self::Error> {
+        anyhow::ensure!(
+            config.schema_version == 2,
+            "TrialityContextConfig requires GGUF Triality schema version 2"
+        );
+        let consensus = config
+            .consensus
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GGUF Triality schema-v2 consensus is absent"))?;
+        let execution = match consensus.execution.as_str() {
+            "single_view" => TrialityExecution::SingleView,
+            "best_per_layer" => TrialityExecution::BestPerLayer,
+            "attention_logit_consensus" => TrialityExecution::AttentionLogitConsensus,
+            "residual_parity" => TrialityExecution::ResidualParity,
+            other => anyhow::bail!("Unsupported Triality execution `{other}`"),
+        };
+        let layers = consensus
+            .branches_by_layer
+            .iter()
+            .map(|branches| {
+                let active_branch_mask = if execution == TrialityExecution::SingleView {
+                    let index = branches
+                        .iter()
+                        .position(|branch| branch.weight > 1.0e-6)
+                        .ok_or_else(|| anyhow::anyhow!("single_view layer has no active branch"))?;
+                    1_u32 << index
+                } else {
+                    0b111
+                };
+                let branches = branches.clone().map(|branch| {
+                    Ok(TrialityBranchConfig {
+                        view: ffi_triality_view(&branch.view)?,
+                        weight: branch.weight,
+                        bias: branch.bias,
+                        scale: branch.scale,
+                        temperature: branch.temperature,
+                        expected_error: branch.expected_error,
+                        bits_per_channel: branch.bits_per_channel,
+                    })
+                });
+                Ok(TrialityLayerConfig {
+                    branches: branches
+                        .into_iter()
+                        .collect::<anyhow::Result<Vec<_>>>()?
+                        .try_into()
+                        .map_err(|_| {
+                            anyhow::anyhow!("Triality layer must contain three branches")
+                        })?,
+                    active_branch_mask,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(TrialityContextConfig {
+            schema_version: 2,
+            execution,
+            layers,
+            required: consensus.required,
+            trace_enabled: false,
+            js_fallback_threshold: consensus.js_fallback_threshold,
+            allow_identity_view_fallback: false,
+        })
+    }
 }
 
 pub fn read_gguf_turboquant_config(
     gguf: &GgufFile,
     metadata: &ModelMetadata,
 ) -> anyhow::Result<Option<GgufTurboQuantConfig>> {
+    match gguf.metadata.get("hypura.turboquant.schema_version") {
+        Some(GgufValue::Uint32(2)) => {
+            return parse_strict_gguf_turboquant_config_v2(gguf, metadata).map(Some);
+        }
+        Some(GgufValue::Uint32(1)) | None => {}
+        Some(GgufValue::Uint32(version)) => {
+            anyhow::bail!("Unsupported public GGUF TurboQuant schema version {version}")
+        }
+        Some(_) => anyhow::bail!(
+            "Public GGUF TurboQuant schema_version must be UINT32 and is invalid for strict parsing"
+        ),
+    }
     if let Some(schema_version) = gguf.get_u32("tq_schema_version") {
         return parse_strict_gguf_turboquant_config(gguf, metadata, schema_version).map(Some);
     }
@@ -1258,9 +2635,7 @@ mod tests {
         );
         gguf.metadata.insert(
             "hypura.turboquant.weight.protected_roles".into(),
-            GgufValue::String(
-                r#"["embedding","norm","output_head","recurrent_state"]"#.into(),
-            ),
+            GgufValue::String(r#"["embedding","norm","output_head","recurrent_state"]"#.into()),
         );
         gguf.metadata.insert(
             "hypura.turboquant.weight.protected_layers".into(),
@@ -1393,7 +2768,7 @@ mod tests {
             .gguf_metadata
             .expect("gguf metadata should be attached");
         assert_eq!(gguf_cfg.mode, TurboQuantMode::ResearchKvSplit);
-        assert_eq!(gguf_cfg.public_mode_label, "triality-so8-pareto");
+        assert_eq!(gguf_cfg.public_mode_label, "triality-proxy-so8-pareto");
         assert_eq!(gguf_cfg.runtime_mode, "research-kv-split");
         assert_eq!(gguf_cfg.schema_version, 1);
         assert_eq!(

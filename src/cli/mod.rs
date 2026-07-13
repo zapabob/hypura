@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod council;
 pub mod estimate;
 pub mod fmt_util;
 pub mod inspect;

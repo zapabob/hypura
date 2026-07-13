@@ -151,7 +151,10 @@ fn normalize_loaded_profile(profile: &mut HardwareProfile) {
         profile.memory.h2d_pinned_bandwidth_bytes_per_sec = pageable.saturating_mul(4) / 3;
     }
 
-    let cuda_backend = matches!(profile.gpu.as_ref().map(|g| &g.backend), Some(GpuBackend::Cuda));
+    let cuda_backend = matches!(
+        profile.gpu.as_ref().map(|g| &g.backend),
+        Some(GpuBackend::Cuda)
+    );
     let inferred_pinning =
         cuda_backend && !profile.memory.is_unified && profile.memory.pinned_budget_bytes == 0;
     if inferred_pinning {

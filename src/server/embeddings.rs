@@ -73,7 +73,10 @@ impl EmbeddingsRuntime {
         &self.model_name
     }
 
-    pub fn embed_request(&mut self, req: &OpenAiEmbeddingsRequest) -> Result<OpenAiEmbeddingsResponse> {
+    pub fn embed_request(
+        &mut self,
+        req: &OpenAiEmbeddingsRequest,
+    ) -> Result<OpenAiEmbeddingsResponse> {
         let inputs = match &req.input {
             OpenAiPromptInput::Single(text) => vec![text.clone()],
             OpenAiPromptInput::Many(items) => items.clone(),
@@ -139,10 +142,9 @@ mod tests {
         assert!(matches!(single.input, OpenAiPromptInput::Single(_)));
         assert!(single.truncate);
 
-        let many = serde_json::from_str::<OpenAiEmbeddingsRequest>(
-            r#"{"input":["hello","world"]}"#,
-        )
-        .unwrap();
+        let many =
+            serde_json::from_str::<OpenAiEmbeddingsRequest>(r#"{"input":["hello","world"]}"#)
+                .unwrap();
         assert!(matches!(many.input, OpenAiPromptInput::Many(_)));
         assert!(!many.truncate);
     }

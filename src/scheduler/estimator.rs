@@ -82,8 +82,8 @@ pub fn estimate_performance(
                     layer_compute_time += t.size_bytes as f64 * freq / gpu_bw;
                 }
                 TensorResidence::HostPinned => {
-                    layer_compute_time +=
-                        t.size_bytes as f64 * freq / hardware.memory.h2d_pinned_bandwidth_bytes_per_sec.max(1) as f64;
+                    layer_compute_time += t.size_bytes as f64 * freq
+                        / hardware.memory.h2d_pinned_bandwidth_bytes_per_sec.max(1) as f64;
                 }
                 TensorResidence::HostPageable => {
                     layer_compute_time += t.size_bytes as f64 * freq / ram_bw;

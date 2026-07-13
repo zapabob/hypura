@@ -21,13 +21,14 @@ use crate::model::gguf::GgufFile;
 use crate::model::metadata::ModelMetadata;
 use crate::model::tensor_role::TensorRole;
 use crate::model::turboquant_sidecar::{
-    GgufTurboQuantConfig, ResolvedTurboQuantConfig, RotationPolicy, TurboQuantMode,
-    resolve_turboquant_config,
+    GgufNcKaConfig, GgufTurboQuantConfig, GgufUrtConfig, ResolvedTurboQuantConfig, RotationPolicy,
+    TurboQuantMode, resolve_turboquant_config,
 };
 use crate::profiler;
 use crate::profiler::types::HardwareProfile;
 use crate::scheduler::placement::{
-    backing_residence, compute_placement_with_context_and_policy, summarize_placement,
+    backing_residence, compute_placement_with_context_and_policy, conservative_council_headroom,
+    council_memory_request_for_metadata, council_memory_resources_for_plan, summarize_placement,
 };
 use crate::scheduler::types::*;
 use crate::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
@@ -48,6 +49,20 @@ pub struct InferenceConfig {
     pub n_batch: u32,
     pub n_threads: i32,
     pub sampling: SamplingParams,
+    #[serde(default)]
+    pub triality: Option<TrialityRuntimePolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrialityRuntimePolicy {
+    pub context: TrialityContextConfig,
+    pub ncka_required: bool,
+    pub urt_enabled: bool,
+    pub embedded_override_allowed: bool,
+    #[serde(default)]
+    pub ncka: Option<GgufNcKaConfig>,
+    #[serde(default)]
+    pub urt: Option<GgufUrtConfig>,
 }
 
 impl Default for InferenceConfig {
@@ -57,6 +72,7 @@ impl Default for InferenceConfig {
             n_batch: 512,
             n_threads: num_performance_cores(),
             sampling: SamplingParams::default(),
+            triality: None,
         }
     }
 }
@@ -94,6 +110,8 @@ pub struct LoadedModel {
     pub model_name: String,
     pub active_context_state: Option<ContextStateSnapshot>,
     pub turboquant: ResolvedTurboQuantConfig,
+    council_memory_request: CouncilMemoryRequest,
+    council_memory_resources: CouncilMemoryResources,
     turboquant_layout: Option<TurboQuantRuntimeLayout>,
     // NVMe scheduling state (None when all tensors fit in GPU+RAM)
     _controller: Option<Box<HypuraBuftController>>,
@@ -110,6 +128,90 @@ impl Drop for LoadedModel {
         if let Some(ref state) = self.prefetch_state {
             state.stop_io_pool();
         }
+    }
+}
+
+fn create_inference_context(
+    model: &LlamaModel,
+    config: &InferenceConfig,
+    callback: hypura_sys::ggml_backend_sched_eval_callback,
+    callback_data: *mut c_void,
+    kv_quant: Option<KvQuantization>,
+    disable_flash_attn: bool,
+) -> anyhow::Result<LlamaContext> {
+    LlamaContext::new_with_options_and_triality(
+        model,
+        config.n_ctx,
+        config.n_batch,
+        config.n_threads,
+        callback,
+        callback_data,
+        kv_quant,
+        disable_flash_attn,
+        config.triality.as_ref().map(|policy| &policy.context),
+    )
+}
+
+fn validate_triality_runtime_policy(
+    model: &LlamaModel,
+    policy: Option<&TrialityRuntimePolicy>,
+) -> anyhow::Result<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let capabilities = model.triality_capabilities()?;
+    anyhow::ensure!(
+        capabilities.metadata_present && capabilities.three_view_bundle,
+        "schema-v2 Triality metadata is missing or incomplete"
+    );
+    anyhow::ensure!(
+        capabilities.n_layers as usize == policy.context.layers.len(),
+        "schema-v2 Triality layer count does not match the loaded model"
+    );
+    anyhow::ensure!(
+        capabilities.supports(policy.context.execution),
+        "loaded model does not support the requested Triality execution mode"
+    );
+    anyhow::ensure!(
+        !policy.ncka_required
+            || (capabilities.ncka_available && !capabilities.ncka_static_fallback_selected),
+        "required NC-KA controller is unavailable or selected a static fallback"
+    );
+    anyhow::ensure!(
+        !policy.urt_enabled || capabilities.urt_available,
+        "requested URT metadata is unavailable"
+    );
+    Ok(())
+}
+
+impl LoadedModel {
+    pub fn council_runtime(
+        &self,
+        config: crate::council::CouncilRuntimeConfig,
+    ) -> anyhow::Result<crate::council::CouncilRuntime<'_>> {
+        anyhow::ensure!(
+            self.prefetch_state.is_none(),
+            "Answer Council requires a fully resident model; NVMe callback contexts are not supported"
+        );
+        crate::council::CouncilRuntime::new(&self.model, config)
+    }
+
+    pub fn admit_council_memory(
+        &self,
+        execution: CouncilExecutionMode,
+        parallelism: CouncilParallelism,
+    ) -> CouncilMemoryAdmission {
+        let mut request = self.council_memory_request.clone();
+        request.execution = execution;
+        request.parallelism = parallelism;
+        CouncilMemoryBudget::admit(&request, &self.council_memory_resources)
+    }
+
+    pub fn council_memory_peak_utilization_ratio(
+        &self,
+        admission: &CouncilMemoryAdmission,
+    ) -> Result<f32, CouncilMemoryRefusal> {
+        admission.peak_utilization_ratio(&self.council_memory_resources)
     }
 }
 
@@ -174,24 +276,14 @@ impl CompatRuntimeSession {
         let callback_ptr = callback_state
             .as_ref()
             .map(|state| state.as_ref() as *const InferenceCallbackState as *mut c_void);
-        let ctx = if let Some(state_ptr) = callback_ptr {
-            LlamaContext::new_with_callback_and_options(
-                &loaded.model,
-                config.n_ctx,
-                config.n_batch,
-                config.n_threads,
-                Some(eval_callback_with_runtime),
-                state_ptr,
-                turboquant_session.is_some(),
-            )?
-        } else {
-            LlamaContext::new(
-                &loaded.model,
-                config.n_ctx,
-                config.n_batch,
-                config.n_threads,
-            )?
-        };
+        let ctx = create_inference_context(
+            &loaded.model,
+            config,
+            callback_ptr.map(|_| eval_callback_with_runtime as _),
+            callback_ptr.unwrap_or(std::ptr::null_mut()),
+            None,
+            turboquant_session.is_some(),
+        )?;
         Ok((ctx, callback_state, turboquant_session))
     }
 
@@ -434,6 +526,33 @@ pub struct RuntimeSetup {
     pub placement_summary: PlacementSummary,
     pub n_gpu_layers: i32,
     pub turboquant: ResolvedTurboQuantConfig,
+    pub triality: Option<TrialityRuntimePolicy>,
+}
+
+impl RuntimeSetup {
+    pub fn admit_council_memory(
+        &self,
+        execution: CouncilExecutionMode,
+        parallelism: CouncilParallelism,
+        context_length: u32,
+        current_host_available_bytes: u64,
+        headroom: CouncilMemoryHeadroom,
+    ) -> Result<CouncilMemoryAdmission, CouncilMemoryRefusal> {
+        let request = council_memory_request_from_turboquant(
+            &self.metadata,
+            self.turboquant.gguf_metadata.as_ref(),
+            context_length,
+            execution,
+            parallelism,
+        )?;
+        let resources = council_memory_resources_for_plan(
+            &self.hardware,
+            &self.placement_summary,
+            current_host_available_bytes,
+            headroom,
+        );
+        Ok(CouncilMemoryBudget::admit(&request, &resources))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -601,6 +720,13 @@ pub struct LlamaTurboquantCliBridge {
     pub tq_so8_learned: bool,
     pub tq_triality_mix: f32,
     pub tq_artifact: Option<String>,
+    pub execution: Option<TrialityExecution>,
+    pub weights: Option<[f32; 3]>,
+    pub trace_enabled: bool,
+    pub ncka_required: bool,
+    pub urt_enabled: bool,
+    pub tq_developer_override: bool,
+    pub tq_allow_identity_view_fallback: bool,
 }
 
 impl Default for LlamaTurboquantCliBridge {
@@ -613,8 +739,189 @@ impl Default for LlamaTurboquantCliBridge {
             tq_so8_learned: false,
             tq_triality_mix: 0.5,
             tq_artifact: None,
+            execution: None,
+            weights: None,
+            trace_enabled: false,
+            ncka_required: false,
+            urt_enabled: false,
+            tq_developer_override: false,
+            tq_allow_identity_view_fallback: false,
         }
     }
+}
+
+fn validate_triality_weight_rows(weights: &[f32]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !weights.is_empty() && weights.len().is_multiple_of(3),
+        "Triality weights must contain complete three-view rows"
+    );
+    for row in weights.chunks_exact(3) {
+        anyhow::ensure!(
+            row.iter()
+                .all(|weight| weight.is_finite() && *weight >= 0.0),
+            "Triality weights must be finite and non-negative"
+        );
+        anyhow::ensure!(
+            (row.iter().sum::<f32>() - 1.0).abs() <= 1.0e-6,
+            "Triality weights must sum to one per layer"
+        );
+    }
+    Ok(())
+}
+
+fn legacy_bridge_override_requested(bridge: &LlamaTurboquantCliBridge) -> bool {
+    bridge.rotation_policy != RotationPolicy::TrialityVector
+        || bridge.llama_rotation_seed != 0
+        || bridge.tq_so8_off
+        || bridge.tq_triality_off
+        || bridge.tq_so8_learned
+        || bridge.tq_triality_mix != 0.5
+        || bridge
+            .tq_artifact
+            .as_ref()
+            .is_some_and(|path| !path.trim().is_empty())
+}
+
+fn legacy_turboquant_env_names() -> Vec<String> {
+    let mut names = std::env::vars_os()
+        .filter_map(|(name, _)| {
+            let name = name.to_string_lossy().into_owned();
+            name.to_ascii_uppercase()
+                .starts_with("LLAMA_TURBOQUANT")
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn validate_schema_v2_override_sources(
+    bridge: &LlamaTurboquantCliBridge,
+    override_allowed: bool,
+    legacy_env: &[String],
+) -> anyhow::Result<()> {
+    if !legacy_env.is_empty() {
+        tracing::warn!(
+            variables = ?legacy_env,
+            "legacy LLAMA_TURBOQUANT environment configuration is deprecated for schema-v2"
+        );
+        anyhow::bail!(
+            "schema-v2 Triality contexts reject process-global LLAMA_TURBOQUANT environment configuration"
+        );
+    }
+    anyhow::ensure!(
+        !legacy_bridge_override_requested(bridge),
+        "schema-v2 Triality contexts reject legacy TurboQuant CLI bridge fields"
+    );
+
+    let override_requested = bridge.execution.is_some()
+        || bridge.weights.is_some()
+        || bridge.trace_enabled
+        || bridge.ncka_required
+        || bridge.urt_enabled
+        || bridge.tq_allow_identity_view_fallback;
+    anyhow::ensure!(
+        !override_requested || override_allowed || bridge.tq_developer_override,
+        "schema-v2 GGUF does not allow Triality CLI overrides"
+    );
+    anyhow::ensure!(
+        !bridge.tq_allow_identity_view_fallback || bridge.tq_developer_override,
+        "identity-view fallback requires the explicit developer override"
+    );
+    Ok(())
+}
+
+fn resolve_triality_runtime_policy(
+    embedded: Option<&GgufTurboQuantConfig>,
+    bridge: &LlamaTurboquantCliBridge,
+) -> anyhow::Result<Option<TrialityRuntimePolicy>> {
+    resolve_triality_runtime_policy_with_legacy_env(
+        embedded,
+        bridge,
+        &legacy_turboquant_env_names(),
+    )
+}
+
+fn resolve_triality_runtime_policy_with_legacy_env(
+    embedded: Option<&GgufTurboQuantConfig>,
+    bridge: &LlamaTurboquantCliBridge,
+    legacy_env: &[String],
+) -> anyhow::Result<Option<TrialityRuntimePolicy>> {
+    let Some(embedded) = embedded.filter(|config| config.schema_version == 2) else {
+        anyhow::ensure!(
+            bridge.execution.is_none()
+                && bridge.weights.is_none()
+                && !bridge.trace_enabled
+                && !bridge.ncka_required
+                && !bridge.urt_enabled
+                && !bridge.tq_allow_identity_view_fallback,
+            "explicit Triality context options require embedded schema-v2 GGUF metadata"
+        );
+        return Ok(None);
+    };
+
+    let consensus = embedded
+        .consensus
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("schema-v2 GGUF is missing Triality consensus metadata"))?;
+    let override_allowed = consensus.override_allowed;
+    validate_schema_v2_override_sources(bridge, override_allowed, legacy_env)?;
+    anyhow::ensure!(
+        embedded.rotation_policy != Some(RotationPolicy::IdentityDev)
+            || bridge.tq_developer_override,
+        "identity_dev Triality artifacts require the explicit developer override"
+    );
+
+    let ncka = embedded.ncka.clone();
+    let urt = embedded.urt.clone();
+    let ncka_required = ncka.as_ref().is_some_and(|config| config.required) || bridge.ncka_required;
+    let urt_enabled = urt.as_ref().is_some_and(|config| config.enabled) || bridge.urt_enabled;
+    let mut context = TrialityContextConfig::try_from(embedded)?;
+    context.execution = bridge.execution.unwrap_or(context.execution);
+    context.trace_enabled = bridge.trace_enabled || ncka_required;
+    context.allow_identity_view_fallback = bridge.tq_allow_identity_view_fallback;
+    if let Some(override_weights) = bridge.weights {
+        validate_triality_weight_rows(&override_weights)?;
+        for layer in &mut context.layers {
+            for (branch, weight) in layer.branches.iter_mut().zip(override_weights) {
+                branch.weight = weight;
+            }
+        }
+    }
+
+    for layer in &mut context.layers {
+        validate_triality_weight_rows(&[
+            layer.branches[0].weight,
+            layer.branches[1].weight,
+            layer.branches[2].weight,
+        ])?;
+        layer.active_branch_mask = if context.execution == TrialityExecution::SingleView {
+            let active = layer
+                .branches
+                .iter()
+                .enumerate()
+                .filter(|(_, branch)| branch.weight > 0.0)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                active.len() == 1,
+                "single_view Triality execution requires exactly one positive branch weight per layer"
+            );
+            1_u32 << active[0]
+        } else {
+            0b111
+        };
+    }
+
+    Ok(Some(TrialityRuntimePolicy {
+        context,
+        ncka_required,
+        urt_enabled,
+        embedded_override_allowed: override_allowed,
+        ncka,
+        urt,
+    }))
 }
 
 fn set_process_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
@@ -629,13 +936,18 @@ fn apply_llama_turboquant_cli_bridge(
     turboquant_mode: TurboQuantMode,
     resolved: &ResolvedTurboQuantConfig,
     bridge: &LlamaTurboquantCliBridge,
-) {
+) -> anyhow::Result<()> {
     if resolved.gguf_metadata.is_some() {
-        return;
+        return Ok(());
     }
     if turboquant_mode == TurboQuantMode::Exact {
-        return;
+        return Ok(());
     }
+
+    anyhow::ensure!(
+        bridge.tq_triality_mix.is_finite() && (0.0..=1.0).contains(&bridge.tq_triality_mix),
+        "legacy TurboQuant triality mix must be finite and in 0..=1"
+    );
 
     let p = bridge.rotation_policy;
     let so8_enabled = !bridge.tq_so8_off && !matches!(p, RotationPolicy::RandomHaar);
@@ -655,7 +967,7 @@ fn apply_llama_turboquant_cli_bridge(
     );
     set_process_env_var(
         "LLAMA_TURBOQUANT_TRIALITY_MIX",
-        format!("{:.3}", bridge.tq_triality_mix.clamp(0.0, 1.0)),
+        format!("{:.3}", bridge.tq_triality_mix),
     );
     set_process_env_var(
         "LLAMA_TURBOQUANT_ROTATION_SEED",
@@ -666,6 +978,7 @@ fn apply_llama_turboquant_cli_bridge(
             set_process_env_var("LLAMA_TURBOQUANT_ARTIFACT", path.trim());
         }
     }
+    Ok(())
 }
 
 impl RuntimeTensorShape {
@@ -733,8 +1046,12 @@ pub fn resolve_runtime_setup(
         turboquant_config,
         allow_exact_fallback,
     )?;
-    apply_gguf_turboquant_env(turboquant.gguf_metadata.as_ref());
-    apply_llama_turboquant_cli_bridge(turboquant_mode, &turboquant, &llama_bridge);
+    let triality =
+        resolve_triality_runtime_policy(turboquant.gguf_metadata.as_ref(), &llama_bridge)?;
+    if triality.is_none() {
+        apply_gguf_turboquant_env(turboquant.gguf_metadata.as_ref());
+        apply_llama_turboquant_cli_bridge(turboquant_mode, &turboquant, &llama_bridge)?;
+    }
     let plan =
         compute_placement_with_context_and_policy(&gguf, &hardware, context, residency_policy)?;
     let placement_summary = summarize_placement(
@@ -755,6 +1072,7 @@ pub fn resolve_runtime_setup(
         placement_summary,
         n_gpu_layers,
         turboquant,
+        triality,
     })
 }
 
@@ -1162,7 +1480,9 @@ fn validate_turboquant_runtime_mode(turboquant: &ResolvedTurboQuantConfig) -> an
         TurboQuantMode::Exact
         | TurboQuantMode::PaperKeyOnly
         | TurboQuantMode::PaperFullKv
-        | TurboQuantMode::ResearchKvSplit => Ok(()),
+        | TurboQuantMode::ResearchKvSplit
+        | TurboQuantMode::TrialityConsensus
+        | TurboQuantMode::TrialityResidualParity => Ok(()),
     }
 }
 
@@ -1186,7 +1506,7 @@ extern "C" fn eval_callback_with_runtime(
     }
 
     if let Some(ref prefetch_state) = state.prefetch_state {
-        eval_callback(tensor, ask, Arc::as_ptr(prefetch_state) as *mut c_void)
+        unsafe { eval_callback(tensor, ask, Arc::as_ptr(prefetch_state) as *mut c_void) }
     } else {
         true
     }
@@ -1295,6 +1615,84 @@ fn write_tensor_f32(tensor: *mut hypura_sys::ggml_tensor, values: &[f32]) -> any
     Ok(())
 }
 
+pub fn council_memory_request_from_turboquant(
+    metadata: &ModelMetadata,
+    turboquant: Option<&GgufTurboQuantConfig>,
+    context_length: u32,
+    execution: CouncilExecutionMode,
+    parallelism: CouncilParallelism,
+) -> Result<CouncilMemoryRequest, CouncilMemoryRefusal> {
+    let k_layout = match turboquant.map(|config| config.mode) {
+        Some(TurboQuantMode::TrialityResidualParity) => CouncilKCacheLayout::ResidualParity,
+        Some(TurboQuantMode::TrialityConsensus) => CouncilKCacheLayout::FullTriple {
+            branch_bits_per_layer: turboquant
+                .and_then(|config| config.consensus.as_ref())
+                .map(|consensus| {
+                    consensus
+                        .branches_by_layer
+                        .iter()
+                        .map(|branches| {
+                            std::array::from_fn(|index| f64::from(branches[index].bits_per_channel))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
+        _ => CouncilKCacheLayout::Single {
+            bits_per_channel: turboquant
+                .map(|config| f64::from(config.k_bits))
+                .unwrap_or(16.0),
+        },
+    };
+    council_memory_request_for_metadata(
+        metadata,
+        context_length,
+        execution,
+        parallelism,
+        k_layout,
+        turboquant
+            .map(|config| f64::from(config.v_bits))
+            .unwrap_or(16.0),
+    )
+}
+
+fn unavailable_council_resources() -> CouncilMemoryResources {
+    let unavailable = CouncilMemoryRegionBudget::new(0, 0, 0);
+    CouncilMemoryResources {
+        gpu: unavailable,
+        host_pageable: unavailable,
+        host_pinned: unavailable,
+        unified: None,
+    }
+}
+
+fn current_host_available_bytes() -> u64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    system.available_memory().max(system.free_memory())
+}
+
+fn council_resources_for_loaded_plan(
+    plan: &PlacementPlan,
+    gguf: &GgufFile,
+) -> CouncilMemoryResources {
+    let Ok(Some(hardware)) = profiler::load_cached_profile() else {
+        return unavailable_council_resources();
+    };
+    let placement = summarize_placement(
+        &plan.tensor_placements,
+        &gguf.tensors,
+        plan.inference_mode,
+        hardware.memory.pinned_budget_bytes,
+    );
+    council_memory_resources_for_plan(
+        &hardware,
+        &placement,
+        current_host_available_bytes(),
+        conservative_council_headroom(&hardware),
+    )
+}
+
 /// Load a model once for repeated generation (server use case).
 ///
 /// Extracts the model loading logic from `generate_with_nvme_scheduling` so the
@@ -1310,6 +1708,29 @@ pub fn load_model(
 ) -> anyhow::Result<LoadedModel> {
     let backend = LlamaBackend::init();
     let metadata = ModelMetadata::from_gguf(gguf)?;
+    let council_memory_request = council_memory_request_from_turboquant(
+        &metadata,
+        turboquant.gguf_metadata.as_ref(),
+        config.n_ctx,
+        CouncilExecutionMode::Answer,
+        CouncilParallelism::Sequential,
+    )
+    .unwrap_or_else(|_| CouncilMemoryRequest {
+        execution: CouncilExecutionMode::Answer,
+        parallelism: CouncilParallelism::Sequential,
+        num_layers: metadata.num_layers,
+        num_kv_heads: metadata.num_kv_heads,
+        head_dim: 0,
+        context_length: config.n_ctx,
+        k_layout: CouncilKCacheLayout::Single {
+            bits_per_channel: f64::NAN,
+        },
+        v_bits_per_channel: f64::NAN,
+        additional_controller_bytes: 0,
+        host_pageable_bytes_per_context: 0,
+        host_pinned_bytes_per_context: 0,
+    });
+    let council_memory_resources = council_resources_for_loaded_plan(plan, gguf);
     prepare_elt_loop_runtime(gguf)?;
     let turboquant_layout = turboquant_runtime_layout(&metadata, turboquant.mode);
     validate_turboquant_runtime_mode(turboquant)?;
@@ -1329,6 +1750,7 @@ pub fn load_model(
 
     if !has_nvme {
         let model = LlamaModel::load(model_path, n_gpu_layers, true)?;
+        validate_triality_runtime_policy(&model, config.triality.as_ref())?;
         return Ok(LoadedModel {
             _backend: backend,
             model,
@@ -1337,6 +1759,8 @@ pub fn load_model(
             model_name,
             active_context_state: None,
             turboquant: turboquant.clone(),
+            council_memory_request,
+            council_memory_resources,
             turboquant_layout,
             _controller: None,
             prefetch_state: None,
@@ -1358,6 +1782,7 @@ pub fn load_model(
 
     let model =
         LlamaModel::load_with_overrides(model_path, n_gpu_layers, true, overrides.as_ptr())?;
+    validate_triality_runtime_policy(&model, config.triality.as_ref())?;
 
     let num_layers = model.n_layers() as u32;
 
@@ -1453,6 +1878,8 @@ pub fn load_model(
         model_name,
         active_context_state: None,
         turboquant: turboquant.clone(),
+        council_memory_request,
+        council_memory_resources,
         turboquant_layout,
         _controller: Some(controller),
         prefetch_state: Some(prefetch_state),
@@ -1493,23 +1920,24 @@ pub fn generate_from_loaded(
         .as_ref()
         .map(|state| state.as_ref() as *const InferenceCallbackState as *mut c_void);
     let mut ctx = if let Some(state_ptr) = callback_ptr {
-        LlamaContext::new_with_callback_and_options(
+        create_inference_context(
             &loaded.model,
-            config.n_ctx,
-            config.n_batch,
-            config.n_threads,
+            config,
             Some(eval_callback_with_runtime),
             state_ptr,
+            None,
             turboquant_session.is_some(),
         )?
         // Immediately convert back to avoid leak — the PrefetchState is kept alive
         // by the Arc in LoadedModel, not by this raw pointer.
     } else {
-        LlamaContext::new(
+        create_inference_context(
             &loaded.model,
-            config.n_ctx,
-            config.n_batch,
-            config.n_threads,
+            config,
+            None,
+            std::ptr::null_mut(),
+            None,
+            false,
         )?
     };
 
@@ -1686,24 +2114,41 @@ pub fn compute_gpu_budget(
     metadata: &ModelMetadata,
     context_length: u32,
 ) -> u64 {
+    compute_gpu_budget_with_kv_layout(
+        hw,
+        metadata,
+        context_length,
+        CouncilKCacheLayout::Single {
+            bits_per_channel: 16.0,
+        },
+        16.0,
+        1,
+    )
+    .unwrap_or(0)
+}
+
+pub fn compute_gpu_budget_with_kv_layout(
+    hw: &HardwareProfile,
+    metadata: &ModelMetadata,
+    context_length: u32,
+    k_layout: CouncilKCacheLayout,
+    v_bits_per_channel: f64,
+    context_count: u32,
+) -> Result<u64, CouncilMemoryRefusal> {
     let gpu_working_set = hw.gpu.as_ref().map_or(0, |g| g.vram_bytes);
-    // KV cache on GPU: 2 * layers * kv_heads * head_dim * 2 bytes * context
-    let head_dim = if metadata.num_heads > 0 {
-        metadata.embedding_dim as u64 / metadata.num_heads as u64
-    } else {
-        0
-    };
-    let kv_on_gpu = 2
-        * metadata.num_layers as u64
-        * metadata.num_kv_heads as u64
-        * head_dim
-        * 2
-        * context_length as u64;
-    // Reserve 2 GiB for compute buffers + Metal framework overhead
+    let request = council_memory_request_for_metadata(
+        metadata,
+        context_length,
+        CouncilExecutionMode::Off,
+        CouncilParallelism::Sequential,
+        k_layout,
+        v_bits_per_channel,
+    )?;
+    let kv_on_gpu = request.project(context_count)?.gpu_bytes;
     let runtime_overhead: u64 = 2 * (1 << 30);
-    gpu_working_set
+    Ok(gpu_working_set
         .saturating_sub(kv_on_gpu)
-        .saturating_sub(runtime_overhead)
+        .saturating_sub(runtime_overhead))
 }
 
 fn tensor_backing_residence(
@@ -1928,6 +2373,7 @@ fn generate_blocking_internal(
     let _backend = LlamaBackend::init();
 
     let model = LlamaModel::load(model_path, n_gpu_layers, true)?;
+    validate_triality_runtime_policy(&model, config.triality.as_ref())?;
     let callback_state = turboquant_session.as_ref().map(|session| {
         Box::new(InferenceCallbackState {
             prefetch_state: None,
@@ -1938,17 +2384,16 @@ fn generate_blocking_internal(
         .as_ref()
         .map(|state| state.as_ref() as *const InferenceCallbackState as *mut c_void);
     let mut ctx = if let Some(state_ptr) = callback_ptr {
-        LlamaContext::new_with_callback_and_options(
+        create_inference_context(
             &model,
-            config.n_ctx,
-            config.n_batch,
-            config.n_threads,
+            config,
             Some(eval_callback_with_runtime),
             state_ptr,
+            None,
             turboquant_session.is_some(),
         )?
     } else {
-        LlamaContext::new(&model, config.n_ctx, config.n_batch, config.n_threads)?
+        create_inference_context(&model, config, None, std::ptr::null_mut(), None, false)?
     };
     let mut sampler = LlamaSampler::new(&config.sampling);
 
@@ -2119,6 +2564,7 @@ pub fn generate_with_nvme_scheduling(
 
     let model =
         LlamaModel::load_with_overrides(model_path, n_gpu_layers, use_mmap, overrides.as_ptr())?;
+    validate_triality_runtime_policy(&model, config.triality.as_ref())?;
 
     // Build prefetch state with layer groupings and file offsets
     let num_layers = model.n_layers() as u32;
@@ -2353,11 +2799,13 @@ pub fn generate_with_nvme_scheduling(
     // Expert-streaming with use_mmap=false + pool buffer keeps Metal working set small
     // enough for full batch size. No n_batch reduction needed.
     let effective_batch = config.n_batch;
-    let mut ctx = LlamaContext::new_with_callback_and_kv_and_options(
+    let context_config = InferenceConfig {
+        n_batch: effective_batch,
+        ..config.clone()
+    };
+    let mut ctx = create_inference_context(
         &model,
-        config.n_ctx,
-        effective_batch,
-        config.n_threads,
+        &context_config,
         Some(eval_callback_with_runtime),
         state_ptr,
         kv_quant,
@@ -2684,8 +3132,83 @@ mod tests {
 
     use crate::model::gguf::{GgmlType, TensorInfo};
     use crate::model::turboquant_sidecar::{
-        GgufTurboQuantConfig, ResolvedTurboQuantConfig, TurboQuantMode,
+        GgufNcKaConfig, GgufTrialityBranchConfig, GgufTrialityConsensusConfig,
+        GgufTurboQuantConfig, GgufUrtConfig, ResolvedTurboQuantConfig, TurboQuantMode,
     };
+
+    fn typed_triality_config() -> GgufTurboQuantConfig {
+        let branch = |view: &str, weight: f32| GgufTrialityBranchConfig {
+            view: view.to_string(),
+            weight,
+            bias: 0.0,
+            scale: 1.0,
+            temperature: 1.0,
+            expected_error: 0.0,
+            bits_per_channel: 4.0,
+        };
+        GgufTurboQuantConfig {
+            enabled: true,
+            schema_version: 2,
+            mode: TurboQuantMode::TrialityConsensus,
+            public_mode_label: "triality-consensus".to_string(),
+            runtime_mode: "triality-consensus".to_string(),
+            rotation_policy: None,
+            triality_view: None,
+            triality_mode: Some("triality_consensus".to_string()),
+            triality_mix: None,
+            paper_fidelity: false,
+            k_bits: 4.0,
+            v_bits: 4.0,
+            payload_format: None,
+            payload_bytes: 0,
+            payload_json: None,
+            rotation_seed: 0,
+            artifact_path: None,
+            head_dim: 8,
+            num_layers: 1,
+            num_kv_heads: 1,
+            layers: Vec::new(),
+            weight: None,
+            consensus: Some(GgufTrialityConsensusConfig {
+                profile_id: "test".to_string(),
+                execution: "attention_logit_consensus".to_string(),
+                branches_by_layer: vec![[
+                    branch("vector", 0.2),
+                    branch("spinor_plus_proxy", 0.3),
+                    branch("spinor_minus_proxy", 0.5),
+                ]],
+                js_fallback_threshold: 0.2,
+                required: true,
+                override_allowed: false,
+            }),
+            ncka: Some(GgufNcKaConfig {
+                enabled: true,
+                required: true,
+                schema_version: 1,
+                controller_type: "continuous_piecewise_linear".to_string(),
+                coordinate_names: vec!["entropy".to_string()],
+                outer_count: 3,
+                knot_count: 2,
+                s3_equivariant: true,
+                controller_sha256: "controller".to_string(),
+                normalisation_sha256: "normalisation".to_string(),
+                static_fallback_selected: false,
+                fallback_weights: [0.2, 0.3, 0.5],
+            }),
+            urt: Some(GgufUrtConfig {
+                enabled: true,
+                schema_version: 1,
+                abstract_algebra_id: "triality".to_string(),
+                operator_word_manifest: r#"{"words":["tau"]}"#.to_string(),
+                operator_word_sha256: "operator".to_string(),
+                reference_representation: "python_quantised_reference".to_string(),
+                supported_representations: vec!["hypura_native".to_string()],
+                consistency_tolerance: 1.0e-5,
+                moment_degree: 3,
+                moment_manifest_sha256: "moments".to_string(),
+            }),
+        }
+    }
 
     fn make_gguf(layers: u32, tensors_per_layer: u32) -> GgufFile {
         let mut tensors = Vec::new();
@@ -2864,6 +3387,9 @@ mod tests {
                 num_kv_heads: 4,
                 layers: Vec::new(),
                 weight: None,
+                consensus: None,
+                ncka: None,
+                urt: None,
             }),
         };
 
@@ -2906,5 +3432,176 @@ mod tests {
 
         assert_eq!(restored_prefix_len(Some(&snapshot), &[1, 2, 3, 4]), 0);
         assert_eq!(restored_prefix_len(None, &[1, 2, 3, 4]), 0);
+    }
+
+    #[test]
+    fn triality_weight_rows_reject_invalid_values() {
+        assert!(validate_triality_weight_rows(&[0.2, 0.3, 0.5]).is_ok());
+        assert!(validate_triality_weight_rows(&[0.2, -0.1, 0.9]).is_err());
+        assert!(validate_triality_weight_rows(&[0.2, 0.3, f32::NAN]).is_err());
+        assert!(validate_triality_weight_rows(&[0.2, 0.3, 0.4]).is_err());
+        assert!(validate_triality_weight_rows(&[0.5, 0.5]).is_err());
+    }
+
+    #[test]
+    fn schema_v2_override_sources_fail_closed() {
+        assert!(
+            validate_schema_v2_override_sources(
+                &LlamaTurboquantCliBridge::default(),
+                false,
+                &["LLAMA_TURBOQUANT_FUTURE".to_string()],
+            )
+            .is_err()
+        );
+
+        let explicit = LlamaTurboquantCliBridge {
+            execution: Some(TrialityExecution::BestPerLayer),
+            ..LlamaTurboquantCliBridge::default()
+        };
+        assert!(validate_schema_v2_override_sources(&explicit, false, &[]).is_err());
+        assert!(validate_schema_v2_override_sources(&explicit, true, &[]).is_ok());
+
+        let identity_without_developer = LlamaTurboquantCliBridge {
+            tq_allow_identity_view_fallback: true,
+            ..LlamaTurboquantCliBridge::default()
+        };
+        assert!(
+            validate_schema_v2_override_sources(&identity_without_developer, true, &[]).is_err()
+        );
+        let identity_with_developer = LlamaTurboquantCliBridge {
+            tq_allow_identity_view_fallback: true,
+            tq_developer_override: true,
+            ..LlamaTurboquantCliBridge::default()
+        };
+        assert!(validate_schema_v2_override_sources(&identity_with_developer, false, &[]).is_ok());
+    }
+
+    #[test]
+    fn identity_dev_artifact_requires_explicit_developer_override() {
+        let mut embedded = typed_triality_config();
+        embedded.rotation_policy = Some(RotationPolicy::IdentityDev);
+
+        let error = resolve_triality_runtime_policy_with_legacy_env(
+            Some(&embedded),
+            &LlamaTurboquantCliBridge::default(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("explicit developer override"));
+
+        let developer = LlamaTurboquantCliBridge {
+            tq_developer_override: true,
+            ..LlamaTurboquantCliBridge::default()
+        };
+        assert!(
+            resolve_triality_runtime_policy_with_legacy_env(Some(&embedded), &developer, &[])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn typed_schema_v2_policy_preserves_ncka_urt_and_required_telemetry() {
+        let embedded = typed_triality_config();
+        let policy = resolve_triality_runtime_policy_with_legacy_env(
+            Some(&embedded),
+            &LlamaTurboquantCliBridge::default(),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(policy.context.schema_version, 2);
+        assert_eq!(
+            policy.context.execution,
+            TrialityExecution::AttentionLogitConsensus
+        );
+        assert!(policy.context.trace_enabled);
+        assert!(policy.ncka_required);
+        assert!(policy.urt_enabled);
+        assert_eq!(policy.ncka, embedded.ncka);
+        assert_eq!(policy.urt, embedded.urt);
+        assert!(!policy.embedded_override_allowed);
+    }
+
+    #[test]
+    fn developer_single_view_override_recomputes_one_hot_active_mask() {
+        let embedded = typed_triality_config();
+        let ambiguous = LlamaTurboquantCliBridge {
+            execution: Some(TrialityExecution::SingleView),
+            tq_developer_override: true,
+            ..LlamaTurboquantCliBridge::default()
+        };
+        assert!(
+            resolve_triality_runtime_policy_with_legacy_env(Some(&embedded), &ambiguous, &[])
+                .is_err()
+        );
+
+        let bridge = LlamaTurboquantCliBridge {
+            execution: Some(TrialityExecution::SingleView),
+            weights: Some([0.0, 1.0, 0.0]),
+            tq_developer_override: true,
+            ..LlamaTurboquantCliBridge::default()
+        };
+        let policy = resolve_triality_runtime_policy_with_legacy_env(Some(&embedded), &bridge, &[])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(policy.context.execution, TrialityExecution::SingleView);
+        assert!(
+            policy
+                .context
+                .layers
+                .iter()
+                .all(|layer| layer.active_branch_mask == 0b010)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires HYPURA_TEST_TRIALITY_GGUF pointing to a schema-v2 fixture"]
+    fn schema_v2_fixture_resolves_explicit_context_and_override_guard() {
+        let path = std::env::var_os("HYPURA_TEST_TRIALITY_GGUF")
+            .expect("HYPURA_TEST_TRIALITY_GGUF must be set");
+        let gguf = GgufFile::open(std::path::Path::new(&path)).unwrap();
+        let metadata = ModelMetadata::from_gguf(&gguf).unwrap();
+
+        let parsed =
+            crate::model::turboquant_sidecar::read_gguf_turboquant_config(&gguf, &metadata)
+                .unwrap();
+        let embedded =
+            resolve_triality_runtime_policy(parsed.as_ref(), &LlamaTurboquantCliBridge::default())
+                .unwrap()
+                .expect("fixture must contain schema-v2 Triality metadata");
+        assert_eq!(embedded.context.schema_version, 2);
+        assert_eq!(embedded.context.layers.len(), metadata.num_layers as usize);
+        assert!(!embedded.embedded_override_allowed);
+        assert!(!embedded.ncka_required);
+        assert!(!embedded.urt_enabled);
+
+        let rejected = LlamaTurboquantCliBridge {
+            execution: Some(TrialityExecution::BestPerLayer),
+            ..LlamaTurboquantCliBridge::default()
+        };
+        assert!(resolve_triality_runtime_policy(parsed.as_ref(), &rejected).is_err());
+
+        let developer = LlamaTurboquantCliBridge {
+            execution: Some(TrialityExecution::BestPerLayer),
+            weights: Some([0.2, 0.3, 0.5]),
+            tq_developer_override: true,
+            ..LlamaTurboquantCliBridge::default()
+        };
+        let overridden = resolve_triality_runtime_policy(parsed.as_ref(), &developer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overridden.context.execution,
+            TrialityExecution::BestPerLayer
+        );
+        assert!(overridden.context.layers.iter().all(|layer| {
+            layer
+                .branches
+                .iter()
+                .map(|branch| branch.weight)
+                .eq([0.2, 0.3, 0.5])
+        }));
     }
 }

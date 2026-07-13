@@ -55,6 +55,9 @@ pub fn build_kv_codec(
             })?,
         )?)),
         TurboQuantMode::ResearchKvSplit => Ok(Box::new(ResearchKvSplitCodec::new(resolved)?)),
+        TurboQuantMode::TrialityConsensus | TurboQuantMode::TrialityResidualParity => {
+            anyhow::bail!("Triality schema-v2 KV storage is owned by the native llama.cpp runtime")
+        }
     }
 }
 

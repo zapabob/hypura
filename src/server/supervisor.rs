@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use crate::compute::ffi::TrialityExecution;
 use crate::model::turboquant_sidecar::{RotationPolicy, TurboQuantMode};
 use crate::scheduler::types::{HostPinnedPolicy, ResidencyProfile};
 
@@ -89,8 +90,8 @@ impl CompatControlPlaneClient {
             request = request.header(header::ACCEPT, accept);
         }
         let upstream = request.body(body.to_vec()).send().await?;
-        let status = StatusCode::from_u16(upstream.status().as_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
         let bytes = upstream.bytes().await?;
         let mut response = Response::new(Body::from(bytes));
@@ -121,6 +122,20 @@ pub struct CompatWorkerBootstrap {
     pub tq_triality_mix: f32,
     pub tq_rotation_seed: u32,
     pub tq_artifact: Option<String>,
+    #[serde(default)]
+    pub triality_execution: Option<TrialityExecution>,
+    #[serde(default)]
+    pub triality_weights: Option<[f32; 3]>,
+    #[serde(default)]
+    pub triality_trace: bool,
+    #[serde(default)]
+    pub ncka_required: bool,
+    #[serde(default)]
+    pub urt_enabled: bool,
+    #[serde(default)]
+    pub tq_developer_override: bool,
+    #[serde(default)]
+    pub tq_allow_identity_view_fallback: bool,
     pub model_dir: Option<String>,
     pub ui_theme: String,
     pub savedatafile: Option<String>,
@@ -250,10 +265,7 @@ pub async fn spawn_supervisor_control_plane(
     };
     let app = Router::new()
         .route("/control/command", post(control_command_handler))
-        .route(
-            "/embeddings/api/extra/embeddings",
-            post(embeddings_handler),
-        )
+        .route("/embeddings/api/extra/embeddings", post(embeddings_handler))
         .route("/embeddings/v1/embeddings", post(embeddings_handler))
         .route("/builtin/api/extra/websearch", post(websearch_handler))
         .route(
@@ -266,16 +278,34 @@ pub async fn spawn_supervisor_control_plane(
         )
         .route("/multimodal/api/extra/tts", post(multimodal_tts_handler))
         .route("/multimodal/v1/audio/speech", post(multimodal_tts_handler))
-        .route("/multimodal/speakers_list", get(multimodal_speakers_handler))
-        .route("/multimodal/sdapi/v1/txt2img", post(multimodal_sd_post_handler))
-        .route("/multimodal/sdapi/v1/img2img", post(multimodal_sd_post_handler))
+        .route(
+            "/multimodal/speakers_list",
+            get(multimodal_speakers_handler),
+        )
+        .route(
+            "/multimodal/sdapi/v1/txt2img",
+            post(multimodal_sd_post_handler),
+        )
+        .route(
+            "/multimodal/sdapi/v1/img2img",
+            post(multimodal_sd_post_handler),
+        )
         .route(
             "/multimodal/sdapi/v1/interrogate",
             post(multimodal_sd_post_handler),
         )
-        .route("/multimodal/sdapi/v1/upscale", post(multimodal_sd_post_handler))
-        .route("/multimodal/sdapi/v1/options", get(multimodal_sd_get_handler))
-        .route("/multimodal/sdapi/v1/sd-models", get(multimodal_sd_get_handler))
+        .route(
+            "/multimodal/sdapi/v1/upscale",
+            post(multimodal_sd_post_handler),
+        )
+        .route(
+            "/multimodal/sdapi/v1/options",
+            get(multimodal_sd_get_handler),
+        )
+        .route(
+            "/multimodal/sdapi/v1/sd-models",
+            get(multimodal_sd_get_handler),
+        )
         .with_state(state);
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
@@ -347,7 +377,9 @@ async fn embeddings_handler(
     match tokio::task::spawn_blocking(move || {
         let mut guard = embeddings.lock().unwrap();
         let runtime = guard.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("embeddings model is not available in the current compatibility runtime")
+            anyhow::anyhow!(
+                "embeddings model is not available in the current compatibility runtime"
+            )
         })?;
         runtime.embed_request(&request)
     })
@@ -356,8 +388,7 @@ async fn embeddings_handler(
         Ok(Ok(response)) => Json(response).into_response(),
         Ok(Err(error)) => {
             let message = error.to_string();
-            let status = if message.contains("not available in the current compatibility runtime")
-            {
+            let status = if message.contains("not available in the current compatibility runtime") {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::BAD_REQUEST
@@ -540,13 +571,10 @@ async fn proxy_upstream(
     base_url: &str,
     path: &str,
 ) -> Response {
-    let mut request = state
-        .proxy_client
-        .request(
-            reqwest::Method::from_bytes(method.as_str().as_bytes())
-                .unwrap_or(reqwest::Method::GET),
-            format!("{base_url}{path}"),
-        );
+    let mut request = state.proxy_client.request(
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
+        format!("{base_url}{path}"),
+    );
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         request = request.header(header::CONTENT_TYPE, content_type);
     }
@@ -555,8 +583,8 @@ async fn proxy_upstream(
     }
     match request.body(body.to_vec()).send().await {
         Ok(response) => {
-            let status = StatusCode::from_u16(response.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
             match response.bytes().await {
                 Ok(bytes) => {
@@ -622,6 +650,13 @@ mod tests {
             tq_triality_mix: 0.5,
             tq_rotation_seed: 0,
             tq_artifact: None,
+            triality_execution: None,
+            triality_weights: None,
+            triality_trace: false,
+            ncka_required: false,
+            urt_enabled: false,
+            tq_developer_override: false,
+            tq_allow_identity_view_fallback: false,
             model_dir: None,
             ui_theme: "classic".to_string(),
             savedatafile: None,

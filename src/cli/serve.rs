@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Instant;
 
 use hypura::compute::inference::{self, LlamaTurboquantCliBridge};
+use hypura::council::{CouncilStore, CouncilStoreConfig};
 use hypura::model::{
+    file_identity::GuardedModelFile,
     gguf::GgufFile,
     metadata::ModelMetadata,
     turboquant_sidecar::{RotationPolicy, TurboQuantMode, read_gguf_turboquant_config},
@@ -23,9 +25,11 @@ use hypura::server::supervisor::{
     CompatControlPlaneClient, CompatWorkerBootstrap, compat_feature_flags_from_env,
 };
 use hypura::telemetry::metrics::TelemetryEmitter;
+use hypura::urt::{UrtRegistry, UrtRegistryConfig};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{Value, json};
 
+use super::council::{TrialityCliOverrides, TrialityExecutionArg, TrialityWeights};
 use super::fmt_util::{cli_progress_enabled, format_bytes, print_elt_loop_status};
 
 fn set_process_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
@@ -232,6 +236,7 @@ pub fn run(
     residency_profile: ResidencyProfile,
     host_pinned: HostPinnedPolicy,
     tq_allow_exact_fallback: bool,
+    triality: &TrialityCliOverrides,
     savedatafile: Option<&str>,
     preloadstory: Option<&str>,
     admindir: Option<&str>,
@@ -239,7 +244,7 @@ pub fn run(
     exportconfig: Option<&str>,
     migration_dir: Option<&str>,
 ) -> anyhow::Result<()> {
-    let llama_bridge = LlamaTurboquantCliBridge {
+    let llama_bridge = triality.apply_to_bridge(LlamaTurboquantCliBridge {
         rotation_policy,
         llama_rotation_seed: tq_rotation_seed,
         tq_so8_off,
@@ -247,7 +252,8 @@ pub fn run(
         tq_so8_learned,
         tq_triality_mix,
         tq_artifact: tq_artifact.map(|s| s.to_string()),
-    };
+        ..Default::default()
+    });
     if !ui_theme.trim().is_empty() {
         set_process_env_var("HYPURA_UI_THEME", ui_theme.trim());
     }
@@ -314,6 +320,15 @@ pub fn run_worker_bootstrap(bootstrap_file: &str) -> anyhow::Result<()> {
         bootstrap.residency_profile,
         bootstrap.host_pinned,
         false,
+        &TrialityCliOverrides {
+            execution: bootstrap.triality_execution.map(TrialityExecutionArg::from),
+            weights: bootstrap.triality_weights.map(TrialityWeights),
+            trace_enabled: bootstrap.triality_trace,
+            ncka_required: bootstrap.ncka_required,
+            urt_enabled: bootstrap.urt_enabled,
+            developer_override: bootstrap.tq_developer_override,
+            allow_identity_view_fallback: bootstrap.tq_allow_identity_view_fallback,
+        },
         bootstrap.savedatafile.as_deref(),
         bootstrap.preloadstory.as_deref(),
         bootstrap.admindir.as_deref(),
@@ -342,7 +357,18 @@ async fn run_async(
     exportconfig: Option<&str>,
     migration_dir: Option<&str>,
 ) -> anyhow::Result<()> {
-    let path = Path::new(model_path);
+    let requested_path = Path::new(model_path);
+    let model_file_guard = if dry_run {
+        None
+    } else {
+        let guarded_path = requested_path.to_path_buf();
+        Some(tokio::task::spawn_blocking(move || GuardedModelFile::acquire(&guarded_path)).await??)
+    };
+    let active_model_path = model_file_guard
+        .as_ref()
+        .map(|guard| guard.canonical_path().to_path_buf())
+        .unwrap_or_else(|| requested_path.to_path_buf());
+    let path = active_model_path.as_path();
     let embedded_turboquant = {
         let gguf = GgufFile::open(path)?;
         let metadata = ModelMetadata::from_gguf(&gguf)?;
@@ -562,7 +588,10 @@ async fn run_async(
         println!("  Dry-run: runtime wiring resolved without loading model weights");
         return Ok(());
     }
-    let file_size = std::fs::metadata(path)?.len();
+    let model_file_guard = model_file_guard
+        .ok_or_else(|| anyhow::anyhow!("model file guard is unavailable for startup load"))?;
+    let initial_file_snapshot = model_file_guard.initial_snapshot().clone();
+    let file_size = initial_file_snapshot.size();
 
     let gguf_info = GgufInfo {
         file_size,
@@ -579,6 +608,7 @@ async fn run_async(
 
     let config = inference::InferenceConfig {
         n_ctx: context,
+        triality: runtime.triality.clone(),
         ..inference::InferenceConfig::default()
     };
 
@@ -617,6 +647,21 @@ async fn run_async(
         )
     })
     .await??;
+    pb.set_message("Verifying loaded GGUF file identity...");
+    let model_file_guard = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        model_file_guard.verify_unchanged()?;
+        Ok(model_file_guard)
+    })
+    .await??;
+    let model_sha256 = if runtime
+        .triality
+        .as_ref()
+        .is_some_and(|triality| triality.urt_enabled)
+    {
+        Some(initial_file_snapshot.sha256().to_string())
+    } else {
+        None
+    };
 
     if cli_progress_enabled() {
         pb.finish_and_clear();
@@ -625,11 +670,12 @@ async fn run_async(
     println!("Model loaded in {load_secs:.1}s");
 
     let load_duration_ns = load_start.elapsed().as_nanos() as u64;
-    let model_name = std::env::var("HYPURA_MODEL_NAME")
+    let explicit_model_alias = std::env::var("HYPURA_MODEL_NAME")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| loaded.model_name.clone());
+        .filter(|s| !s.is_empty());
+    let model_name_is_explicit_alias = explicit_model_alias.is_some();
+    let model_name = explicit_model_alias.unwrap_or_else(|| loaded.model_name.clone());
 
     let telemetry = Arc::new(TelemetryEmitter::new(256));
     let init_theme = if let Some(storage) = compat_storage.as_ref() {
@@ -678,11 +724,17 @@ async fn run_async(
     } else {
         None
     };
+    let council_store = Arc::new(CouncilStore::open(CouncilStoreConfig::app_data_default()?)?);
+    let urt_registry = Arc::new(std::sync::Mutex::new(UrtRegistry::open(
+        UrtRegistryConfig::app_data_persistent()?,
+    )?));
 
     let state = Arc::new(AppState {
         loaded_model,
         model_name: Arc::new(std::sync::Mutex::new(model_name.clone())),
+        model_name_is_explicit_alias,
         model_path: Arc::new(std::sync::Mutex::new(path.to_path_buf())),
+        model_sha256: Arc::new(std::sync::Mutex::new(model_sha256)),
         gguf_info: Arc::new(std::sync::Mutex::new(gguf_info)),
         model_dir: model_dir
             .map(std::path::PathBuf::from)
@@ -691,6 +743,8 @@ async fn run_async(
         default_context: Arc::new(AtomicU32::new(context)),
         load_duration_ns,
         telemetry,
+        council_store,
+        urt_registry,
         turboquant: runtime.turboquant,
         serve_turboquant_mode: turboquant_mode,
         serve_turboquant_config_path,
@@ -711,6 +765,7 @@ async fn run_async(
         compat_control_client,
         compat_session,
     });
+    drop(model_file_guard);
 
     if let Some(storage) = compat_storage.as_ref() {
         storage.migrate_gui_state(

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use good_lp::{constraint, default_solver, variable, variables, Expression, Solution, SolverModel};
+use good_lp::{Expression, Solution, SolverModel, constraint, default_solver, variable, variables};
 
 use crate::model::gguf::{GgufFile, TensorInfo};
 use crate::model::metadata::ModelMetadata;
@@ -119,8 +119,13 @@ pub fn compute_placement_with_context_and_policy(
     );
 
     // Build prefetch schedule
-    let prefetch_schedule =
-        build_prefetch_schedule(&tensor_placements, &model.tensors, &metadata, hardware, inference_mode);
+    let prefetch_schedule = build_prefetch_schedule(
+        &tensor_placements,
+        &model.tensors,
+        &metadata,
+        hardware,
+        inference_mode,
+    );
 
     // KV cache plan
     let kv_cache_plan =
@@ -236,16 +241,137 @@ fn compute_tier_capacities(
 }
 
 fn estimate_kv_bytes(metadata: &ModelMetadata, context_length: u32) -> u64 {
-    if metadata.num_heads == 0 || metadata.embedding_dim == 0 {
-        return 0;
+    let request = match council_memory_request_for_metadata(
+        metadata,
+        context_length,
+        CouncilExecutionMode::Off,
+        CouncilParallelism::Sequential,
+        CouncilKCacheLayout::Single {
+            bits_per_channel: 16.0,
+        },
+        16.0,
+    ) {
+        Ok(request) => request,
+        Err(_) => return u64::MAX,
+    };
+    request
+        .project(1)
+        .map(|projection| projection.kv_bytes)
+        .unwrap_or(u64::MAX)
+}
+
+pub fn council_memory_request_for_metadata(
+    metadata: &ModelMetadata,
+    context_length: u32,
+    execution: CouncilExecutionMode,
+    parallelism: CouncilParallelism,
+    k_layout: CouncilKCacheLayout,
+    v_bits_per_channel: f64,
+) -> Result<CouncilMemoryRequest, CouncilMemoryRefusal> {
+    if metadata.num_heads == 0
+        || metadata.embedding_dim == 0
+        || metadata.embedding_dim % metadata.num_heads != 0
+    {
+        return Err(CouncilMemoryRefusal {
+            code: CouncilMemoryRefusalCode::InvalidRequest,
+            resource: None,
+            requested_bytes: None,
+            available_after_headroom_bytes: None,
+            reason: "model attention metadata cannot determine an integral head dimension"
+                .to_string(),
+        });
     }
-    let head_dim = metadata.embedding_dim as u64 / metadata.num_heads as u64;
-    // 2 (key+value) * layers * kv_heads * head_dim * 2 (FP16 bytes) * context
-    2 * metadata.num_layers as u64
-        * metadata.num_kv_heads as u64
-        * head_dim
-        * 2
-        * context_length as u64
+    Ok(CouncilMemoryRequest {
+        execution,
+        parallelism,
+        num_layers: metadata.num_layers,
+        num_kv_heads: metadata.num_kv_heads,
+        head_dim: u64::from(metadata.embedding_dim / metadata.num_heads),
+        context_length,
+        k_layout,
+        v_bits_per_channel,
+        additional_controller_bytes: 0,
+        host_pageable_bytes_per_context: 0,
+        host_pinned_bytes_per_context: 0,
+    })
+}
+
+pub fn conservative_council_headroom(hw: &HardwareProfile) -> CouncilMemoryHeadroom {
+    let gpu_capacity = hw.gpu.as_ref().map_or(0, |gpu| gpu.vram_bytes);
+    let gpu_bytes = if gpu_capacity == 0 {
+        0
+    } else {
+        (gpu_capacity / 16).clamp(256 * (1 << 20), 1 << 30)
+    };
+    let host_pageable_bytes = (hw.memory.total_bytes / 16).clamp(512 * (1 << 20), 2 * (1 << 30));
+    let host_pinned_bytes = if hw.memory.supports_host_pinning && hw.memory.pinned_budget_bytes > 0
+    {
+        (hw.memory.pinned_budget_bytes / 8).clamp(64 * (1 << 20), 256 * (1 << 20))
+    } else {
+        0
+    };
+    CouncilMemoryHeadroom::new(
+        gpu_bytes,
+        host_pageable_bytes,
+        host_pinned_bytes,
+        host_pageable_bytes,
+    )
+}
+
+pub fn council_memory_resources_for_plan(
+    hw: &HardwareProfile,
+    placement: &PlacementSummary,
+    current_host_available_bytes: u64,
+    headroom: CouncilMemoryHeadroom,
+) -> CouncilMemoryResources {
+    let gpu_capacity = hw.gpu.as_ref().map_or(0, |gpu| gpu.vram_bytes);
+    let gpu_committed = placement
+        .total_gpu_bytes
+        .checked_add(GPU_RUNTIME_OVERHEAD)
+        .unwrap_or(u64::MAX);
+    let pinned_capacity = if hw.memory.supports_host_pinning {
+        hw.memory.pinned_budget_bytes.min(hw.memory.total_bytes)
+    } else {
+        0
+    };
+    let pageable_capacity = hw.memory.total_bytes.saturating_sub(pinned_capacity);
+    let observed_host_committed = hw
+        .memory
+        .total_bytes
+        .saturating_sub(current_host_available_bytes.min(hw.memory.total_bytes));
+    let host_pageable_committed = observed_host_committed
+        .checked_add(placement.total_host_pageable_bytes)
+        .unwrap_or(u64::MAX);
+    let host_pinned_committed = placement.total_host_pinned_bytes;
+    let unified = hw.memory.is_unified.then(|| {
+        let placement_committed = placement
+            .total_gpu_bytes
+            .checked_add(placement.total_host_pageable_bytes)
+            .and_then(|value| value.checked_add(placement.total_host_pinned_bytes))
+            .unwrap_or(u64::MAX);
+        CouncilMemoryRegionBudget::new(
+            hw.memory.total_bytes,
+            observed_host_committed
+                .checked_add(placement_committed)
+                .unwrap_or(u64::MAX),
+            headroom.unified_bytes,
+        )
+    });
+
+    CouncilMemoryResources {
+        gpu: CouncilMemoryRegionBudget::new(gpu_capacity, gpu_committed, headroom.gpu_bytes),
+        host_pageable: CouncilMemoryRegionBudget::new(
+            pageable_capacity,
+            host_pageable_committed,
+            headroom.host_pageable_bytes,
+        ),
+        host_pinned: CouncilMemoryRegionBudget::new(
+            pinned_capacity,
+            host_pinned_committed,
+            headroom.host_pinned_bytes,
+        ),
+        unified,
+    }
 }
 
 struct ScoredTensor {
@@ -1190,7 +1316,9 @@ pub fn summarize_placement(
         }
         if matches!(
             residence,
-            TensorResidence::HostPinned | TensorResidence::HostPageable | TensorResidence::NvmeBacked
+            TensorResidence::HostPinned
+                | TensorResidence::HostPageable
+                | TensorResidence::NvmeBacked
         ) {
             summary.total_staging_bytes += t.size_bytes;
         }
@@ -1323,8 +1451,8 @@ mod tests {
             .collect();
 
         let caps = TierCapacities {
-            gpu_bytes: 3 << 30,     // 3 GB GPU
-            host_pageable_bytes: 4 << 30,     // 4 GB RAM
+            gpu_bytes: 3 << 30,           // 3 GB GPU
+            host_pageable_bytes: 4 << 30, // 4 GB RAM
             host_pinned_bytes: 0,
             unified_limit: 7 << 30, // 7 GB unified
             nvme_peak_bw: 5_000_000_000,
@@ -1454,8 +1582,7 @@ mod tests {
             size_bytes: 1 << 28,
             layer_index: Some(0),
         }];
-        let assignments =
-            HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
+        let assignments = HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
         let mut metadata = make_metadata(1);
         metadata.is_moe = true;
         metadata.num_experts = Some(8);
@@ -1479,7 +1606,11 @@ mod tests {
         let placement = placements.get(&tensors[0].name).unwrap();
         assert_eq!(placement.residence, TensorResidence::HostPageable);
         assert_eq!(
-            backing_residence(placement, &TensorRole::MoeFusedExperts, InferenceMode::ExpertStreaming),
+            backing_residence(
+                placement,
+                &TensorRole::MoeFusedExperts,
+                InferenceMode::ExpertStreaming
+            ),
             TensorResidence::NvmeBacked
         );
     }
@@ -1494,8 +1625,7 @@ mod tests {
             size_bytes: 1 << 28,
             layer_index: Some(0),
         }];
-        let assignments =
-            HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
+        let assignments = HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
         let caps = TierCapacities {
             gpu_bytes: 8 << 30,
             host_pageable_bytes: 8 << 30,
@@ -1526,8 +1656,7 @@ mod tests {
             size_bytes: 1 << 28,
             layer_index: Some(0),
         }];
-        let assignments =
-            HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
+        let assignments = HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
         let mut metadata = make_metadata(1);
         metadata.is_moe = true;
         metadata.num_experts = Some(8);
@@ -1562,8 +1691,7 @@ mod tests {
             size_bytes: 1 << 28,
             layer_index: Some(0),
         }];
-        let assignments =
-            HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
+        let assignments = HashMap::from([(tensors[0].name.clone(), TensorResidence::NvmeBacked)]);
         let caps = TierCapacities {
             gpu_bytes: 8 << 30,
             host_pageable_bytes: 6 << 30,

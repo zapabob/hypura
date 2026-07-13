@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use crate::council::{AhaMode, AhaReasonCode, CouncilView};
 use crate::scheduler::types::StorageTier;
 
 /// Real-time telemetry events emitted during inference.
@@ -34,6 +35,36 @@ pub enum TelemetryEvent {
         tier: StorageTier,
         bytes: u64,
         latency_us: u64,
+    },
+    TrialityBranchCompleted {
+        request_id: String,
+        view: CouncilView,
+        prompt_tokens: u32,
+        generated_tokens: u32,
+        runtime_ms: u64,
+        tok_per_sec: f64,
+        trace_enabled: bool,
+        content_persisted: bool,
+    },
+    TrialityConsensusCompleted {
+        request_id: String,
+        selected_view: CouncilView,
+        candidate_scores: [f64; 3],
+        winner_margin: f64,
+        agreement: f64,
+        result_persisted: bool,
+    },
+    TrialityUrtChecked {
+        request_id: String,
+        comparison_count: u32,
+        consistent: Option<bool>,
+        max_absolute_error: Option<f64>,
+    },
+    TrialityAha {
+        request_id: String,
+        emitted: bool,
+        mode: Option<AhaMode>,
+        reason_code: Option<AhaReasonCode>,
     },
 }
 

@@ -10,6 +10,7 @@ use hypura::scheduler::types::{
 use hypura::telemetry::metrics::TelemetryEmitter;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use super::council::TrialityCliOverrides;
 use super::fmt_util::{cli_progress_enabled, format_bytes, print_elt_loop_status};
 
 pub fn run(
@@ -25,6 +26,7 @@ pub fn run(
     residency_profile: ResidencyProfile,
     host_pinned: HostPinnedPolicy,
     tq_allow_exact_fallback: bool,
+    triality: &TrialityCliOverrides,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
@@ -40,6 +42,7 @@ pub fn run(
         residency_profile,
         host_pinned,
         tq_allow_exact_fallback,
+        triality,
     ))
 }
 
@@ -56,13 +59,14 @@ async fn run_async(
     residency_profile: ResidencyProfile,
     host_pinned: HostPinnedPolicy,
     tq_allow_exact_fallback: bool,
+    triality: &TrialityCliOverrides,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
-    let llama_bridge = LlamaTurboquantCliBridge {
+    let llama_bridge = triality.apply_to_bridge(LlamaTurboquantCliBridge {
         rotation_policy,
         llama_rotation_seed: rotation_seed,
         ..Default::default()
-    };
+    });
     let runtime = resolve_runtime_setup(
         path,
         context,
@@ -129,6 +133,7 @@ async fn run_async(
         ..InferenceConfig::default()
     };
     config.sampling.max_tokens = max_tokens;
+    config.triality = runtime.triality.clone();
 
     // Clone what we need for the blocking thread
     let plan = Arc::new(runtime.plan.clone());

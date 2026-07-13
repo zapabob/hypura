@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use crate::cache::kv_codec::{build_kv_codec, KvCodec};
+use crate::cache::kv_codec::{KvCodec, build_kv_codec};
 use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
 
 /// FFI bridge that connects Rust KvCodec to C callbacks for llama.cpp integration.

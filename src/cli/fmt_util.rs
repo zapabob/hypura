@@ -1,6 +1,6 @@
-use std::io::{stderr, IsTerminal};
+use std::io::{IsTerminal, stderr};
 
-use hypura::model::elt_loop::{elt_loop_runtime_supported_from_env, EltLoopMetadata};
+use hypura::model::elt_loop::{EltLoopMetadata, elt_loop_runtime_supported_from_env};
 
 /// Whether to show indicatif spinners/bars (stderr TTY, not CI, NO_COLOR unset).
 pub fn cli_progress_enabled() -> bool {

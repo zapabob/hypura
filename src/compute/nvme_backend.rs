@@ -1,6 +1,6 @@
 use crate::io::compat::{self, NativeFd};
 use std::collections::HashMap;
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -156,11 +156,7 @@ impl IoPool {
     pub fn throughput_bps(&self) -> f64 {
         let bytes = self.bytes_loaded.load(Ordering::Relaxed) as f64;
         let ns = self.load_time_ns.load(Ordering::Relaxed) as f64;
-        if ns > 0.0 {
-            bytes / (ns / 1e9)
-        } else {
-            0.0
-        }
+        if ns > 0.0 { bytes / (ns / 1e9) } else { 0.0 }
     }
 }
 
@@ -466,7 +462,10 @@ impl PrefetchState {
     }
 
     fn mark_unit_residency(&self, key: StreamUnitKey, residence: RuntimeResidency) {
-        self.runtime_residency.lock().unwrap().insert(key, residence);
+        self.runtime_residency
+            .lock()
+            .unwrap()
+            .insert(key, residence);
     }
 
     fn mark_layer_residency(&self, layer_idx: u32, residence: RuntimeResidency) {
@@ -1212,8 +1211,8 @@ impl PrefetchState {
         }
         drop(status);
         for layout in layouts {
-            let tensor_type = ExpertTensorType::from_name(&layout.tensor_name)
-                .unwrap_or(ExpertTensorType::Gate);
+            let tensor_type =
+                ExpertTensorType::from_name(&layout.tensor_name).unwrap_or(ExpertTensorType::Gate);
             for &eid in expert_ids {
                 if eid < layout.num_experts {
                     self.mark_expert_residency(
@@ -2684,7 +2683,12 @@ fn regex_escape(s: &str) -> String {
 
 /// cb_eval callback — tracks layer transitions, intercepts router output,
 /// and triggers expert-aware prefetch/release with co-activation predictions.
-pub extern "C" fn eval_callback(
+///
+/// # Safety
+///
+/// `tensor` must reference a live `ggml_tensor`, and `user_data` must reference
+/// a live `PrefetchState` for the duration of the callback.
+pub unsafe extern "C" fn eval_callback(
     tensor: *mut hypura_sys::ggml_tensor,
     ask: bool,
     user_data: *mut c_void,
@@ -3319,7 +3323,10 @@ mod tests {
     #[test]
     fn test_pinned_staging_fallback_semantics() {
         let state = make_test_prefetch_state();
-        assert_eq!(state.preferred_warm_residency(), RuntimeResidency::PageableWarm);
+        assert_eq!(
+            state.preferred_warm_residency(),
+            RuntimeResidency::PageableWarm
+        );
 
         let ring = PinnedStagingRing {
             base: std::ptr::null_mut(),

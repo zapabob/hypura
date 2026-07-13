@@ -176,7 +176,7 @@ mod imp {
 
     pub fn alloc_pages(size: usize) -> *mut u8 {
         use windows_sys::Win32::System::Memory::{
-            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         unsafe {
             VirtualAlloc(
@@ -189,7 +189,7 @@ mod imp {
     }
 
     pub fn free_pages(ptr: *mut u8, _size: usize) {
-        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
         if !ptr.is_null() {
             unsafe {
                 VirtualFree(ptr as *mut _, 0, MEM_RELEASE);
@@ -279,9 +279,9 @@ mod cuda_host {
             else {
                 continue;
             };
-            let Some(unregister) = (unsafe {
-                GetProcAddress(handle, c"cudaHostUnregister".as_ptr() as *const u8)
-            }) else {
+            let Some(unregister) =
+                (unsafe { GetProcAddress(handle, c"cudaHostUnregister".as_ptr() as *const u8) })
+            else {
                 continue;
             };
 

@@ -104,9 +104,7 @@ pub fn default_asset_root() -> PathBuf {
         }
     }
 
-    PathBuf::from(".hypura")
-        .join("koboldcpp")
-        .join("assets")
+    PathBuf::from(".hypura").join("koboldcpp").join("assets")
 }
 
 pub fn discover_asset_manifest_path() -> Option<PathBuf> {
@@ -217,7 +215,11 @@ pub fn materialize_pending_asset_entry(
     Ok(target)
 }
 
-fn materialize_asset_entry(entry: &KoboldcppAssetEntry, source: &Path, target: &Path) -> Result<()> {
+fn materialize_asset_entry(
+    entry: &KoboldcppAssetEntry,
+    source: &Path,
+    target: &Path,
+) -> Result<()> {
     if is_tree_asset_entry(entry) {
         if !source.is_dir() {
             anyhow::bail!(
@@ -303,7 +305,11 @@ fn verify_tree_asset_entry(entry: &KoboldcppAssetEntry, target: &Path) -> Result
     Ok(marker.source == entry.download_url.clone().unwrap_or_default())
 }
 
-fn write_tree_asset_marker(entry: &KoboldcppAssetEntry, target: &Path, file_count: usize) -> Result<()> {
+fn write_tree_asset_marker(
+    entry: &KoboldcppAssetEntry,
+    target: &Path,
+    file_count: usize,
+) -> Result<()> {
     fs::create_dir_all(target)
         .with_context(|| format!("creating tree asset directory {}", target.display()))?;
     let marker = TreeAssetMarker {
@@ -410,7 +416,8 @@ fn download_file_to_target(
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(target, &bytes).with_context(|| format!("writing {label} to {}", target.display()))?;
+    fs::write(target, &bytes)
+        .with_context(|| format!("writing {label} to {}", target.display()))?;
     if let Some(expected_sha) = expected_sha {
         let actual_sha = sha256_hex(target)?;
         anyhow::ensure!(
@@ -424,8 +431,8 @@ fn download_file_to_target(
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
     fs::create_dir_all(target)
         .with_context(|| format!("creating recursive copy target {}", target.display()))?;
-    for entry in fs::read_dir(source)
-        .with_context(|| format!("reading directory {}", source.display()))?
+    for entry in
+        fs::read_dir(source).with_context(|| format!("reading directory {}", source.display()))?
     {
         let entry = entry?;
         let source_path = entry.path();

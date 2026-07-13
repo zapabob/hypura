@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::council::{AhaEvent, CouncilView};
 use crate::model::elt_loop::EltLoopMetadata;
+use crate::scheduler::types::CouncilParallelism;
 
 // ── Request types ──
 
@@ -28,12 +30,108 @@ pub struct ChatRequest {
     /// Ollama/OpenClaw compatibility flag (currently accepted and ignored).
     #[serde(default)]
     pub think: Option<bool>,
+    #[serde(default)]
+    pub hypura: Option<HypuraRequestExtension>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HypuraRequestExtension {
+    #[serde(default)]
+    pub triality_council: bool,
+    #[serde(default)]
+    pub trace: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrialityCouncilRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub messages: Option<Vec<OpenAiChatMessage>>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_council_parallelism")]
+    pub parallelism: Option<CouncilParallelism>,
+    #[serde(default)]
+    pub attention_consensus: bool,
+    #[serde(default = "default_true")]
+    pub cross_score: bool,
+    #[serde(default)]
+    pub synthesis: bool,
+    #[serde(default = "default_true")]
+    pub aha: bool,
+    #[serde(default)]
+    pub trace: bool,
+    #[serde(default)]
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrialityCouncilTrace {
+    pub parallelism: String,
+    pub context_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_kv_bytes: Option<u64>,
+    pub branch_generated_tokens: [u32; 3],
+    pub branch_runtime_ms: [u64; 3],
+    pub cross_scores: [[f64; 3]; 3],
+    pub attention: serde_json::Value,
+    pub ncka: serde_json::Value,
+    pub aha: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub urt: Option<serde_json::Value>,
+    pub capabilities: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrialityCouncilResponse {
+    pub id: String,
+    pub object: String,
+    pub model: String,
+    pub selected_text: String,
+    pub selected_view: CouncilView,
+    pub candidate_scores: [f64; 3],
+    pub winner_margin: f64,
+    pub agreement: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aha: Option<AhaEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TrialityCouncilTrace>,
+}
+
+fn deserialize_optional_council_parallelism<'de, D>(
+    deserializer: D,
+) -> Result<Option<CouncilParallelism>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref() {
+        None => Ok(None),
+        Some("sequential") => Ok(Some(CouncilParallelism::Sequential)),
+        Some("parallel") => Ok(Some(CouncilParallelism::Parallel)),
+        Some("auto") => Ok(Some(CouncilParallelism::Auto)),
+        Some(other) => Err(serde::de::Error::unknown_variant(
+            other,
+            &["sequential", "parallel", "auto"],
+        )),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -448,6 +546,8 @@ pub struct OpenAiChatCompletionRequest {
     pub stop: Option<OpenAiStopInput>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub hypura: Option<HypuraRequestExtension>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -16,6 +16,7 @@ use hypura::scheduler::types::{HostPinnedPolicy, ResidencyPolicyConfig, Residenc
 use hypura::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use super::council::TrialityCliOverrides;
 use super::fmt_util::{cli_progress_enabled, format_bytes, format_params, print_elt_loop_status};
 
 const DEFAULT_PROMPT: &str = "Write a short paragraph about artificial intelligence.";
@@ -35,6 +36,7 @@ pub fn run(
     residency_profile: Option<ResidencyProfile>,
     host_pinned: Option<HostPinnedPolicy>,
     tq_allow_exact_fallback: bool,
+    triality: &TrialityCliOverrides,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(
@@ -51,6 +53,7 @@ pub fn run(
         residency_profile,
         host_pinned,
         tq_allow_exact_fallback,
+        triality,
     ))
 }
 
@@ -68,6 +71,7 @@ async fn run_async(
     residency_profile: Option<ResidencyProfile>,
     host_pinned: Option<HostPinnedPolicy>,
     tq_allow_exact_fallback: bool,
+    triality: &TrialityCliOverrides,
 ) -> anyhow::Result<()> {
     let path = Path::new(model_path);
     let embedded_turboquant = {
@@ -76,11 +80,11 @@ async fn run_async(
         read_gguf_turboquant_config(&gguf, &metadata)?
     };
     let prompt_text = prompt.unwrap_or(DEFAULT_PROMPT);
-    let llama_bridge = LlamaTurboquantCliBridge {
+    let llama_bridge = triality.apply_to_bridge(LlamaTurboquantCliBridge {
         rotation_policy,
         llama_rotation_seed: rotation_seed,
         ..Default::default()
-    };
+    });
 
     let residency_cases = benchmark_cases(residency_profile, host_pinned);
     let base_runtime = resolve_runtime_setup(
@@ -134,7 +138,11 @@ async fn run_async(
             } else {
                 "collapsed"
             },
-            base_runtime.plan.residency_policy.host_pinned_policy.label(),
+            base_runtime
+                .plan
+                .residency_policy
+                .host_pinned_policy
+                .label(),
         );
         let reported_gguf_cfg = base_runtime
             .turboquant
@@ -253,6 +261,7 @@ async fn run_async(
             seed: 42,
             ..SamplingParams::default()
         },
+        triality: None,
     };
 
     let baseline_result = if run_baseline {
@@ -352,7 +361,11 @@ async fn run_async(
             name: filename.trim_end_matches(".gguf").to_string(),
             architecture: base_runtime.metadata.architecture.clone(),
             params: format_params(base_runtime.metadata.parameter_count),
-            quant: base_runtime.metadata.quantization.clone().unwrap_or_default(),
+            quant: base_runtime
+                .metadata
+                .quantization
+                .clone()
+                .unwrap_or_default(),
             size_gb: base_runtime.gguf.total_tensor_bytes() as f64 / (1u64 << 30) as f64,
         },
         hardware: HardwareInfo {
@@ -411,11 +424,13 @@ fn benchmark_cases(
     host_pinned: Option<HostPinnedPolicy>,
 ) -> Vec<ResidencyPolicyConfig> {
     let mut cases = if residency_profile.is_some() || host_pinned.is_some() {
-        vec![ResidencyPolicyConfig::new(
-            residency_profile.unwrap_or(ResidencyProfile::FourTier),
-            host_pinned.unwrap_or(HostPinnedPolicy::Auto),
-        )
-        .normalized()]
+        vec![
+            ResidencyPolicyConfig::new(
+                residency_profile.unwrap_or(ResidencyProfile::FourTier),
+                host_pinned.unwrap_or(HostPinnedPolicy::Auto),
+            )
+            .normalized(),
+        ]
     } else {
         vec![
             ResidencyPolicyConfig::new(ResidencyProfile::Legacy3Tier, HostPinnedPolicy::Off),
@@ -436,7 +451,11 @@ async fn run_baseline_case(
 ) -> anyhow::Result<Option<RunResult>> {
     let model_total_bytes = runtime.gguf.total_tensor_bytes();
     let total_ram = runtime.hardware.memory.total_bytes;
-    let baseline_ngl = if baseline_safe { runtime.n_gpu_layers } else { 0 };
+    let baseline_ngl = if baseline_safe {
+        runtime.n_gpu_layers
+    } else {
+        0
+    };
 
     let baseline_label = if baseline_safe {
         "llama.cpp (full GPU)".to_string()
@@ -531,7 +550,8 @@ async fn run_hypura_case(
     let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
     let path_c = model_path.to_path_buf();
     let prompt_c = prompt.to_string();
-    let config_c = config.clone();
+    let mut config_c = config.clone();
+    config_c.triality = runtime.triality.clone();
     let plan_c = Arc::new(runtime.plan.clone());
     let gguf_c = Arc::new(runtime.gguf.clone());
     let turboquant_c = Arc::new(runtime.turboquant.clone());
@@ -575,8 +595,18 @@ async fn run_hypura_case(
             runtime.plan.residency_policy.residency_profile.label(),
             runtime.plan.residency_policy.host_pinned_policy.label()
         ),
-        residency_profile: runtime.plan.residency_policy.residency_profile.label().to_string(),
-        host_pinned_policy: runtime.plan.residency_policy.host_pinned_policy.label().to_string(),
+        residency_profile: runtime
+            .plan
+            .residency_policy
+            .residency_profile
+            .label()
+            .to_string(),
+        host_pinned_policy: runtime
+            .plan
+            .residency_policy
+            .host_pinned_policy
+            .label()
+            .to_string(),
         n_gpu_layers: runtime.n_gpu_layers,
         placement: PlacementInfo {
             gpu_gb: runtime.placement_summary.total_gpu_bytes as f64 / (1u64 << 30) as f64,
@@ -882,7 +912,10 @@ mod tests {
 
     #[test]
     fn benchmark_cases_normalize_legacy_host_policy() {
-        let cases = benchmark_cases(Some(ResidencyProfile::Legacy3Tier), Some(HostPinnedPolicy::Force));
+        let cases = benchmark_cases(
+            Some(ResidencyProfile::Legacy3Tier),
+            Some(HostPinnedPolicy::Force),
+        );
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].host_pinned_policy, HostPinnedPolicy::Off);
     }

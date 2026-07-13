@@ -20,10 +20,10 @@ use hypura::server::compat_storage::{
 use hypura::server::embeddings::EmbeddingsRuntime;
 use hypura::server::supervisor::{
     CompatControlPlaneClient, CompatControlPlaneClientInfo, CompatSupervisorCommand,
-    CompatWorkerBootstrap, MultimodalBackendConfig,
-    spawn_supervisor_control_plane,
+    CompatWorkerBootstrap, MultimodalBackendConfig, spawn_supervisor_control_plane,
 };
 
+use super::council::TrialityCliOverrides;
 use super::serve::{build_runtime_launcher_profile, load_json_object, resolve_canonical_db_path};
 
 fn browser_visible_host(host: &str) -> &str {
@@ -80,12 +80,17 @@ fn parse_u32_value(value: Option<&Value>) -> Option<u32> {
         value
             .as_u64()
             .and_then(|raw| u32::try_from(raw).ok())
-            .or_else(|| value.as_str().and_then(|raw| raw.trim().parse::<u32>().ok()))
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|raw| raw.trim().parse::<u32>().ok())
+            })
     })
 }
 
 fn parse_string_value(value: Option<&Value>) -> Option<String> {
-    value.and_then(|value| value.as_str().map(str::trim))
+    value
+        .and_then(|value| value.as_str().map(str::trim))
         .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
@@ -207,11 +212,7 @@ fn spawn_pending_asset_downloads(
             match result {
                 Ok(Ok(path)) => {
                     downloaded_any = true;
-                    tracing::info!(
-                        "downloaded compat asset {} to {}",
-                        entry_id,
-                        path.display()
-                    );
+                    tracing::info!("downloaded compat asset {} to {}", entry_id, path.display());
                 }
                 Ok(Err(error)) => {
                     tracing::warn!("failed to materialize compat asset {}: {error}", entry_id);
@@ -306,6 +307,7 @@ pub fn run(
     dry_run: bool,
     residency_profile: ResidencyProfile,
     host_pinned: HostPinnedPolicy,
+    triality: &TrialityCliOverrides,
 ) -> anyhow::Result<()> {
     if dry_run {
         unsafe {
@@ -334,6 +336,7 @@ pub fn run(
             residency_profile,
             host_pinned,
             false,
+            triality,
             savedatafile,
             preloadstory,
             admindir,
@@ -373,6 +376,7 @@ pub fn run(
         no_show_gui,
         residency_profile,
         host_pinned,
+        triality.clone(),
     ))
 }
 
@@ -406,8 +410,11 @@ async fn run_async(
     no_show_gui: bool,
     residency_profile: ResidencyProfile,
     host_pinned: HostPinnedPolicy,
+    triality: TrialityCliOverrides,
 ) -> anyhow::Result<()> {
-    let seed_config = config.map(|path| load_json_object(Path::new(path))).transpose()?;
+    let seed_config = config
+        .map(|path| load_json_object(Path::new(path)))
+        .transpose()?;
     let seed_profile = seed_config
         .as_ref()
         .map(|value| LauncherProfile::from_kcpps_value("seed.kcpps".to_string(), value.clone()))
@@ -471,19 +478,19 @@ async fn run_async(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "current-session.kcpps".to_string());
-        let current_profile = build_runtime_launcher_profile(
-            &current_profile_name,
-            seed_config.clone(),
-            model_path,
-            host,
-            port,
-            effective_savedatafile.as_deref(),
-            effective_preloadstory.as_deref(),
-            effective_admindir.as_deref(),
-            embeddings_model,
-            Some(current_asset_root.to_string_lossy().as_ref()),
-            ui_theme,
-        )?;
+    let current_profile = build_runtime_launcher_profile(
+        &current_profile_name,
+        seed_config.clone(),
+        model_path,
+        host,
+        port,
+        effective_savedatafile.as_deref(),
+        effective_preloadstory.as_deref(),
+        effective_admindir.as_deref(),
+        embeddings_model,
+        Some(current_asset_root.to_string_lossy().as_ref()),
+        ui_theme,
+    )?;
     storage.save_launcher_profile(&current_profile)?;
     storage.set_current_launcher_profile(&current_profile.name)?;
     if let Some(exportconfig) = exportconfig.filter(|value| !value.trim().is_empty()) {
@@ -533,6 +540,13 @@ async fn run_async(
             tq_triality_mix,
             tq_rotation_seed,
             tq_artifact: tq_artifact.map(str::to_string),
+            triality_execution: triality.execution.map(Into::into),
+            triality_weights: triality.weights.map(|weights| weights.0),
+            triality_trace: triality.trace_enabled,
+            ncka_required: triality.ncka_required,
+            urt_enabled: triality.urt_enabled,
+            tq_developer_override: triality.developer_override,
+            tq_allow_identity_view_fallback: triality.allow_identity_view_fallback,
             model_dir: model_dir.map(str::to_string),
             ui_theme: ui_theme.to_string(),
             savedatafile: effective_savedatafile.clone(),

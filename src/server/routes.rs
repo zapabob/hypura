@@ -1,11 +1,12 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use std::{fs, path::PathBuf};
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Html;
@@ -18,15 +19,31 @@ use crate::compute::inference::{
     CompatRuntimeSession, ContextStateSnapshot, GenerateFromLoadedParams, GenerationResult,
     LlamaTurboquantCliBridge, LoadedModel,
 };
-use crate::model::turboquant_sidecar::{ResolvedTurboQuantConfig, TurboQuantMode};
-use crate::scheduler::types::ResidencyPolicyConfig;
+use crate::council::store::{
+    CouncilInputKind, CouncilRequestRecord, CouncilStore, PersistedCouncilRecord,
+    StoredCouncilRecord,
+};
+use crate::council::{
+    AhaThresholds, AnswerCouncilConfig, CouncilRuntimeConfig, CouncilUrtDescriptor,
+    EmbeddedKaController, KaController, KaGateConfig, NoSafetyPenalty,
+    prepare_embedded_ka_controller,
+};
+use crate::model::file_identity::{GuardedModelFile, open_read_guard};
+use crate::model::gguf::GgufFile;
+use crate::model::turboquant_sidecar::{
+    GgufTurboQuantConfig, GgufUrtConfig, ResolvedTurboQuantConfig, TurboQuantMode,
+};
+use crate::scheduler::types::{CouncilExecutionMode, CouncilParallelism, ResidencyPolicyConfig};
 use crate::server::chat::format_chat_prompt;
 use crate::server::compat::{self, CompatFeatureFlags, CompatPerfState};
 use crate::server::compat_storage::{CompatStorage, LauncherProfile, RuntimeStateSlotMetadata};
 use crate::server::ollama_types::*;
 use crate::server::streaming;
 use crate::server::supervisor::{CompatControlPlaneClient, CompatSupervisorCommand};
-use crate::telemetry::metrics::TelemetryEmitter;
+use crate::telemetry::metrics::{TelemetryEmitter, TelemetryEvent};
+use crate::urt::{
+    RepresentationId, RepresentationKind, UrtAssessment, UrtObservation, UrtRegistry,
+};
 
 const VENDORED_KOBOLD_LITE_INDEX: &str = include_str!("../../vendor/kobold-lite/index.html");
 const VENDORED_KOBOLDCPP_API_HTML: &str =
@@ -40,12 +57,16 @@ const VENDORED_KOBOLD_LITE_NIKO_PNG: &[u8] = include_bytes!("../../vendor/kobold
 pub struct AppState {
     pub loaded_model: Arc<std::sync::Mutex<LoadedModel>>,
     pub model_name: Arc<Mutex<String>>,
+    pub model_name_is_explicit_alias: bool,
     pub model_path: Arc<Mutex<PathBuf>>,
+    pub model_sha256: Arc<std::sync::Mutex<Option<String>>>,
     pub gguf_info: Arc<Mutex<GgufInfo>>,
     pub model_dir: PathBuf,
     pub default_context: Arc<AtomicU32>,
     pub load_duration_ns: u64,
     pub telemetry: Arc<TelemetryEmitter>,
+    pub council_store: Arc<CouncilStore>,
+    pub urt_registry: Arc<Mutex<UrtRegistry>>,
     pub turboquant: ResolvedTurboQuantConfig,
     /// CLI `hypura serve` TurboQuant mode — reused by hot model switch for parity.
     pub serve_turboquant_mode: TurboQuantMode,
@@ -127,6 +148,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/extra/ui-theme", post(ui_theme_set_handler))
         .route("/api/generate", post(generate_handler))
         .route("/api/chat", post(chat_handler))
+        .route(
+            "/api/extra/triality/council",
+            post(triality_council_handler),
+        )
+        .route("/v1/triality/council", post(triality_council_handler))
+        .route(
+            "/api/extra/triality/council/:id",
+            get(triality_council_get_handler),
+        )
+        .route("/api/extra/triality/events", get(triality_events_handler))
         .route("/api/v1/model", get(kobold_model_handler))
         .route("/api/v1/generate", post(kobold_generate_handler))
         .route("/v1/completions", post(openai_completions_handler))
@@ -212,6 +243,1038 @@ async fn enforce_optional_api_key(request: Request<Body>, next: Next) -> Respons
             Json(serde_json::json!({ "error": "invalid or missing API key" })),
         )
             .into_response()
+    }
+}
+
+#[derive(Debug)]
+struct CouncilApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl CouncilApiError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn unsupported(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn internal(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for CouncilApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "error": {
+                    "code": self.code,
+                    "message": self.message,
+                }
+            })),
+        )
+            .into_response()
+    }
+}
+
+struct ValidatedCouncilRequest {
+    request_id: String,
+    requested_model: Option<String>,
+    prompt: String,
+    input_kind: CouncilInputKind,
+    message_count: Option<usize>,
+    sampling: crate::compute::ffi::SamplingParams,
+    parallelism: CouncilParallelism,
+    aha: bool,
+    trace: bool,
+    stream: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveModelIdentity {
+    public_alias: String,
+    physical_name: String,
+    path: PathBuf,
+    sha256: Option<String>,
+}
+
+struct LockedModelIdentity<'a, T> {
+    loaded: MutexGuard<'a, T>,
+    identity: ActiveModelIdentity,
+}
+
+fn lock_model_identity<'a, T>(
+    loaded: &'a Mutex<T>,
+    name: &Mutex<String>,
+    path: &Mutex<PathBuf>,
+    sha256: &Mutex<Option<String>>,
+    physical_name: impl FnOnce(&T) -> String,
+) -> Result<LockedModelIdentity<'a, T>, &'static str> {
+    lock_model_identity_after_loaded(loaded, name, path, sha256, physical_name, || {})
+}
+
+fn lock_model_identity_after_loaded<'a, T>(
+    loaded: &'a Mutex<T>,
+    name: &Mutex<String>,
+    path: &Mutex<PathBuf>,
+    sha256: &Mutex<Option<String>>,
+    physical_name: impl FnOnce(&T) -> String,
+    after_loaded: impl FnOnce(),
+) -> Result<LockedModelIdentity<'a, T>, &'static str> {
+    let loaded = loaded.lock().map_err(|_| "loaded model lock poisoned")?;
+    let physical_name = physical_name(&loaded);
+    after_loaded();
+    let public_alias = name.lock().map_err(|_| "model name lock poisoned")?.clone();
+    let path = path.lock().map_err(|_| "model path lock poisoned")?.clone();
+    let sha256 = sha256
+        .lock()
+        .map_err(|_| "model hash lock poisoned")?
+        .clone();
+    Ok(LockedModelIdentity {
+        loaded,
+        identity: ActiveModelIdentity {
+            public_alias,
+            physical_name,
+            path,
+            sha256,
+        },
+    })
+}
+
+async fn triality_council_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TrialityCouncilRequest>,
+) -> Response {
+    let validated = match validate_council_request(&state, request) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let stream = validated.stream;
+    match execute_triality_council(state, validated).await {
+        Ok(response) => triality_council_response(response, stream),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn triality_council_get_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(request_id): AxumPath<String>,
+) -> Response {
+    triality_council_get_from_store(state.council_store.clone(), request_id).await
+}
+
+async fn triality_council_get_from_store(store: Arc<CouncilStore>, request_id: String) -> Response {
+    let stored = match tokio::task::spawn_blocking(move || store.read(&request_id)).await {
+        Ok(Ok(Some(record))) => record,
+        Ok(Ok(None)) => {
+            return CouncilApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "council_result_not_found",
+                message: "Council result was not found".to_string(),
+            }
+            .into_response();
+        }
+        Ok(Err(error)) => {
+            return CouncilApiError::bad_request("invalid_council_result_id", error.to_string())
+                .into_response();
+        }
+        Err(error) => {
+            return CouncilApiError::internal(
+                "council_store_join_failed",
+                format!("Council store read task failed: {error}"),
+            )
+            .into_response();
+        }
+    };
+    Json(stored_council_response(stored)).into_response()
+}
+
+async fn triality_events_handler(State(state): State<Arc<AppState>>) -> Response {
+    triality_events_from_emitter(state.telemetry.clone()).await
+}
+
+async fn triality_events_from_emitter(telemetry: Arc<TelemetryEmitter>) -> Response {
+    let mut events = telemetry.subscribe();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
+    tokio::spawn(async move {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            if !is_triality_event(&event) {
+                continue;
+            }
+            let Ok(payload) = serde_json::to_string(&event) else {
+                continue;
+            };
+            if tx.send(Ok(format!("data: {payload}\n\n"))).await.is_err() {
+                return;
+            }
+        }
+    });
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+    )
+        .into_response()
+}
+
+fn is_triality_event(event: &TelemetryEvent) -> bool {
+    matches!(
+        event,
+        TelemetryEvent::TrialityBranchCompleted { .. }
+            | TelemetryEvent::TrialityConsensusCompleted { .. }
+            | TelemetryEvent::TrialityUrtChecked { .. }
+            | TelemetryEvent::TrialityAha { .. }
+    )
+}
+
+fn validate_council_request(
+    state: &Arc<AppState>,
+    request: TrialityCouncilRequest,
+) -> Result<ValidatedCouncilRequest, CouncilApiError> {
+    validate_council_feature_flags(&request)?;
+    let (prompt, input_kind, message_count) =
+        validate_council_input(request.prompt, request.messages)?;
+
+    let requested_model = request.model.map(|model| model.trim().to_string());
+    if let Some(model) = requested_model.as_deref() {
+        if model.trim().is_empty() {
+            return Err(CouncilApiError::bad_request(
+                "invalid_model",
+                "model must not be empty",
+            ));
+        }
+    }
+
+    let max_tokens = request
+        .max_tokens
+        .unwrap_or_else(|| state.compat_default_max_length.load(Ordering::Relaxed))
+        .max(1);
+    if let Some(temperature) = request.temperature {
+        if !temperature.is_finite() || !(0.0..=10.0).contains(&temperature) {
+            return Err(CouncilApiError::bad_request(
+                "invalid_temperature",
+                "temperature must be finite and between 0 and 10",
+            ));
+        }
+    }
+
+    let mut sampling = crate::compute::ffi::SamplingParams::default();
+    sampling.max_tokens = max_tokens;
+    if let Some(temperature) = request.temperature {
+        sampling.temperature = temperature;
+    }
+    if let Some(seed) = request.seed {
+        sampling.seed = seed;
+    }
+
+    Ok(ValidatedCouncilRequest {
+        request_id: format!("tc-{}", uuid::Uuid::new_v4().simple()),
+        requested_model,
+        prompt,
+        input_kind,
+        message_count,
+        sampling,
+        parallelism: request
+            .parallelism
+            .unwrap_or(CouncilParallelism::Sequential),
+        aha: request.aha,
+        trace: request.trace,
+        stream: request.stream,
+    })
+}
+
+fn validate_council_feature_flags(request: &TrialityCouncilRequest) -> Result<(), CouncilApiError> {
+    if request.attention_consensus {
+        return Err(CouncilApiError::unsupported(
+            "attention_consensus_unsupported",
+            "Dedicated Answer Council does not execute attention-logit consensus",
+        ));
+    }
+    if request.synthesis {
+        return Err(CouncilApiError::unsupported(
+            "unsupported_until_enabled",
+            "Council synthesis is not enabled in this release",
+        ));
+    }
+    if !request.cross_score {
+        return Err(CouncilApiError::unsupported(
+            "cross_score_required",
+            "The v1 Answer Council requires deterministic 3x3 cross-scoring",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_council_input(
+    prompt: Option<String>,
+    messages: Option<Vec<OpenAiChatMessage>>,
+) -> Result<(String, CouncilInputKind, Option<usize>), CouncilApiError> {
+    let (prompt, input_kind, message_count) = match (prompt, messages) {
+        (Some(prompt), None) => {
+            if prompt.trim().is_empty() {
+                return Err(CouncilApiError::bad_request(
+                    "invalid_prompt",
+                    "prompt must not be empty",
+                ));
+            }
+            (prompt, CouncilInputKind::Prompt, None)
+        }
+        (None, Some(messages)) => {
+            if messages.is_empty() || messages.len() > 1024 {
+                return Err(CouncilApiError::bad_request(
+                    "invalid_messages",
+                    "messages must contain between 1 and 1024 entries",
+                ));
+            }
+            let mut chat_messages = Vec::with_capacity(messages.len());
+            for message in &messages {
+                if !matches!(
+                    message.role.as_str(),
+                    "system" | "developer" | "user" | "assistant" | "tool"
+                ) {
+                    return Err(CouncilApiError::bad_request(
+                        "invalid_message_role",
+                        format!("Unsupported message role `{}`", message.role),
+                    ));
+                }
+                let chat = message.to_chat_message();
+                if chat.content.trim().is_empty() {
+                    return Err(CouncilApiError::bad_request(
+                        "invalid_message_content",
+                        "Each message must contain non-empty text content",
+                    ));
+                }
+                chat_messages.push(chat);
+            }
+            let count = chat_messages.len();
+            (
+                format_chat_prompt(&chat_messages),
+                CouncilInputKind::Messages,
+                Some(count),
+            )
+        }
+        (Some(_), Some(_)) => {
+            return Err(CouncilApiError::bad_request(
+                "ambiguous_input",
+                "Exactly one of prompt or messages must be supplied",
+            ));
+        }
+        (None, None) => {
+            return Err(CouncilApiError::bad_request(
+                "missing_input",
+                "Exactly one of prompt or messages must be supplied",
+            ));
+        }
+    };
+    if prompt.len() > 1_048_576 {
+        return Err(CouncilApiError::bad_request(
+            "input_too_large",
+            "Council input exceeds the 1 MiB request limit",
+        ));
+    }
+    Ok((prompt, input_kind, message_count))
+}
+
+fn prepare_route_embedded_ka_controller(
+    model_path: &Path,
+    gguf: &GgufFile,
+    config: &GgufTurboQuantConfig,
+    gate_config: &mut KaGateConfig,
+) -> Result<Option<EmbeddedKaController>, CouncilApiError> {
+    prepare_embedded_ka_controller(model_path, gguf, config, gate_config).map_err(|error| {
+        CouncilApiError::unsupported("ncka_controller_unavailable", error.to_string())
+    })
+}
+
+fn council_trace_storage(
+    identity: &ActiveModelIdentity,
+    persisted: Option<&PersistedCouncilRecord>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model_alias": identity.public_alias,
+        "model_sha256": identity.sha256,
+        "result_persisted": persisted.is_some(),
+        "branch_content_persisted": persisted
+            .map(|value| value.branch_content_persisted)
+            .unwrap_or(false),
+        "final_answer_persisted": persisted
+            .map(|value| value.final_answer_persisted)
+            .unwrap_or(false),
+    })
+}
+
+fn validate_requested_model_alias(
+    requested_model: Option<&str>,
+    identity: &ActiveModelIdentity,
+) -> Result<(), CouncilApiError> {
+    if let Some(requested_model) = requested_model {
+        if requested_model != identity.public_alias {
+            return Err(CouncilApiError::conflict(
+                "model_not_loaded",
+                format!("Requested model `{requested_model}` is not the published model alias"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn switched_public_model_alias(
+    current_alias: &str,
+    next_physical_name: &str,
+    explicit_alias: bool,
+) -> String {
+    if explicit_alias {
+        current_alias.to_string()
+    } else {
+        next_physical_name.to_string()
+    }
+}
+
+async fn execute_triality_council(
+    state: Arc<AppState>,
+    request: ValidatedCouncilRequest,
+) -> Result<TrialityCouncilResponse, CouncilApiError> {
+    let request_id = request.request_id.clone();
+    let request_id_for_error = request_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let LockedModelIdentity {
+            loaded: model,
+            identity: active_identity,
+        } = lock_model_identity(
+            &state.loaded_model,
+            &state.model_name,
+            &state.model_path,
+            &state.model_sha256,
+            |model| model.model_name.clone(),
+        )
+        .map_err(|error| {
+            CouncilApiError::internal(
+                "model_state_poisoned",
+                format!("Loaded model identity is unavailable: {error}"),
+            )
+        })?;
+        if model.model_name != active_identity.physical_name {
+            return Err(CouncilApiError::internal(
+                "model_identity_inconsistent",
+                "Loaded model and captured physical identity differ",
+            ));
+        }
+        validate_requested_model_alias(request.requested_model.as_deref(), &active_identity)?;
+        let _capabilities = model.model.triality_capabilities().map_err(|error| {
+            CouncilApiError::unsupported(
+                "triality_capabilities_unavailable",
+                format!("Triality model capabilities are unavailable: {error}"),
+            )
+        })?;
+        let triality = model.config.triality.clone().ok_or_else(|| {
+            CouncilApiError::unsupported(
+                "triality_schema_unavailable",
+                "Embedded schema-v2 Triality context policy is unavailable",
+            )
+        })?;
+        let prompt_tokens = model.model.tokenize(&request.prompt, true, true).len();
+        let required_tokens = prompt_tokens.saturating_add(request.sampling.max_tokens as usize);
+        if required_tokens > model.config.n_ctx as usize {
+            return Err(CouncilApiError::bad_request(
+                "council_context_exceeded",
+                format!(
+                    "Prompt tokens ({prompt_tokens}) plus max_tokens ({}) exceed context {}",
+                    request.sampling.max_tokens, model.config.n_ctx
+                ),
+            ));
+        }
+
+        let metadata = model.turboquant.gguf_metadata.as_ref().ok_or_else(|| {
+            CouncilApiError::unsupported(
+                "triality_schema_unavailable",
+                "Embedded schema-v2 Triality metadata is required",
+            )
+        })?;
+        if triality.ncka_required && triality.ncka.is_none() {
+            return Err(CouncilApiError::unsupported(
+                "ncka_descriptor_unavailable",
+                "Required typed NC-KA policy is unavailable",
+            ));
+        }
+        let mut ka_gate = triality
+            .ncka
+            .as_ref()
+            .map(|ncka| KaGateConfig {
+                enabled: ncka.enabled,
+                required: triality.ncka_required,
+                controller_s3_equivariant: ncka.s3_equivariant,
+                static_fallback_weights: ncka.fallback_weights,
+                ..KaGateConfig::default()
+            })
+            .unwrap_or_default();
+        ka_gate.required = triality.ncka_required;
+        let ka_controller = if ka_gate.enabled {
+            let _model_file_guard = open_read_guard(&active_identity.path).map_err(|error| {
+                CouncilApiError::unsupported(
+                    "ncka_controller_unavailable",
+                    format!("Loaded GGUF cannot be guarded for NC-KA: {error}"),
+                )
+            })?;
+            let gguf = GgufFile::open(&active_identity.path).map_err(|error| {
+                CouncilApiError::unsupported(
+                    "ncka_controller_unavailable",
+                    format!("Loaded GGUF cannot be parsed for NC-KA: {error}"),
+                )
+            })?;
+            prepare_route_embedded_ka_controller(
+                &active_identity.path,
+                &gguf,
+                metadata,
+                &mut ka_gate,
+            )?
+        } else {
+            None
+        };
+        let urt = if triality.urt_enabled {
+            let urt = triality.urt.as_ref().ok_or_else(|| {
+                CouncilApiError::unsupported(
+                    "urt_descriptor_unavailable",
+                    "Required typed URT policy is unavailable",
+                )
+            })?;
+            let model_sha256 = active_identity.sha256.clone().ok_or_else(|| {
+                CouncilApiError::unsupported(
+                    "urt_model_hash_unavailable",
+                    "The loaded GGUF content hash is unavailable",
+                )
+            })?;
+            Some(council_urt_descriptor(metadata, urt, &model_sha256)?)
+        } else {
+            None
+        };
+        let moment_degree = triality
+            .urt
+            .as_ref()
+            .filter(|urt| urt.enabled)
+            .map(|urt| urt.moment_degree)
+            .unwrap_or(3);
+        let admission =
+            model.admit_council_memory(CouncilExecutionMode::Answer, request.parallelism);
+        if !admission.budget.admitted {
+            let refusal = admission.refusal.as_ref().map_or_else(
+                || admission.budget.reason.clone(),
+                |refusal| serde_json::to_string(refusal).unwrap_or_else(|_| refusal.reason.clone()),
+            );
+            return Err(CouncilApiError::unsupported(
+                "council_memory_not_admitted",
+                refusal,
+            ));
+        }
+        let memory_ratio = model
+            .council_memory_peak_utilization_ratio(&admission)
+            .map_err(|refusal| {
+                CouncilApiError::unsupported(
+                    "council_memory_not_admitted",
+                    serde_json::to_string(&refusal).unwrap_or_else(|_| refusal.reason.clone()),
+                )
+            })?;
+        let memory_budget = admission.budget;
+
+        let runtime = model
+            .council_runtime(CouncilRuntimeConfig {
+                inference: model.config.clone(),
+                triality: triality.context,
+                memory_budget: memory_budget.clone(),
+                answer: AnswerCouncilConfig::default(),
+                ka_gate,
+                moment_degree,
+                memory_ratio,
+                attention_consensus_requested: false,
+                attention_consensus_required: false,
+                aha_enabled: request.aha,
+                aha_thresholds: AhaThresholds::default(),
+                urt,
+            })
+            .map_err(|error| {
+                CouncilApiError::unsupported(
+                    "council_runtime_unavailable",
+                    format!("Council runtime initialization failed: {error}"),
+                )
+            })?;
+        let execution = runtime
+            .execute(
+                &request.request_id,
+                &request.prompt,
+                &request.sampling,
+                &[],
+                &NoSafetyPenalty,
+                ka_controller
+                    .as_ref()
+                    .map(|controller| controller as &dyn KaController),
+                None,
+            )
+            .map_err(|error| {
+                CouncilApiError::unsupported(
+                    "council_execution_failed",
+                    format!("Council execution failed: {error}"),
+                )
+            })?;
+        drop(model);
+
+        let request_record = CouncilRequestRecord {
+            request_id: request.request_id.clone(),
+            created_at: chrono::Utc::now(),
+            model: Some(active_identity.public_alias.clone()),
+            input_kind: request.input_kind,
+            message_count: request.message_count,
+            max_tokens: Some(request.sampling.max_tokens),
+            temperature: Some(request.sampling.temperature),
+            seed: Some(request.sampling.seed),
+            parallelism: memory_budget.parallelism,
+            attention_consensus: false,
+            cross_score: true,
+            synthesis: false,
+            aha: request.aha,
+            trace: request.trace,
+        };
+        let persisted = state
+            .council_store
+            .persist(&request_record, &execution.answer)
+            .map_err(|error| {
+                CouncilApiError::internal(
+                    "council_persistence_failed",
+                    format!("Council result persistence failed: {error}"),
+                )
+            })?;
+        let urt_trace = record_council_urt_observation(
+            &state.urt_registry,
+            execution.urt_observation.as_ref(),
+        )?;
+        emit_council_events(
+            &state.telemetry,
+            &execution,
+            request.trace,
+            persisted.as_ref(),
+            urt_trace.as_ref(),
+        );
+
+        let trace = if request.trace {
+            Some(TrialityCouncilTrace {
+                parallelism: parallelism_label(memory_budget.parallelism).to_string(),
+                context_count: memory_budget.context_count,
+                estimated_kv_bytes: Some(memory_budget.estimated_kv_bytes),
+                branch_generated_tokens: std::array::from_fn(|index| {
+                    execution.answer.candidates[index].generated_tokens
+                }),
+                branch_runtime_ms: std::array::from_fn(|index| {
+                    execution.answer.candidates[index].runtime_ms
+                }),
+                cross_scores: execution.answer.cross_scores.scores,
+                attention: serde_json::to_value(&execution.attention).map_err(|error| {
+                    CouncilApiError::internal(
+                        "council_trace_serialization_failed",
+                        error.to_string(),
+                    )
+                })?,
+                ncka: serde_json::to_value(&execution.ka_gate).map_err(|error| {
+                    CouncilApiError::internal(
+                        "council_trace_serialization_failed",
+                        error.to_string(),
+                    )
+                })?,
+                aha: serde_json::json!({
+                    "requested": request.aha,
+                    "evaluation": execution.aha,
+                }),
+                urt: urt_trace
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|error| {
+                        CouncilApiError::internal(
+                            "council_trace_serialization_failed",
+                            error.to_string(),
+                        )
+                    })?,
+                capabilities: serde_json::to_value(&execution.capabilities).map_err(|error| {
+                    CouncilApiError::internal(
+                        "council_trace_serialization_failed",
+                        error.to_string(),
+                    )
+                })?,
+                storage: Some(council_trace_storage(&active_identity, persisted.as_ref())),
+            })
+        } else {
+            None
+        };
+
+        Ok(TrialityCouncilResponse {
+            id: execution.answer.request_id.clone(),
+            object: "triality.council".to_string(),
+            model: active_identity.public_alias,
+            selected_text: execution.answer.selected_text.clone(),
+            selected_view: execution.answer.selected_view,
+            candidate_scores: execution.answer.candidate_scores,
+            winner_margin: execution.answer.winner_margin,
+            agreement: execution.answer.agreement,
+            aha: execution.answer.aha.clone(),
+            trace,
+        })
+    })
+    .await
+    .map_err(|error| {
+        CouncilApiError::internal(
+            "council_task_join_failed",
+            format!("Council task {request_id_for_error} failed to join: {error}"),
+        )
+    })?
+}
+
+fn emit_council_events(
+    telemetry: &TelemetryEmitter,
+    execution: &crate::council::CouncilExecutionResult,
+    trace_enabled: bool,
+    persisted: Option<&crate::council::store::PersistedCouncilRecord>,
+    urt_trace: Option<&UrtAssessment>,
+) {
+    let content_persisted = persisted
+        .map(|value| value.branch_content_persisted)
+        .unwrap_or(false);
+    for candidate in &execution.answer.candidates {
+        telemetry.emit(TelemetryEvent::TrialityBranchCompleted {
+            request_id: execution.answer.request_id.clone(),
+            view: candidate.view,
+            prompt_tokens: candidate.prompt_tokens,
+            generated_tokens: candidate.generated_tokens,
+            runtime_ms: candidate.runtime_ms,
+            tok_per_sec: candidate.tok_per_sec,
+            trace_enabled,
+            content_persisted,
+        });
+    }
+    telemetry.emit(TelemetryEvent::TrialityConsensusCompleted {
+        request_id: execution.answer.request_id.clone(),
+        selected_view: execution.answer.selected_view,
+        candidate_scores: execution.answer.candidate_scores,
+        winner_margin: execution.answer.winner_margin,
+        agreement: execution.answer.agreement,
+        result_persisted: persisted.is_some(),
+    });
+    if let Some(urt_trace) = urt_trace {
+        emit_council_urt_event(telemetry, execution.answer.request_id.clone(), urt_trace);
+    }
+    telemetry.emit(TelemetryEvent::TrialityAha {
+        request_id: execution.answer.request_id.clone(),
+        emitted: execution.answer.aha.is_some(),
+        mode: execution.answer.aha.as_ref().map(|event| event.mode),
+        reason_code: execution.answer.aha.as_ref().map(|event| event.reason_code),
+    });
+}
+
+fn record_council_urt_observation(
+    registry: &Mutex<UrtRegistry>,
+    observation: Option<&UrtObservation>,
+) -> Result<Option<UrtAssessment>, CouncilApiError> {
+    let Some(observation) = observation else {
+        return Ok(None);
+    };
+    let mut registry = registry.lock().map_err(|_| {
+        CouncilApiError::internal(
+            "urt_registry_state_poisoned",
+            "The URT registry state is unavailable",
+        )
+    })?;
+    let assessment = registry
+        .record_and_assess(observation.clone())
+        .map_err(|error| {
+            CouncilApiError::internal(
+                "urt_observation_persistence_failed",
+                format!("URT observation persistence or assessment failed: {error}"),
+            )
+        })?;
+    Ok(Some(assessment))
+}
+
+fn emit_council_urt_event(
+    telemetry: &TelemetryEmitter,
+    request_id: String,
+    urt_trace: &UrtAssessment,
+) {
+    telemetry.emit(TelemetryEvent::TrialityUrtChecked {
+        request_id,
+        comparison_count: urt_trace
+            .report
+            .as_ref()
+            .map(|report| report.comparisons.len() as u32)
+            .unwrap_or(0),
+        consistent: urt_trace.report.as_ref().map(|report| report.consistent),
+        max_absolute_error: urt_trace
+            .report
+            .as_ref()
+            .map(|report| report.max_absolute_error),
+    });
+}
+
+fn triality_council_response(response: TrialityCouncilResponse, stream: bool) -> Response {
+    if !stream {
+        return Json(response).into_response();
+    }
+    match serde_json::to_string(&response) {
+        Ok(payload) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            format!("data: {payload}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response(),
+        Err(error) => {
+            CouncilApiError::internal("council_response_serialization_failed", error.to_string())
+                .into_response()
+        }
+    }
+}
+
+fn openai_council_chat_response(response: TrialityCouncilResponse, stream: bool) -> Response {
+    let created = chrono::Utc::now().timestamp();
+    if !stream {
+        return Json(compat::openai_chat_response(
+            &format!("chatcmpl-{}", response.id),
+            created,
+            &response.model,
+            &response.selected_text,
+            0,
+            0,
+        ))
+        .into_response();
+    }
+
+    let request_id = format!("chatcmpl-{}", response.id);
+    let content_chunk = serde_json::json!({
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": response.model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "content": response.selected_text,
+            },
+            "finish_reason": serde_json::Value::Null,
+        }],
+    });
+    let final_chunk = serde_json::json!({
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": response.model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop",
+        }],
+        "usage": compat::openai_usage(0, 0),
+    });
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        format!("data: {content_chunk}\n\ndata: {final_chunk}\n\ndata: [DONE]\n\n"),
+    )
+        .into_response()
+}
+
+fn ollama_council_chat_response(response: TrialityCouncilResponse, stream: bool) -> Response {
+    let payload = ChatResponseChunk {
+        model: response.model,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        message: ChatMessage {
+            role: "assistant".to_string(),
+            content: response.selected_text,
+        },
+        done: true,
+        done_reason: Some("stop".to_string()),
+        total_duration: None,
+        load_duration: None,
+        prompt_eval_count: None,
+        prompt_eval_duration: None,
+        eval_count: None,
+        eval_duration: None,
+    };
+    if !stream {
+        return Json(payload).into_response();
+    }
+    match serde_json::to_string(&payload) {
+        Ok(json) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-ndjson")],
+            format!("{json}\n"),
+        )
+            .into_response(),
+        Err(error) => {
+            CouncilApiError::internal("council_response_serialization_failed", error.to_string())
+                .into_response()
+        }
+    }
+}
+
+fn stored_council_response(stored: StoredCouncilRecord) -> TrialityCouncilResponse {
+    let context_count = if stored.request.parallelism == CouncilParallelism::Parallel {
+        3
+    } else {
+        1
+    };
+    let trace = stored.request.trace.then(|| TrialityCouncilTrace {
+        parallelism: parallelism_label(stored.request.parallelism).to_string(),
+        context_count,
+        estimated_kv_bytes: None,
+        branch_generated_tokens: std::array::from_fn(|index| {
+            stored.branch_candidates[index].generated_tokens
+        }),
+        branch_runtime_ms: std::array::from_fn(|index| stored.branch_candidates[index].runtime_ms),
+        cross_scores: stored.cross_scores.scores,
+        attention: serde_json::json!({ "status": "not_requested" }),
+        ncka: serde_json::json!({ "status": "not_persisted" }),
+        aha: serde_json::json!({
+            "requested": stored.request.aha,
+            "status": "not_persisted",
+        }),
+        urt: None,
+        capabilities: serde_json::json!({ "status": "not_persisted" }),
+        storage: Some(serde_json::json!({
+            "branch_content_redacted": stored.branch_content_redacted,
+            "final_answer_redacted": stored.final_answer_redacted,
+        })),
+    });
+    TrialityCouncilResponse {
+        id: stored.consensus.request_id,
+        object: "triality.council".to_string(),
+        model: stored
+            .request
+            .model
+            .unwrap_or_else(|| "unknown".to_string()),
+        selected_text: stored.final_answer,
+        selected_view: stored.consensus.selected_view,
+        candidate_scores: stored.consensus.candidate_scores,
+        winner_margin: stored.consensus.winner_margin,
+        agreement: stored.consensus.agreement,
+        aha: stored.aha,
+        trace,
+    }
+}
+
+fn council_urt_descriptor(
+    metadata: &GgufTurboQuantConfig,
+    urt: &GgufUrtConfig,
+    model_sha256: &str,
+) -> Result<CouncilUrtDescriptor, CouncilApiError> {
+    if model_sha256.len() != 64 || !model_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CouncilApiError::unsupported(
+            "urt_model_hash_invalid",
+            "The loaded GGUF content hash is invalid",
+        ));
+    }
+    if !urt
+        .supported_representations
+        .iter()
+        .any(|value| value == RepresentationKind::HypuraNative.as_str())
+    {
+        return Err(CouncilApiError::unsupported(
+            "urt_representation_unsupported",
+            "Embedded URT policy does not support the Hypura native representation",
+        ));
+    }
+    if urt.operator_word_sha256.trim().is_empty()
+        || !urt.consistency_tolerance.is_finite()
+        || urt.consistency_tolerance <= 0.0
+    {
+        return Err(CouncilApiError::unsupported(
+            "urt_descriptor_invalid",
+            "Embedded URT descriptor is incomplete",
+        ));
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_str(&urt.operator_word_manifest).map_err(|_| {
+            CouncilApiError::unsupported(
+                "urt_descriptor_invalid",
+                "Embedded URT operator-word manifest is invalid",
+            )
+        })?;
+    let operator_word = manifest
+        .get("words")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            CouncilApiError::unsupported(
+                "urt_descriptor_invalid",
+                "Embedded URT operator-word manifest has no words",
+            )
+        })?
+        .iter()
+        .map(|value| value.as_str().map(str::trim))
+        .collect::<Option<Vec<_>>>()
+        .filter(|words| !words.is_empty() && words.iter().all(|word| !word.is_empty()))
+        .ok_or_else(|| {
+            CouncilApiError::unsupported(
+                "urt_descriptor_invalid",
+                "Embedded URT operator words are invalid",
+            )
+        })?
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+
+    Ok(CouncilUrtDescriptor {
+        representation: RepresentationId {
+            kind: RepresentationKind::HypuraNative,
+            model_hash: model_sha256.to_ascii_lowercase(),
+            artefact_hash: Some(model_sha256.to_ascii_lowercase()),
+            backend: RepresentationKind::HypuraNative.as_str().to_string(),
+            precision: format!("k{:.3}_v{:.3}", metadata.k_bits, metadata.v_bits),
+            view: None,
+        },
+        operator_word,
+        operator_word_sha256: urt.operator_word_sha256.clone(),
+        tolerance: f64::from(urt.consistency_tolerance),
+    })
+}
+
+const fn parallelism_label(value: CouncilParallelism) -> &'static str {
+    match value {
+        CouncilParallelism::Sequential => "sequential",
+        CouncilParallelism::Parallel => "parallel",
+        CouncilParallelism::Auto => "auto",
     }
 }
 
@@ -1115,8 +2178,14 @@ async fn show_handler(
         ),
     });
     if let (Some(elt_loop), Some(object)) = (&info.elt_loop, model_info.as_object_mut()) {
-        object.insert("elt.loop.enabled".into(), serde_json::json!(elt_loop.enabled));
-        object.insert("elt.loop.required".into(), serde_json::json!(elt_loop.required));
+        object.insert(
+            "elt.loop.enabled".into(),
+            serde_json::json!(elt_loop.enabled),
+        );
+        object.insert(
+            "elt.loop.required".into(),
+            serde_json::json!(elt_loop.required),
+        );
         object.insert("elt.loop.L_min".into(), serde_json::json!(elt_loop.l_min));
         object.insert(
             "elt.loop.L_default".into(),
@@ -1137,9 +2206,11 @@ async fn show_handler(
         );
         object.insert(
             "hypura.elt_loop.runtime_gate".into(),
-            serde_json::json!(elt_loop.runtime_gate_label(
-                crate::model::elt_loop::elt_loop_runtime_supported_from_env()
-            )),
+            serde_json::json!(
+                elt_loop.runtime_gate_label(
+                    crate::model::elt_loop::elt_loop_runtime_supported_from_env()
+                )
+            ),
         );
     }
     Json(ShowResponse {
@@ -1309,9 +2380,14 @@ async fn switch_loaded_model_runtime(
         "generation in progress; abort first"
     );
     anyhow::ensure!(next_model_path.exists(), "model path does not exist");
+    let guarded_path = next_model_path.clone();
+    let model_file_guard =
+        tokio::task::spawn_blocking(move || GuardedModelFile::acquire(&guarded_path)).await??;
+    let canonical_model_path = model_file_guard.canonical_path().to_path_buf();
+    let initial_file_snapshot = model_file_guard.initial_snapshot().clone();
 
     let context = context.max(256);
-    let path_for_setup = next_model_path.clone();
+    let path_for_setup = canonical_model_path.clone();
     let tq_mode = state.serve_turboquant_mode;
     let tq_config = state.serve_turboquant_config_path.clone();
     let bridge = state.serve_llama_bridge.clone();
@@ -1329,10 +2405,14 @@ async fn switch_loaded_model_runtime(
         )
     })
     .await??;
+    let urt_enabled = setup
+        .triality
+        .as_ref()
+        .is_some_and(|triality| triality.urt_enabled);
+    let next_model_sha256 = urt_enabled.then(|| initial_file_snapshot.sha256().to_string());
 
-    let file_size = fs::metadata(&next_model_path)?.len();
     let gguf_info = GgufInfo {
-        file_size,
+        file_size: initial_file_snapshot.size(),
         architecture: setup.metadata.architecture.clone(),
         parameter_count: setup.metadata.parameter_count,
         quantization: setup
@@ -1346,13 +2426,14 @@ async fn switch_loaded_model_runtime(
 
     let config = crate::compute::inference::InferenceConfig {
         n_ctx: context,
+        triality: setup.triality.clone(),
         ..crate::compute::inference::InferenceConfig::default()
     };
     let n_gpu_layers = setup.n_gpu_layers;
     let plan = setup.plan.clone();
     let gguf = setup.gguf.clone();
     let turboquant = setup.turboquant.clone();
-    let path_for_load = next_model_path.clone();
+    let path_for_load = canonical_model_path.clone();
 
     let loaded_next = tokio::task::spawn_blocking(move || {
         crate::compute::inference::load_model(
@@ -1365,29 +2446,48 @@ async fn switch_loaded_model_runtime(
         )
     })
     .await??;
+    let model_file_guard = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        model_file_guard.verify_unchanged()?;
+        Ok(model_file_guard)
+    })
+    .await??;
 
-    let next_model_name = loaded_next.model_name.clone();
+    let next_physical_name = loaded_next.model_name.clone();
     let mut loaded_guard = state.loaded_model.lock().unwrap();
+    let mut name_guard = state.model_name.lock().unwrap();
+    let mut path_guard = state.model_path.lock().unwrap();
+    let mut hash_guard = state.model_sha256.lock().unwrap();
+    let mut gguf_guard = state.gguf_info.lock().unwrap();
     *loaded_guard = loaded_next;
+    *name_guard = switched_public_model_alias(
+        &name_guard,
+        &next_physical_name,
+        state.model_name_is_explicit_alias,
+    );
+    let public_alias = name_guard.clone();
+    *path_guard = canonical_model_path;
+    *hash_guard = next_model_sha256;
+    *gguf_guard = gguf_info;
+    state.default_context.store(context, Ordering::Relaxed);
+    drop(gguf_guard);
+    drop(hash_guard);
+    drop(path_guard);
+    drop(name_guard);
     drop(loaded_guard);
+    drop(model_file_guard);
     if let Some(session) = state.compat_session.as_ref() {
         session.lock().unwrap().reset_context()?;
     }
 
-    state.default_context.store(context, Ordering::Relaxed);
-    *state.model_name.lock().unwrap() = next_model_name.clone();
-    *state.model_path.lock().unwrap() = next_model_path;
-    *state.gguf_info.lock().unwrap() = gguf_info;
-
     push_gui_event(
         &state,
         "info",
-        format!("model switched to {next_model_name} (ctx {context})"),
+        format!("model switched to {public_alias} (ctx {context})"),
     );
 
     Ok(ModelSwitchResponse {
         success: true,
-        model: next_model_name,
+        model: public_alias,
         context,
     })
 }
@@ -1850,11 +2950,15 @@ async fn kobold_admin_load_state_handler(
         }))
         .into_response();
     };
-    if let Err(error) = session.lock().unwrap().load_state_snapshot(ContextStateSnapshot {
-        token_ids: record.token_ids,
-        token_count: record.metadata.token_count,
-        state_bytes: record.state_bytes,
-    }) {
+    if let Err(error) = session
+        .lock()
+        .unwrap()
+        .load_state_snapshot(ContextStateSnapshot {
+            token_ids: record.token_ids,
+            token_count: record.metadata.token_count,
+            state_bytes: record.state_bytes,
+        })
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -2093,7 +3197,11 @@ fn spawn_generation_task(
             }
             Err(error) => {
                 tracing::error!("generation error: {error}");
-                push_gui_event(&state_for_task, "error", format!("generation failed: {error}"));
+                push_gui_event(
+                    &state_for_task,
+                    "error",
+                    format!("generation failed: {error}"),
+                );
             }
         }
     });
@@ -2164,7 +3272,10 @@ async fn proxy_embeddings_request(
         )
             .into_response();
     };
-    match client.proxy_request(internal_path, method, &headers, body).await {
+    match client
+        .proxy_request(internal_path, method, &headers, body)
+        .await
+    {
         Ok(response) => response,
         Err(error) => (
             StatusCode::BAD_GATEWAY,
@@ -2735,6 +3846,32 @@ async fn openai_chat_completions_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenAiChatCompletionRequest>,
 ) -> Response {
+    if let Some(extension) = council_extension(req.hypura.as_ref()) {
+        let council_request = TrialityCouncilRequest {
+            model: req.model.clone(),
+            prompt: None,
+            messages: Some(req.messages.clone()),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            seed: req.seed,
+            parallelism: None,
+            attention_consensus: false,
+            cross_score: true,
+            synthesis: false,
+            aha: true,
+            trace: extension.trace,
+            stream: req.stream,
+        };
+        let validated = match validate_council_request(&state, council_request) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+        return match execute_triality_council(state, validated).await {
+            Ok(response) => openai_council_chat_response(response, req.stream),
+            Err(error) => error.into_response(),
+        };
+    }
+
     let request_start = Instant::now();
     let load_duration_ns = state.load_duration_ns;
     let messages: Vec<ChatMessage> = req
@@ -2854,6 +3991,40 @@ async fn chat_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
+    if let Some(extension) = council_extension(req.hypura.as_ref()) {
+        let messages = req
+            .messages
+            .iter()
+            .map(|message| OpenAiChatMessage {
+                role: message.role.clone(),
+                content: Some(OpenAiMessageContent::Text(message.content.clone())),
+            })
+            .collect();
+        let council_request = TrialityCouncilRequest {
+            model: Some(req.model.clone()),
+            prompt: None,
+            messages: Some(messages),
+            max_tokens: req.options.num_predict,
+            temperature: req.options.temperature,
+            seed: req.options.seed,
+            parallelism: None,
+            attention_consensus: false,
+            cross_score: true,
+            synthesis: false,
+            aha: true,
+            trace: extension.trace,
+            stream: req.stream,
+        };
+        let validated = match validate_council_request(&state, council_request) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+        return match execute_triality_council(state, validated).await {
+            Ok(response) => ollama_council_chat_response(response, req.stream),
+            Err(error) => error.into_response(),
+        };
+    }
+
     let request_start = Instant::now();
     let load_duration_ns = state.load_duration_ns;
 
@@ -2897,6 +4068,12 @@ async fn chat_handler(
         .await;
         Json(result).into_response()
     }
+}
+
+fn council_extension(
+    extension: Option<&HypuraRequestExtension>,
+) -> Option<&HypuraRequestExtension> {
+    extension.filter(|value| value.triality_council)
 }
 
 // ── Helpers ──
@@ -3194,6 +4371,75 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn council_response(selected_text: &str) -> TrialityCouncilResponse {
+        TrialityCouncilResponse {
+            id: "tc-test".to_string(),
+            object: "triality.council".to_string(),
+            model: "test.gguf".to_string(),
+            selected_text: selected_text.to_string(),
+            selected_view: crate::council::CouncilView::Vector,
+            candidate_scores: [1.0, 0.5, 0.25],
+            winner_margin: 0.5,
+            agreement: 0.75,
+            aha: None,
+            trace: None,
+        }
+    }
+
+    async fn council_preflight_handler(Json(request): Json<TrialityCouncilRequest>) -> Response {
+        if let Err(error) = validate_council_feature_flags(&request) {
+            return error.into_response();
+        }
+        match validate_council_input(request.prompt, request.messages) {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+
+    async fn openai_extension_probe(
+        Json(request): Json<OpenAiChatCompletionRequest>,
+    ) -> &'static str {
+        if council_extension(request.hypura.as_ref()).is_some() {
+            "council"
+        } else {
+            "legacy"
+        }
+    }
+
+    async fn ollama_extension_probe(Json(request): Json<ChatRequest>) -> &'static str {
+        if council_extension(request.hypura.as_ref()).is_some() {
+            "council"
+        } else {
+            "legacy"
+        }
+    }
+
+    async fn council_get_probe(
+        State(store): State<Arc<CouncilStore>>,
+        AxumPath(request_id): AxumPath<String>,
+    ) -> Response {
+        triality_council_get_from_store(store, request_id).await
+    }
+
+    async fn council_events_probe(State(telemetry): State<Arc<TelemetryEmitter>>) -> Response {
+        triality_events_from_emitter(telemetry).await
+    }
+
+    async fn post_preflight(value: serde_json::Value) -> reqwest::Response {
+        let app = Router::new().route("/v1/triality/council", post(council_preflight_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/triality/council"))
+            .json(&value)
+            .send()
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn launcher_profile_context_reads_known_kcpps_fields() {
         let profile = LauncherProfile::from_kcpps_value(
@@ -3217,5 +4463,481 @@ mod tests {
 
         assert_eq!(launcher_profile_context(&profile, 4096), 4096);
         assert_eq!(launcher_profile_max_length(&profile, 256), 256);
+    }
+
+    #[tokio::test]
+    async fn council_preflight_rejects_unsupported_modes_over_http() {
+        for (field, value, expected_code) in [
+            (
+                "attention_consensus",
+                true,
+                "attention_consensus_unsupported",
+            ),
+            ("synthesis", true, "unsupported_until_enabled"),
+            ("cross_score", false, "cross_score_required"),
+        ] {
+            let mut request = json!({"prompt": "hello", "cross_score": true});
+            request[field] = json!(value);
+            let response = post_preflight(request).await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["code"], expected_code);
+        }
+    }
+
+    #[tokio::test]
+    async fn council_preflight_requires_exactly_one_input_over_http() {
+        for request in [
+            json!({"cross_score": true}),
+            json!({
+                "prompt": "hello",
+                "messages": [{"role": "user", "content": "hello"}],
+                "cross_score": true
+            }),
+        ] {
+            let response = post_preflight(request).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn council_streams_emit_only_the_selected_final_answer() {
+        let selected = "selected-final-answer";
+        let native = triality_council_response(council_response(selected), true);
+        let native_body = axum::body::to_bytes(native.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let native_text = String::from_utf8(native_body.to_vec()).unwrap();
+        assert_eq!(native_text.matches(selected).count(), 1);
+        assert!(native_text.ends_with("data: [DONE]\n\n"));
+
+        let openai = openai_council_chat_response(council_response(selected), true);
+        let openai_body = axum::body::to_bytes(openai.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let openai_text = String::from_utf8(openai_body.to_vec()).unwrap();
+        assert_eq!(openai_text.matches(selected).count(), 1);
+        assert!(openai_text.ends_with("data: [DONE]\n\n"));
+
+        let ollama = ollama_council_chat_response(council_response(selected), true);
+        let ollama_body = axum::body::to_bytes(ollama.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ollama_text = String::from_utf8(ollama_body.to_vec()).unwrap();
+        assert_eq!(ollama_text.matches(selected).count(), 1);
+        assert_eq!(ollama_text.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn absent_extensions_retain_legacy_dispatch_over_http() {
+        let app = Router::new()
+            .route("/v1/chat/completions", post(openai_extension_probe))
+            .route("/api/chat", post(ollama_extension_probe));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let openai = client
+            .post(format!("http://{address}/v1/chat/completions"))
+            .json(&json!({
+                "model": "test.gguf",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(openai.text().await.unwrap(), "legacy");
+        let ollama = client
+            .post(format!("http://{address}/api/chat"))
+            .json(&json!({
+                "model": "test.gguf",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ollama.text().await.unwrap(), "legacy");
+    }
+
+    #[tokio::test]
+    async fn council_get_rejects_oversized_persisted_input_over_http() {
+        let data_root = std::env::temp_dir().join(format!(
+            "hypura-council-get-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = Arc::new(
+            CouncilStore::open(crate::council::CouncilStoreConfig::for_data_root(
+                data_root.clone(),
+            ))
+            .unwrap(),
+        );
+        let request_id = "tc-oversized";
+        let record_dir = store.record_directory(request_id).unwrap();
+        std::fs::create_dir_all(&record_dir).unwrap();
+        let request_file = std::fs::File::create(record_dir.join("request.json")).unwrap();
+        request_file.set_len(64 * 1024 * 1024 + 1).unwrap();
+        drop(request_file);
+
+        let app = Router::new()
+            .route("/api/extra/triality/council/:id", get(council_get_probe))
+            .with_state(store);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::get(format!(
+            "http://{address}/api/extra/triality/council/{request_id}"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_council_result_id");
+        std::fs::remove_dir_all(data_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn council_events_endpoint_never_broadcasts_prompt_or_candidate_secrets() {
+        let secret = "secret-prompt-and-candidate-content";
+        let prompt = secret.to_string();
+        let candidates = [secret.to_string(), secret.to_string(), secret.to_string()];
+        let telemetry = Arc::new(TelemetryEmitter::new(8));
+        let app = Router::new()
+            .route("/api/extra/triality/events", get(council_events_probe))
+            .with_state(telemetry.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut response = reqwest::get(format!("http://{address}/api/extra/triality/events"))
+            .await
+            .unwrap();
+        telemetry.emit(TelemetryEvent::TokenGenerated {
+            tok_per_sec: 1.0,
+            token: secret.to_string(),
+        });
+        telemetry.emit(TelemetryEvent::TrialityConsensusCompleted {
+            request_id: "tc-safe".to_string(),
+            selected_view: crate::council::CouncilView::Vector,
+            candidate_scores: [1.0, 0.5, 0.25],
+            winner_margin: 0.5,
+            agreement: 0.75,
+            result_persisted: false,
+        });
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), response.chunk())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let payload = String::from_utf8(chunk.to_vec()).unwrap();
+        assert!(!payload.contains(&prompt));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !payload.contains(candidate))
+        );
+    }
+
+    #[test]
+    fn council_identity_snapshot_serializes_hot_switch_interleaving() {
+        let loaded = Arc::new(Mutex::new(0_u64));
+        let name = Arc::new(Mutex::new("model-a".to_string()));
+        let path = Arc::new(Mutex::new(PathBuf::from("model-a.gguf")));
+        let sha256 = Arc::new(Mutex::new(Some("hash-a".to_string())));
+        let (begin_switch_tx, begin_switch_rx) = std::sync::mpsc::channel();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+
+        let switch_loaded = loaded.clone();
+        let switch_name = name.clone();
+        let switch_path = path.clone();
+        let switch_sha256 = sha256.clone();
+        let switch = std::thread::spawn(move || {
+            begin_switch_rx.recv().unwrap();
+            attempting_tx.send(()).unwrap();
+            let mut loaded = switch_loaded.lock().unwrap();
+            let mut name = switch_name.lock().unwrap();
+            let mut path = switch_path.lock().unwrap();
+            let mut sha256 = switch_sha256.lock().unwrap();
+            *loaded = 1;
+            *name = "model-b".to_string();
+            *path = PathBuf::from("model-b.gguf");
+            *sha256 = Some("hash-b".to_string());
+            completed_tx.send(()).unwrap();
+        });
+
+        let first = lock_model_identity_after_loaded(
+            &loaded,
+            &name,
+            &path,
+            &sha256,
+            |generation| format!("physical-{generation}"),
+            || {
+                begin_switch_tx.send(()).unwrap();
+                attempting_rx.recv().unwrap();
+            },
+        )
+        .unwrap();
+        assert_eq!(*first.loaded, 0);
+        assert_eq!(first.identity.public_alias, "model-a");
+        assert_eq!(first.identity.physical_name, "physical-0");
+        assert_eq!(first.identity.path, PathBuf::from("model-a.gguf"));
+        assert_eq!(first.identity.sha256.as_deref(), Some("hash-a"));
+        assert!(completed_rx.try_recv().is_err());
+        drop(first);
+
+        completed_rx.recv().unwrap();
+        switch.join().unwrap();
+        let second = lock_model_identity(&loaded, &name, &path, &sha256, |generation| {
+            format!("physical-{generation}")
+        })
+        .unwrap();
+        assert_eq!(*second.loaded, 1);
+        assert_eq!(second.identity.public_alias, "model-b");
+        assert_eq!(second.identity.physical_name, "physical-1");
+        assert_eq!(second.identity.path, PathBuf::from("model-b.gguf"));
+        assert_eq!(second.identity.sha256.as_deref(), Some("hash-b"));
+    }
+
+    #[test]
+    fn council_request_uses_public_alias_without_conflating_physical_name() {
+        let identity = ActiveModelIdentity {
+            public_alias: "public-council".to_string(),
+            physical_name: "weights-q4.gguf".to_string(),
+            path: PathBuf::from("C:/models/weights-q4.gguf"),
+            sha256: Some("a".repeat(64)),
+        };
+
+        assert!(validate_requested_model_alias(Some("public-council"), &identity).is_ok());
+        let error = validate_requested_model_alias(Some("weights-q4.gguf"), &identity).unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "model_not_loaded");
+        assert_eq!(
+            switched_public_model_alias("public-council", "next.gguf", true),
+            "public-council"
+        );
+        assert_eq!(
+            switched_public_model_alias("weights-q4.gguf", "next.gguf", false),
+            "next.gguf"
+        );
+    }
+
+    #[test]
+    fn council_trace_storage_exposes_alias_and_hash_without_server_path() {
+        let identity = ActiveModelIdentity {
+            public_alias: "public-council".to_string(),
+            physical_name: "weights-q4.gguf".to_string(),
+            path: PathBuf::from("C:/private/models/weights-q4.gguf"),
+            sha256: Some("b".repeat(64)),
+        };
+
+        let storage = council_trace_storage(&identity, None);
+        let serialized = serde_json::to_string(&storage).unwrap();
+        assert_eq!(storage["model_alias"], "public-council");
+        assert_eq!(storage["model_sha256"], "b".repeat(64));
+        assert!(storage.get("model_path").is_none());
+        assert!(!serialized.contains("C:/private"));
+        assert!(!serialized.contains("weights-q4.gguf"));
+    }
+
+    #[test]
+    fn model_file_guard_rejects_same_size_content_replacement() {
+        use crate::model::file_identity::{ensure_unchanged, snapshot_path};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        std::fs::write(&path, b"abc").unwrap();
+        let before = snapshot_path(&path).unwrap();
+        assert!(ensure_unchanged(&before, &before).is_ok());
+
+        std::fs::write(&path, b"xyz").unwrap();
+        let after = snapshot_path(&path).unwrap();
+        assert_eq!(before.size(), after.size());
+        assert_ne!(before.sha256(), after.sha256());
+        assert!(ensure_unchanged(&before, &after).is_err());
+    }
+
+    fn route_ncka_config(required: bool, fallback_weights: [f32; 3]) -> GgufTurboQuantConfig {
+        GgufTurboQuantConfig {
+            enabled: true,
+            schema_version: 2,
+            mode: TurboQuantMode::PaperFullKv,
+            public_mode_label: "paper-full-kv".to_string(),
+            runtime_mode: "paper-full-kv".to_string(),
+            rotation_policy: None,
+            triality_view: None,
+            triality_mode: None,
+            triality_mix: None,
+            paper_fidelity: true,
+            k_bits: 4.0,
+            v_bits: 4.0,
+            payload_format: None,
+            payload_bytes: 0,
+            payload_json: None,
+            rotation_seed: 0,
+            artifact_path: None,
+            head_dim: 128,
+            num_layers: 1,
+            num_kv_heads: 1,
+            layers: Vec::new(),
+            weight: None,
+            consensus: None,
+            ncka: Some(crate::model::turboquant_sidecar::GgufNcKaConfig {
+                enabled: true,
+                required,
+                schema_version: u32::MAX,
+                controller_type: "unsupported".to_string(),
+                coordinate_names: Vec::new(),
+                outer_count: 0,
+                knot_count: 0,
+                s3_equivariant: true,
+                controller_sha256: "0".repeat(64),
+                normalisation_sha256: "0".repeat(64),
+                static_fallback_selected: !required,
+                fallback_weights,
+            }),
+            urt: None,
+        }
+    }
+
+    fn empty_route_gguf() -> GgufFile {
+        GgufFile {
+            version: 3,
+            metadata: Default::default(),
+            tensors: Vec::new(),
+            data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn route_ncka_optional_failure_uses_declared_static_fallback() {
+        let fallback_weights = [0.2, 0.3, 0.5];
+        let config = route_ncka_config(false, fallback_weights);
+        let mut gate = KaGateConfig {
+            enabled: true,
+            static_fallback_weights: [1.0 / 3.0; 3],
+            ..KaGateConfig::default()
+        };
+
+        let controller = prepare_route_embedded_ka_controller(
+            Path::new("unused.gguf"),
+            &empty_route_gguf(),
+            &config,
+            &mut gate,
+        )
+        .unwrap();
+
+        assert!(controller.is_none());
+        assert_eq!(gate.static_fallback_weights, fallback_weights);
+    }
+
+    #[test]
+    fn route_ncka_required_and_invalid_fallback_fail_closed() {
+        for config in [
+            route_ncka_config(true, [0.2, 0.3, 0.5]),
+            route_ncka_config(false, [0.6, 0.6, -0.2]),
+        ] {
+            let mut gate = KaGateConfig {
+                enabled: true,
+                ..KaGateConfig::default()
+            };
+            let error = prepare_route_embedded_ka_controller(
+                Path::new("unused.gguf"),
+                &empty_route_gguf(),
+                &config,
+                &mut gate,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(error.code, "ncka_controller_unavailable");
+        }
+    }
+
+    #[test]
+    fn single_urt_observation_is_persisted_and_emitted_unassessed() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Mutex::new(
+            UrtRegistry::open(crate::urt::UrtRegistryConfig::persistent(directory.path())).unwrap(),
+        );
+        let observation = UrtObservation {
+            request_id: "tc-urt-single".to_string(),
+            representation: RepresentationId {
+                kind: RepresentationKind::HypuraNative,
+                model_hash: "model-sha256".to_string(),
+                artefact_hash: Some("artefact-sha256".to_string()),
+                backend: "hypura_native".to_string(),
+                precision: "k4.000_v4.000".to_string(),
+                view: Some("vector".to_string()),
+            },
+            state_id: "state-single".to_string(),
+            layer: None,
+            operator_word: vec!["Q".to_string(), "U".to_string()],
+            operator_word_sha256: "operator-sha256".to_string(),
+            observable: "selected_candidate_mean_log_likelihood".to_string(),
+            value_real: -1.25,
+            value_imag: 0.0,
+            tolerance: 0.001,
+        };
+
+        let trace = record_council_urt_observation(&registry, Some(&observation))
+            .unwrap()
+            .unwrap();
+        assert_eq!(trace.status, crate::urt::UrtAssessmentStatus::Unassessed);
+        assert!(trace.report.is_none());
+        let trace_json = serde_json::to_value(&trace).unwrap();
+        assert_eq!(trace_json["status"], "unassessed");
+        assert!(trace_json.get("report").is_none());
+
+        let urt_directory = directory.path().join("artifacts").join("urt");
+        assert!(urt_directory.join("representations.json").is_file());
+        assert!(urt_directory.join("observations.jsonl").is_file());
+        assert!(!urt_directory.join("consistency_summary.csv").exists());
+        assert!(!urt_directory.join("consistency_failures.jsonl").exists());
+
+        let telemetry = TelemetryEmitter::new(4);
+        let mut receiver = telemetry.subscribe();
+        emit_council_urt_event(&telemetry, observation.request_id.clone(), &trace);
+        match receiver.try_recv().unwrap() {
+            TelemetryEvent::TrialityUrtChecked {
+                request_id,
+                comparison_count,
+                consistent,
+                max_absolute_error,
+            } => {
+                assert_eq!(request_id, observation.request_id);
+                assert_eq!(comparison_count, 0);
+                assert_eq!(consistent, None);
+                assert_eq!(max_absolute_error, None);
+            }
+            other => panic!("unexpected telemetry event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hot_switch_model_hash_uses_guarded_snapshot_only_for_urt() {
+        use crate::model::file_identity::snapshot_path;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut active_hash = Some("old-model-hash".to_string());
+        assert_eq!(active_hash.as_deref(), Some("old-model-hash"));
+
+        let snapshot = snapshot_path(&path).unwrap();
+        active_hash = true.then(|| snapshot.sha256().to_string());
+        assert_eq!(
+            active_hash.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+
+        active_hash = false.then(|| snapshot.sha256().to_string());
+        assert!(active_hash.is_none());
     }
 }

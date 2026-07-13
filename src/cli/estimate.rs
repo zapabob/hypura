@@ -2,7 +2,7 @@ use std::path::Path;
 
 use hypura::model::{gguf::GgufFile, metadata::ModelMetadata};
 use hypura::profiler;
-use hypura::scheduler::estimator::{estimate_performance, EstimateConfidence};
+use hypura::scheduler::estimator::{EstimateConfidence, estimate_performance};
 use hypura::scheduler::placement::{compute_placement, summarize_placement};
 
 use super::fmt_util::{format_bytes, format_params};

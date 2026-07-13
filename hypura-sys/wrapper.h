@@ -1,4 +1,6 @@
 #include "llama.h"
+#include "llama-turboquant.h"
+#include "llama-turboquant-telemetry.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"

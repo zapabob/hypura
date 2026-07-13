@@ -17,6 +17,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Council(cli::council::CouncilCommandOptions),
     /// Run hardware profiler and save results
     Profile {
         /// Force re-profiling even if a recent profile exists
@@ -65,6 +66,8 @@ enum Commands {
         /// Developer-only escape hatch: allow exact fallback when TurboQuant artifacts are incomplete
         #[arg(long)]
         tq_allow_exact_fallback: bool,
+        #[command(flatten)]
+        triality: cli::council::TrialityCliOverrides,
     },
     /// Start Ollama-compatible API server
     Serve {
@@ -127,6 +130,8 @@ enum Commands {
         /// Developer-only escape hatch: allow exact fallback when TurboQuant artifacts are incomplete
         #[arg(long)]
         tq_allow_exact_fallback: bool,
+        #[command(flatten)]
+        triality: cli::council::TrialityCliOverrides,
     },
     /// Start a KoboldCpp-compatible server profile with Kobold-style defaults
     #[command(name = "koboldcpp", visible_alias = "compat")]
@@ -217,6 +222,8 @@ enum Commands {
         /// Host pinned tier policy
         #[arg(long, value_enum, default_value_t = HostPinnedPolicy::Auto)]
         host_pinned: HostPinnedPolicy,
+        #[command(flatten)]
+        triality: cli::council::TrialityCliOverrides,
     },
     /// Internal hidden worker mode for the KoboldCpp supervisor process
     #[command(name = "__koboldcpp_worker", hide = true)]
@@ -268,6 +275,8 @@ enum Commands {
         /// Developer-only escape hatch: allow exact fallback when TurboQuant artifacts are incomplete
         #[arg(long)]
         tq_allow_exact_fallback: bool,
+        #[command(flatten)]
+        triality: cli::council::TrialityCliOverrides,
     },
     /// Print model metadata, tensor list, and placement plan
     Inspect {
@@ -312,6 +321,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Council(options) => cli::council::run(options),
         Commands::Profile { force } => cli::profile::run(force),
         Commands::Estimate { model } => cli::estimate::run(&model),
         Commands::Run {
@@ -327,6 +337,7 @@ fn main() -> anyhow::Result<()> {
             residency_profile,
             host_pinned,
             tq_allow_exact_fallback,
+            triality,
         } => cli::run::run(
             &model,
             context,
@@ -340,6 +351,7 @@ fn main() -> anyhow::Result<()> {
             residency_profile,
             host_pinned,
             tq_allow_exact_fallback,
+            &triality,
         ),
         Commands::Serve {
             model,
@@ -362,6 +374,7 @@ fn main() -> anyhow::Result<()> {
             residency_profile,
             host_pinned,
             tq_allow_exact_fallback,
+            triality,
         } => cli::serve::run(
             &model,
             &host,
@@ -383,6 +396,7 @@ fn main() -> anyhow::Result<()> {
             residency_profile,
             host_pinned,
             tq_allow_exact_fallback,
+            &triality,
             None,
             None,
             None,
@@ -420,6 +434,7 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             residency_profile,
             host_pinned,
+            triality,
         } => cli::koboldcpp::run(
             &model,
             &host,
@@ -450,6 +465,7 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             residency_profile,
             host_pinned,
+            &triality,
         ),
         Commands::KoboldcppWorker { bootstrap_file } => {
             cli::serve::run_worker_bootstrap(&bootstrap_file)
@@ -469,6 +485,7 @@ fn main() -> anyhow::Result<()> {
             residency_profile,
             host_pinned,
             tq_allow_exact_fallback,
+            triality,
         } => cli::bench::run(
             &model,
             baseline,
@@ -484,6 +501,7 @@ fn main() -> anyhow::Result<()> {
             residency_profile,
             host_pinned,
             tq_allow_exact_fallback,
+            &triality,
         ),
         Commands::Inspect {
             model,

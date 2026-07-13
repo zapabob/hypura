@@ -60,7 +60,9 @@ impl TurboQuantCodec {
 
         if let Ok(virtual_env) = std::env::var("VIRTUAL_ENV") {
             let path = if cfg!(windows) {
-                PathBuf::from(&virtual_env).join("Scripts").join("python.exe")
+                PathBuf::from(&virtual_env)
+                    .join("Scripts")
+                    .join("python.exe")
             } else {
                 PathBuf::from(&virtual_env).join("bin").join("python")
             };
@@ -84,7 +86,9 @@ impl TurboQuantCodec {
     }
 
     fn workspace_dir(&self) -> &Path {
-        self.python_path.parent().unwrap_or(self.python_path.as_path())
+        self.python_path
+            .parent()
+            .unwrap_or(self.python_path.as_path())
     }
 
     fn prepare_script(&self, script_name: &str, script_body: &str) -> anyhow::Result<PathBuf> {
@@ -359,7 +363,10 @@ fn resolve_turboquant_python_path() -> PathBuf {
         .join(TURBOQUANT_PYTHON_PATH)
 }
 
-fn parse_rotation_policy(policy: Option<&str>, triality_view: Option<&str>) -> (String, Option<String>) {
+fn parse_rotation_policy(
+    policy: Option<&str>,
+    triality_view: Option<&str>,
+) -> (String, Option<String>) {
     if let Some(view) = triality_view {
         let normalized_view = match view {
             "vector" => Some("vector".to_string()),

@@ -2,7 +2,9 @@ use std::env;
 use std::path::PathBuf;
 
 fn resolve_llama_dir(manifest_dir: &str) -> PathBuf {
-    let explicit = env::var_os("HYPURA_LLAMA_CPP_PATH").map(PathBuf::from);
+    let explicit = env::var_os("HYPURA_LLAMA_CPP_DIR")
+        .or_else(|| env::var_os("HYPURA_LLAMA_CPP_PATH"))
+        .map(PathBuf::from);
     let candidate = explicit
         .clone()
         .unwrap_or_else(|| PathBuf::from(manifest_dir).join("../vendor/llama.cpp"));
@@ -10,12 +12,12 @@ fn resolve_llama_dir(manifest_dir: &str) -> PathBuf {
     dunce::canonicalize(&candidate).unwrap_or_else(|_| {
         if explicit.is_some() {
             panic!(
-                "HYPURA_LLAMA_CPP_PATH not found or invalid: {}",
+                "HYPURA_LLAMA_CPP_DIR/HYPURA_LLAMA_CPP_PATH not found or invalid: {}",
                 candidate.display()
             );
         }
         panic!(
-            "vendor/llama.cpp not found: {} (run `git submodule update --init --recursive` or set HYPURA_LLAMA_CPP_PATH)",
+            "vendor/llama.cpp not found: {} (run `git submodule update --init --recursive` or set HYPURA_LLAMA_CPP_DIR)",
             candidate.display()
         );
     })
@@ -25,6 +27,7 @@ fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let llama_dir = resolve_llama_dir(&manifest_dir);
 
+    println!("cargo:rerun-if-env-changed=HYPURA_LLAMA_CPP_DIR");
     println!("cargo:rerun-if-env-changed=HYPURA_LLAMA_CPP_PATH");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -41,6 +44,7 @@ fn main() {
         }
     }
     if target_os == "windows" {
+        cmake_config.cxxflag("/FS").cxxflag("/EHsc");
         if let Some(masm) = find_masm() {
             let masm = masm.display().to_string();
             cmake_config.define("CMAKE_ASM_COMPILER", &masm);
@@ -52,6 +56,8 @@ fn main() {
         .define("CMAKE_BUILD_TYPE", "Release")
         .define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL")
         .define("LLAMA_BUILD_TESTS", "OFF")
+        .define("LLAMA_BUILD_APP", "OFF")
+        .define("LLAMA_BUILD_COMMON", "OFF")
         // Hypura links against the vendored libraries only; skip tool targets so
         // upstream tool-only link seams do not block runtime syncs.
         .define("LLAMA_BUILD_TOOLS", "OFF")
@@ -70,7 +76,7 @@ fn main() {
             .define("GGML_OPENMP", "OFF");
     } else if use_cuda {
         let cuda_arches =
-            env::var("HYPURA_CUDA_ARCHITECTURES").unwrap_or_else(|_| "75;86;89;90".to_string());
+            env::var("HYPURA_CUDA_ARCHITECTURES").unwrap_or_else(|_| "120".to_string());
 
         cmake_config
             .define("GGML_METAL", "OFF")
@@ -99,6 +105,9 @@ fn main() {
     println!("cargo:rustc-link-lib=static=ggml");
     println!("cargo:rustc-link-lib=static=ggml-base");
     println!("cargo:rustc-link-lib=static=ggml-cpu");
+    if target_os == "windows" {
+        println!("cargo:rustc-link-lib=advapi32");
+    }
 
     if use_metal {
         println!("cargo:rustc-link-lib=static=ggml-metal");
@@ -192,6 +201,16 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!(
         "cargo:rerun-if-changed={}",
+        llama_dir.join("include/llama-turboquant.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        llama_dir
+            .join("include/llama-turboquant-telemetry.h")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         llama_dir.join("include").display()
     );
     println!("cargo:rerun-if-changed={}", llama_dir.join("src").display());
@@ -226,12 +245,11 @@ fn get_cuda_root() -> Option<PathBuf> {
         }
     }
 
-    if let Some(nvcc) = find_nvcc() {
-        if let Some(bin) = nvcc.parent() {
-            if let Some(root) = bin.parent() {
-                return Some(root.to_path_buf());
-            }
-        }
+    if let Some(nvcc) = find_nvcc()
+        && let Some(bin) = nvcc.parent()
+        && let Some(root) = bin.parent()
+    {
+        return Some(root.to_path_buf());
     }
 
     None
@@ -282,11 +300,7 @@ fn find_nvcc() -> Option<PathBuf> {
 
 fn get_cuda_root_from_env() -> Option<PathBuf> {
     let root = env::var_os("CUDA_PATH").map(PathBuf::from)?;
-    if root.exists() {
-        Some(root)
-    } else {
-        None
-    }
+    if root.exists() { Some(root) } else { None }
 }
 
 fn find_masm() -> Option<PathBuf> {
