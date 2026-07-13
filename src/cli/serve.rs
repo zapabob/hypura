@@ -415,7 +415,7 @@ async fn run_async(
         ProgressBar::hidden()
     };
 
-    let runtime = inference::resolve_runtime_setup(
+    let mut runtime = inference::resolve_runtime_setup(
         path,
         context,
         turboquant_mode,
@@ -424,6 +424,9 @@ async fn run_async(
         residency_policy,
         tq_allow_exact_fallback,
     )?;
+    if runtime.triality.is_some() {
+        runtime.plan = inference::council_compatible_resident_plan(&runtime.plan);
+    }
     if cli_progress_enabled() {
         pb_setup.finish_and_clear();
     }

@@ -1693,6 +1693,32 @@ fn council_resources_for_loaded_plan(
     )
 }
 
+/// Return a placement plan that can be used by Answer Council contexts.
+///
+/// Answer Council creates independent llama.cpp contexts over one loaded model.
+/// The NVMe callback loader owns mutable prefetch state and cannot safely be
+/// shared by those contexts, so tensors assigned to that callback must fall back
+/// to llama.cpp's ordinary host-pageable path. Existing GPU placements remain
+/// unchanged.
+pub fn council_compatible_resident_plan(plan: &PlacementPlan) -> PlacementPlan {
+    let mut resident = plan.clone();
+    let mut replaced_nvme = false;
+    for placement in resident.tensor_placements.values_mut() {
+        if placement.residence == TensorResidence::NvmeBacked {
+            placement.residence = TensorResidence::HostPageable;
+            placement.compute_target = ComputeTarget::CpuFallback;
+            replaced_nvme = true;
+        }
+    }
+    if replaced_nvme {
+        resident.inference_mode = InferenceMode::FullResident;
+        for prefetches in &mut resident.prefetch_schedule.layer_prefetches {
+            prefetches.clear();
+        }
+    }
+    resident
+}
+
 /// Load a model once for repeated generation (server use case).
 ///
 /// Extracts the model loading logic from `generate_with_nvme_scheduling` so the
@@ -3267,6 +3293,34 @@ mod tests {
             inference_mode: InferenceMode::FullStreaming,
             residency_policy: ResidencyPolicyConfig::default(),
         }
+    }
+
+    #[test]
+    fn council_resident_plan_replaces_only_nvme_callbacks() {
+        let mut assignments = HashMap::new();
+        assignments.insert("gpu.weight".to_string(), StorageTier::Gpu);
+        assignments.insert("nvme.weight".to_string(), StorageTier::Nvme);
+        let plan = make_plan(assignments);
+
+        let resident = council_compatible_resident_plan(&plan);
+
+        assert_eq!(
+            resident.tensor_placements["gpu.weight"].residence,
+            TensorResidence::GpuResident
+        );
+        assert_eq!(
+            resident.tensor_placements["nvme.weight"].residence,
+            TensorResidence::HostPageable
+        );
+        assert_eq!(
+            resident.tensor_placements["nvme.weight"].compute_target,
+            ComputeTarget::CpuFallback
+        );
+        assert_eq!(resident.inference_mode, InferenceMode::FullResident);
+        assert_eq!(
+            plan.tensor_placements["nvme.weight"].residence,
+            TensorResidence::NvmeBacked
+        );
     }
 
     #[test]

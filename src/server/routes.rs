@@ -2393,7 +2393,7 @@ async fn switch_loaded_model_runtime(
     let bridge = state.serve_llama_bridge.clone();
     let residency_policy = state.serve_residency_policy;
     let tq_allow_exact_fallback = state.serve_tq_allow_exact_fallback;
-    let setup = tokio::task::spawn_blocking(move || {
+    let mut setup = tokio::task::spawn_blocking(move || {
         crate::compute::inference::resolve_runtime_setup(
             &path_for_setup,
             context,
@@ -2405,6 +2405,9 @@ async fn switch_loaded_model_runtime(
         )
     })
     .await??;
+    if setup.triality.is_some() {
+        setup.plan = crate::compute::inference::council_compatible_resident_plan(&setup.plan);
+    }
     let urt_enabled = setup
         .triality
         .as_ref()

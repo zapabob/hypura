@@ -205,7 +205,7 @@ pub fn run(options: CouncilCommandOptions) -> anyhow::Result<()> {
         llama_rotation_seed: options.rotation_seed,
         ..LlamaTurboquantCliBridge::default()
     });
-    let runtime = inference::resolve_runtime_setup(
+    let mut runtime = inference::resolve_runtime_setup(
         path,
         options.context,
         options.turboquant_mode,
@@ -214,6 +214,7 @@ pub fn run(options: CouncilCommandOptions) -> anyhow::Result<()> {
         ResidencyPolicyConfig::new(options.residency_profile, options.host_pinned),
         options.tq_allow_exact_fallback,
     )?;
+    runtime.plan = inference::council_compatible_resident_plan(&runtime.plan);
     let triality = runtime
         .triality
         .clone()
