@@ -35,6 +35,25 @@ Hypura continues to provide:
 - savedata, preload story, launcher configuration, and probe-gated optional multimodal bridges
 - ELT loop metadata detection with a fail-closed runtime gate
 
+## Qwen3.6 HauhauCS local verification (2026-07-16)
+
+The supplied Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive Q4_K_M model was exercised with the locally built `Hypura.exe` and the supplied `mmproj` through `llama-server`. The record below is a short smoke benchmark, not a quality evaluation: context was 512, the prompt was `Reply with exactly READY.`, and generation was limited to 10 tokens.
+
+| Run | Prompt eval | Decode | Wall time | Placement |
+| --- | ---: | ---: | ---: | --- |
+| llama.cpp baseline | 1.8 tok/s | 1.4 tok/s | 23.4 s | 0 GPU layers after runtime admission |
+| Hypura `legacy-3tier` + pinned `off` | 4.6 tok/s | 5.3 tok/s | 10.0 s | Sparse-MoE mmap, CPU model weights |
+| Hypura `four-tier` + pinned `off` | 0.7 tok/s | 2.8 tok/s | 39.7 s | Sparse-MoE mmap, CPU model weights |
+| Hypura `four-tier` + pinned `auto` | 2.2 tok/s | 4.2 tok/s | 12.0 s | Sparse-MoE mmap, CPU model weights |
+
+The selected Hypura run (`four-tier` + `auto`) measured 3.10x the baseline decode rate in this eight-token smoke. The 19.7 GB model exceeds the available RTX 5060 Ti budget, so the actual runtime kept model weights on CPU (`n_gpu_layers=0`, `CPU_Mapped` about 20,175.71 MiB) and used CUDA for compute buffers. The model has no embedded TurboQuant schema or sidecar; the test therefore used the explicit `--turboquant-mode exact` compatibility path, with TurboQuant runtime status inactive. Residency telemetry was zero because no pinned-host or NVMe tier was activated.
+
+For practical classification, `legacy-3tier` is borderline usable for one local text session with a short context and modest reply length: it measured 5.3 decode tok/s and 10.0 seconds wall time in this smoke. It is not a good basis for long-context work, concurrent slots, or vision. `four-tier` + `auto` is the more conservative residency policy, but it was slower in this run.
+
+The supplied `mmproj` was loaded by `llama-server` as a multimodal model. A 400x200 local PNG request reached image prompt processing and completed 103 prompt tokens at about 0.65 tok/s; the 32-token decode was about 4.59 tok/s and the request took about 166.5 seconds. This confirms the wiring, but it is not practical for interactive vision use on this hardware. The server also warned that Qwen-VL grounding workloads should use at least 1,024 image tokens, so vision quality was not certified by this smoke run. The exact local `mmproj` file must be present again before reproducing the server lane.
+
+The raw Hypura JSON result is written locally under `benchmarks/results/` by `hypura bench`; those generated files are ignored, while this README records the measured values and the hardware/runtime constraints.
+
 ## Source authority and reproducibility
 
 The canonical runtime inputs are:
